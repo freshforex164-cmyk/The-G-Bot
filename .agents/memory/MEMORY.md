@@ -1,1 +1,1 @@
-- [The G-Bot scope](gbot-scope.md) — currently a read-only Pocket Option demo CLI; no web server is in scope yet.
+- [G Bots engine scope](gbot-scope.md) — Phase 1 is a read-only demo CLI; no UI, database, or web server is in scope yet.

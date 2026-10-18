@@ -1,7 +1,7 @@
 [project]
-name = "the-g-bot"
+name = "g-bots-engine"
 version = "0.1.0"
-description = "Read-only Pocket Option demo balance and candle checker."
+description = "Async Pocket Option demo-market data engine."
 requires-python = ">=3.12"
 dependencies = [
     "binaryoptionstoolsv2==0.2.15",

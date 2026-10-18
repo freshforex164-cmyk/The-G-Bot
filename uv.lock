@@ -19,7 +19,7 @@ wheels = [
 ]
 
 [[package]]
-name = "the-g-bot"
+name = "g-bots-engine"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
