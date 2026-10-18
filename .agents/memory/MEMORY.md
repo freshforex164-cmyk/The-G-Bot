@@ -1,0 +1,1 @@
+- [The G-Bot scope](gbot-scope.md) — currently a read-only Pocket Option demo CLI; no web server is in scope yet.
