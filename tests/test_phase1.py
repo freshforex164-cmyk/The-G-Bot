@@ -356,7 +356,12 @@ class ConfigurationTests(unittest.TestCase):
             exit_code = main_module.main(["--confirm-real"])
 
         self.assertEqual(exit_code, 0)
-        runner.assert_awaited_once_with("real", confirm_real=True)
+        runner.assert_awaited_once_with(
+            "real",
+            confirm_real=True,
+            run_mode="watch",
+            minutes=main_module.SIGNAL_RUN_DEFAULT_MINUTES,
+        )
 
     def test_demo_mode_uses_demo_secret_and_remains_default(self) -> None:
         with patch.dict(

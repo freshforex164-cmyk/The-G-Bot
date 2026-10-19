@@ -68,6 +68,11 @@ class CandleBuilder:
         self.current: Candle | None = None
         self._latest_closed_time: int | None = None
 
+    @property
+    def forming_candle(self) -> Candle | None:
+        """Return the current, still-open candle being updated by live ticks."""
+        return self.current
+
     def seed(self, history: Iterable[Mapping[str, Any]]) -> int:
         """Seed from broker-compiled history, ignoring the current open time bucket."""
         current_bucket = int(time.time()) // self.period_seconds * self.period_seconds
