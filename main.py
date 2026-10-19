@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -20,10 +21,12 @@ from config import (
     ConfigurationError,
     HISTORY_LOOKBACK_SECONDS,
     MAX_CANDLES_PER_PAIR,
+    MODE,
     MIN_PAYOUT,
     RUN_DURATION_SECONDS,
     TOP_PAIRS_COUNT,
-    load_demo_ssid,
+    load_mode_ssid,
+    validate_mode,
 )
 from data.candles import Candle, CandleBuilder, CandleDataError
 
@@ -60,9 +63,12 @@ async def _stream_pair(
         await ticks.aclose()
 
 
-async def run_engine() -> None:
-    ssid = load_demo_ssid()
-    broker = PocketOptionBroker(ssid)
+async def run_engine(
+    mode: str | None = None, *, confirm_real: bool = False
+) -> None:
+    active_mode = validate_mode(MODE if mode is None else mode)
+    ssid = load_mode_ssid(active_mode, confirm_real=confirm_real)
+    broker = PocketOptionBroker(ssid, mode=active_mode)
     stop_monitor = asyncio.Event()
     monitor_task: asyncio.Task[None] | None = None
     try:
@@ -73,7 +79,7 @@ async def run_engine() -> None:
         )
 
         balance = await broker.balance()
-        print(f"Demo balance: {balance}", flush=True)
+        print(f"{active_mode.capitalize()} balance: {balance}", flush=True)
 
         payouts = await broker.payouts()
         eligible = sorted(
@@ -135,7 +141,8 @@ async def run_engine() -> None:
         tasks.append(monitor_task)
 
         print(
-            f"Streaming {len(builders)} pair(s) for {RUN_DURATION_SECONDS} seconds "
+            f"Streaming {len(builders)} pair(s) in {active_mode} mode for "
+            f"{RUN_DURATION_SECONDS} seconds "
             f"with {CANDLE_INTERVAL_SECONDS}-second candles.",
             flush=True,
         )
@@ -167,13 +174,23 @@ async def run_engine() -> None:
         await broker.close()
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Read-only Pocket Option balance and market-data runner."
+    )
+    parser.add_argument(
+        "--confirm-real",
+        action="store_true",
+        help="Required when MODE=real; real mode remains read-only.",
+    )
+    args = parser.parse_args(argv)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
-        asyncio.run(run_engine())
+        asyncio.run(run_engine(MODE, confirm_real=args.confirm_real))
     except KeyboardInterrupt:
         logger.info("Stopped by user.")
         return 130

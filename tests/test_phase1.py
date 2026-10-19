@@ -2,26 +2,36 @@ from __future__ import annotations
 
 import ast
 import os
-import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import broker.pocket_option as pocket_option_module
+import main as main_module
 from broker.pocket_option import (
     PocketOptionAuthenticationError,
     PocketOptionBroker,
+    PocketOptionOperationError,
 )
 from config import (
+    DEFAULT_MODE,
     POCKET_OPTION_TIME_OFFSET_SECONDS,
-    PO_SSID_ENV_VAR,
+    SSID_ENV_BY_MODE,
+    STATE_KEYS_BY_MODE,
     ConfigurationError,
-    load_demo_ssid,
+    load_mode_ssid,
+    state_keys_for_mode,
 )
 from data.candles import CandleBuilder, CandleDataError
 
 
 FIXED_TIME = 1_760_000_000
+FAKE_DEMO_SSID = (
+    '42["auth",{"session":"0123456789","uid":123,"isDemo":1}]'
+)
+FAKE_REAL_SSID = (
+    '42["auth",{"session":"abcdefghij","uid":456,"isDemo":0}]'
+)
 
 
 class CandleBuilderTests(unittest.TestCase):
@@ -122,6 +132,7 @@ class FakeSubscription:
 class FakePocketOptionClient:
     instances: list[FakePocketOptionClient] = []
     demo_account = True
+    balance_failure: str | None = None
 
     def __init__(self, ssid: str, config: object) -> None:
         self.connected = True
@@ -143,9 +154,11 @@ class FakePocketOptionClient:
         return True
 
     def is_demo(self) -> bool:
-        return self.demo_account
+        return type(self).demo_account
 
     async def balance(self) -> float:
+        if type(self).balance_failure:
+            raise RuntimeError(type(self).balance_failure)
         return 1234.5
 
     async def payout(self, asset: str | None = None) -> dict[str, int]:
@@ -188,6 +201,7 @@ class PocketOptionBrokerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         FakePocketOptionClient.instances.clear()
         FakePocketOptionClient.demo_account = True
+        FakePocketOptionClient.balance_failure = None
         self.client_patch = patch.object(
             pocket_option_module, "PocketOptionAsync", FakePocketOptionClient
         )
@@ -195,7 +209,7 @@ class PocketOptionBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.client_patch.stop)
 
     async def test_demo_balance_payouts_history_and_order_direction_mapping(self) -> None:
-        broker = PocketOptionBroker("fake-demo-session")
+        broker = PocketOptionBroker(FAKE_DEMO_SSID, mode="demo")
         await broker.connect()
 
         self.assertEqual(await broker.balance(), 1234.5)
@@ -222,7 +236,7 @@ class PocketOptionBrokerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_refuses_non_demo_session(self) -> None:
         FakePocketOptionClient.demo_account = False
-        broker = PocketOptionBroker("fake-session")
+        broker = PocketOptionBroker(FAKE_REAL_SSID, mode="demo")
 
         with self.assertRaises(PocketOptionAuthenticationError):
             await broker.connect()
@@ -230,7 +244,7 @@ class PocketOptionBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(FakePocketOptionClient.instances[0].shutdown_called)
 
     async def test_reconnects_after_disconnect(self) -> None:
-        broker = PocketOptionBroker("fake-demo-session")
+        broker = PocketOptionBroker(FAKE_DEMO_SSID, mode="demo")
         await broker.connect()
         client = FakePocketOptionClient.instances[0]
         client.connected = False
@@ -247,7 +261,7 @@ class PocketOptionBrokerTests(unittest.IsolatedAsyncioTestCase):
         await broker.close()
 
     async def test_tick_stream_yields_raw_updates_and_unsubscribes(self) -> None:
-        broker = PocketOptionBroker("fake-demo-session")
+        broker = PocketOptionBroker(FAKE_DEMO_SSID, mode="demo")
         await broker.connect()
         stream = broker.subscribe_ticks("EURUSD_otc")
         tick = await anext(stream)
@@ -259,14 +273,155 @@ class PocketOptionBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.unsubscriptions, 1)
         await broker.close()
 
+    async def test_refuses_demo_account_in_real_mode(self) -> None:
+        FakePocketOptionClient.demo_account = True
+        broker = PocketOptionBroker(FAKE_REAL_SSID, mode="real")
+
+        with self.assertRaisesRegex(PocketOptionAuthenticationError, "demo account"):
+            await broker.connect()
+
+        self.assertTrue(FakePocketOptionClient.instances[0].shutdown_called)
+
+    async def test_real_mode_reads_balance_but_cannot_place_orders(self) -> None:
+        FakePocketOptionClient.demo_account = False
+        broker = PocketOptionBroker(FAKE_REAL_SSID, mode="real")
+        await broker.connect()
+
+        self.assertEqual(await broker.balance(), 1234.5)
+        self.assertEqual(
+            await broker.payouts(),
+            {"EURUSD_otc": 85.0, "USDCHF_otc": 80.0},
+        )
+        FakePocketOptionClient.balance_failure = "temporary provider failure"
+        with self.assertRaisesRegex(PocketOptionOperationError, "read the real balance"):
+            await broker.balance()
+        FakePocketOptionClient.balance_failure = None
+        stream = broker.subscribe_ticks("EURUSD_otc")
+        self.assertEqual(
+            await anext(stream),
+            {"timestamp": FIXED_TIME, "price": 1.25},
+        )
+        await stream.aclose()
+        with self.assertRaisesRegex(PocketOptionOperationError, "read-only"):
+            await broker.buy("EURUSD_otc", 2.0, "call", 60)
+        self.assertEqual(FakePocketOptionClient.instances[0].orders, [])
+        await broker.close()
+
 
 class ConfigurationTests(unittest.TestCase):
     def test_ssid_errors_do_not_echo_secret_contents(self) -> None:
         fake_secret = "not-a-real-secret-value"
-        with patch.dict(os.environ, {PO_SSID_ENV_VAR: fake_secret}):
-            with self.assertRaises(ConfigurationError) as captured:
-                load_demo_ssid()
-        self.assertNotIn(fake_secret, str(captured.exception))
+        for mode in ("demo", "real"):
+            with self.subTest(mode=mode):
+                with patch.dict(
+                    os.environ,
+                    {SSID_ENV_BY_MODE[mode]: fake_secret},
+                    clear=True,
+                ):
+                    with self.assertRaises(ConfigurationError) as captured:
+                        load_mode_ssid(mode, confirm_real=True)
+                self.assertNotIn(fake_secret, str(captured.exception))
+
+    def test_real_mode_requires_the_real_secret(self) -> None:
+        with patch.dict(
+            os.environ,
+            {SSID_ENV_BY_MODE["demo"]: FAKE_DEMO_SSID},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ConfigurationError, "PO_SSID_REAL"):
+                load_mode_ssid("real", confirm_real=True)
+
+    def test_real_mode_requires_explicit_cli_confirmation(self) -> None:
+        with (
+            patch.object(main_module, "MODE", "real"),
+            patch.dict(
+                os.environ,
+                {SSID_ENV_BY_MODE["real"]: FAKE_REAL_SSID},
+                clear=True,
+            ),
+            patch.object(main_module, "PocketOptionBroker") as broker_class,
+            self.assertLogs("g_bots", level="ERROR") as captured,
+        ):
+            exit_code = main_module.main([])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("--confirm-real", "\n".join(captured.output))
+        broker_class.assert_not_called()
+
+    def test_real_confirmation_flag_is_passed_through_cli(self) -> None:
+        with (
+            patch.object(main_module, "MODE", "real"),
+            patch.object(main_module, "run_engine", new_callable=AsyncMock) as runner,
+        ):
+            exit_code = main_module.main(["--confirm-real"])
+
+        self.assertEqual(exit_code, 0)
+        runner.assert_awaited_once_with("real", confirm_real=True)
+
+    def test_demo_mode_uses_demo_secret_and_remains_default(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                SSID_ENV_BY_MODE["demo"]: FAKE_DEMO_SSID,
+                SSID_ENV_BY_MODE["real"]: FAKE_REAL_SSID,
+            },
+            clear=True,
+        ):
+            self.assertEqual(load_mode_ssid("demo"), FAKE_DEMO_SSID)
+        self.assertEqual(DEFAULT_MODE, "demo")
+
+    def test_state_keys_are_separate_by_mode(self) -> None:
+        demo_keys = state_keys_for_mode("demo")
+        real_keys = state_keys_for_mode("real")
+        self.assertEqual(set(demo_keys), {"peak_balance", "trades", "settings"})
+        self.assertEqual(set(real_keys), {"peak_balance", "trades", "settings"})
+        self.assertTrue(set(demo_keys.values()).isdisjoint(real_keys.values()))
+        self.assertTrue(all(key.startswith("g_bots:demo:") for key in demo_keys.values()))
+        self.assertTrue(all(key.startswith("g_bots:real:") for key in real_keys.values()))
+        self.assertEqual(STATE_KEYS_BY_MODE["demo"], demo_keys)
+        self.assertEqual(STATE_KEYS_BY_MODE["real"], real_keys)
+
+
+class RealModeEngineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_confirmed_real_mode_uses_real_secret_and_read_only_flow(self) -> None:
+        class FakeEngineBroker:
+            instances: list[FakeEngineBroker] = []
+
+            def __init__(self, ssid: str, mode: str) -> None:
+                self.ssid = ssid
+                self.mode = mode
+                self.instances.append(self)
+
+            async def connect(self) -> None:
+                return None
+
+            async def balance(self) -> float:
+                return 99.0
+
+            async def payouts(self) -> dict[str, float]:
+                return {}
+
+            async def monitor_connection(self, stop_event: object) -> None:
+                await stop_event.wait()
+
+            async def close(self) -> None:
+                return None
+
+        FakeEngineBroker.instances.clear()
+        with (
+            patch.dict(
+                os.environ,
+                {SSID_ENV_BY_MODE["real"]: FAKE_REAL_SSID},
+                clear=True,
+            ),
+            patch.object(main_module, "PocketOptionBroker", FakeEngineBroker),
+            patch("builtins.print"),
+        ):
+            await main_module.run_engine("real", confirm_real=True)
+
+        broker = FakeEngineBroker.instances[0]
+        self.assertEqual(broker.ssid, FAKE_REAL_SSID)
+        self.assertEqual(broker.mode, "real")
 
     def test_main_does_not_call_order_method(self) -> None:
         tree = ast.parse(Path("main.py").read_text(encoding="utf-8"))

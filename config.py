@@ -3,7 +3,28 @@
 import json
 import os
 
-PO_SSID_ENV_VAR = "PO_SSID_DEMO"
+DEFAULT_MODE = "demo"
+MODE = os.environ.get("MODE", DEFAULT_MODE).strip().lower()
+VALID_MODES = ("demo", "real")
+SSID_ENV_BY_MODE = {
+    "demo": "PO_SSID_DEMO",
+    "real": "PO_SSID_REAL",
+}
+
+# Reserved for future persistence. Each mode gets its own namespace so demo and
+# real balances, trades, and settings can never share a storage key.
+STATE_KEYS_BY_MODE = {
+    "demo": {
+        "peak_balance": "g_bots:demo:peak_balance",
+        "trades": "g_bots:demo:trades",
+        "settings": "g_bots:demo:settings",
+    },
+    "real": {
+        "peak_balance": "g_bots:real:peak_balance",
+        "trades": "g_bots:real:trades",
+        "settings": "g_bots:real:settings",
+    },
+}
 MIN_PAYOUT = 80
 
 CANDLE_INTERVAL_SECONDS = 10
@@ -28,33 +49,58 @@ class ConfigurationError(ValueError):
     """Raised when required project configuration is missing or malformed."""
 
 
-def load_demo_ssid() -> str:
-    """Load and validate the full demo SSID without ever logging its contents."""
-    ssid = os.environ.get(PO_SSID_ENV_VAR, "").strip()
+def validate_mode(mode: str) -> str:
+    normalized = mode.strip().lower()
+    if normalized not in VALID_MODES:
+        raise ConfigurationError("MODE must be either 'demo' or 'real'.")
+    return normalized
+
+
+def ssid_env_var_for_mode(mode: str) -> str:
+    return SSID_ENV_BY_MODE[validate_mode(mode)]
+
+
+def state_keys_for_mode(mode: str) -> dict[str, str]:
+    """Return a copy of the reserved state-key names for one account mode."""
+    return dict(STATE_KEYS_BY_MODE[validate_mode(mode)])
+
+
+def load_mode_ssid(mode: str, *, confirm_real: bool = False) -> str:
+    """Load the active mode's full SSID without ever logging its contents."""
+    mode = validate_mode(mode)
+    secret_name = ssid_env_var_for_mode(mode)
+
+    if mode == "real" and not confirm_real:
+        raise ConfigurationError(
+            "Real mode requires the --confirm-real CLI flag. "
+            "Real mode is read-only in this phase."
+        )
+
+    ssid = os.environ.get(secret_name, "").strip()
     if not ssid:
         raise ConfigurationError(
-            f"Missing required secret {PO_SSID_ENV_VAR}. Add the full demo "
-            "SSID in Replit Secrets."
+            f"Missing required secret {secret_name}. Add the full "
+            f"{mode} Pocket Option SSID in Replit Secrets."
         )
 
     if not ssid.startswith('42["auth",'):
         raise ConfigurationError(
-            f"{PO_SSID_ENV_VAR} must contain the full SSID beginning with "
-            '42["auth",...]. Copy it from a Pocket Option demo session.'
+            f"{secret_name} must contain the full SSID beginning with "
+            f'42["auth",...]. Copy it from a Pocket Option {mode} session.'
         )
 
     try:
         payload = json.loads(ssid[2:])
     except json.JSONDecodeError:
         raise ConfigurationError(
-            f"{PO_SSID_ENV_VAR} is not valid JSON. Replace it with the complete "
-            "current demo SSID."
+            f"{secret_name} is not valid JSON. Replace it with the complete "
+            f"current {mode} SSID."
         ) from None
 
     if not isinstance(payload, list) or len(payload) < 2 or payload[0] != "auth":
         raise ConfigurationError(
-            f"{PO_SSID_ENV_VAR} is not a valid Pocket Option auth SSID. "
-            "Replace it with the complete current demo SSID."
+            f"{secret_name} is not a valid Pocket Option auth SSID. "
+            f"Replace it with the complete current {mode} SSID."
         )
 
     return ssid

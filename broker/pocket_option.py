@@ -17,6 +17,8 @@ from config import (
     RECONNECT_CALL_TIMEOUT_SECONDS,
     RECONNECT_MAX_ATTEMPTS,
     RECONNECT_MAX_DELAY_SECONDS,
+    ssid_env_var_for_mode,
+    validate_mode,
 )
 
 logger = logging.getLogger("g_bots.broker.pocket_option")
@@ -30,7 +32,7 @@ class PocketOptionBrokerError(RuntimeError):
 
 
 class PocketOptionAuthenticationError(PocketOptionBrokerError):
-    """Raised when the demo SSID is malformed, expired, or not demo-only."""
+    """Raised when the active SSID is invalid or belongs to the wrong account mode."""
 
 
 class PocketOptionConnectionError(PocketOptionBrokerError):
@@ -48,12 +50,14 @@ class CandleHistoryUnavailable(PocketOptionBrokerError):
 class PocketOptionBroker:
     """Small async adapter for the documented BinaryOptionsToolsV2 API."""
 
-    def __init__(self, ssid: str) -> None:
+    def __init__(self, ssid: str, mode: str) -> None:
+        self.mode = validate_mode(mode)
+        self.secret_name = ssid_env_var_for_mode(self.mode)
         self._ssid = ssid
         self._client: PocketOptionAsync | None = None
         self._closed = False
         self._disconnected = False
-        self._demo_confirmed = False
+        self._account_confirmed = False
         self._connection_generation = 0
         self._reconnect_lock = asyncio.Lock()
 
@@ -67,13 +71,13 @@ class PocketOptionBroker:
             return False
 
     async def connect(self) -> None:
-        """Create the client, wait for its asset list, and require a demo session."""
+        """Create the client, wait for assets, and verify the requested account mode."""
         if self._closed:
             raise PocketOptionBrokerError("This broker client has already been closed.")
 
         if self._client is not None:
             if self.is_connected:
-                self._require_demo_account()
+                self._require_account_mode()
                 return
             await self._mark_disconnected("connection was unavailable during connect")
             await self._reconnect_with_backoff()
@@ -92,17 +96,17 @@ class PocketOptionBroker:
             client = PocketOptionAsync(ssid=self._ssid, config=library_config)
         except Exception as exc:
             raise PocketOptionAuthenticationError(
-                "Pocket Option could not initialize the demo session "
-                f"({type(exc).__name__}). Verify PO_SSID_DEMO is the full, "
-                "current demo SSID."
+                f"Pocket Option could not initialize the {self.mode} session "
+                f"({type(exc).__name__}). Verify {self.secret_name} contains "
+                f"the full current {self.mode} SSID."
             ) from None
 
         self._client = client
         if not client.is_ssid_valid():
             await self._shutdown_client()
             raise PocketOptionAuthenticationError(
-                "PO_SSID_DEMO has an invalid SSID format. Replace it with the "
-                "complete current demo SSID beginning with 42[\"auth\",...]."
+                f"{self.secret_name} has an invalid SSID format. Replace it "
+                "with the complete current SSID beginning with 42[\"auth\",...]."
             )
 
         try:
@@ -112,7 +116,7 @@ class PocketOptionBroker:
             )
             if not client.is_connected():
                 raise TimeoutError("Pocket Option did not report a live connection.")
-            self._require_demo_account()
+            self._require_account_mode()
         except asyncio.CancelledError:
             await self._shutdown_client()
             raise
@@ -122,46 +126,51 @@ class PocketOptionBroker:
         except Exception as exc:
             await self._shutdown_client()
             raise PocketOptionAuthenticationError(
-                "Pocket Option did not accept or finish connecting this demo "
-                f"session ({type(exc).__name__}). PO_SSID_DEMO may be invalid "
-                "or expired; copy a fresh full SSID from the demo account. "
+                f"Pocket Option did not accept or finish connecting this "
+                f"{self.mode} session ({type(exc).__name__}). "
+                f"{self.secret_name} may be invalid or expired; copy a fresh "
+                f"full SSID from the {self.mode} account. "
                 "If it is current, check the network and Pocket Option service."
             ) from None
 
         self._disconnected = False
-        logger.info("Connected to Pocket Option demo account.")
+        logger.info("Connected to Pocket Option %s account.", self.mode)
 
     def _require_client(self) -> PocketOptionAsync:
         if self._client is None:
             raise PocketOptionBrokerError("Call connect() before using the broker.")
         return self._client
 
-    def _require_demo_account(self) -> None:
+    def _require_account_mode(self) -> None:
         client = self._require_client()
         if not client.is_ssid_valid():
             raise PocketOptionAuthenticationError(
-                "PO_SSID_DEMO has an invalid SSID format. Replace it with the "
-                "complete current demo SSID."
+                f"{self.secret_name} has an invalid SSID format. Replace it "
+                "with the complete current SSID."
             )
         if not self.is_connected:
-            if self._demo_confirmed:
+            if self._account_confirmed:
                 return
             raise PocketOptionConnectionError(
                 "Pocket Option is not connected yet; call connect() first."
             )
         try:
-            is_demo = client.is_demo()
+            actual_is_demo = client.is_demo()
         except Exception as exc:
             raise PocketOptionAuthenticationError(
                 "Pocket Option could not confirm the account type "
-                f"({type(exc).__name__}). Refresh PO_SSID_DEMO from the demo account."
+                f"({type(exc).__name__}). Refresh {self.secret_name} from the "
+                f"{self.mode} account."
             ) from None
-        if not is_demo:
+        expected_is_demo = self.mode == "demo"
+        if actual_is_demo != expected_is_demo:
+            actual_mode = "demo" if actual_is_demo else "real"
             raise PocketOptionAuthenticationError(
-                "PO_SSID_DEMO is not connected to a demo account. Refusing to "
-                "continue; switch Pocket Option to demo and replace the secret."
+                f"MODE is '{self.mode}', but Pocket Option reports a "
+                f"{actual_mode} account. Refusing to continue; use the matching "
+                f"{self.secret_name} for a {self.mode} account."
             )
-        self._demo_confirmed = True
+        self._account_confirmed = True
 
     async def _mark_disconnected(
         self, reason: str, error: BaseException | None = None
@@ -179,7 +188,7 @@ class PocketOptionBroker:
 
         async with self._reconnect_lock:
             if self.is_connected:
-                self._require_demo_account()
+                self._require_account_mode()
                 if self._disconnected:
                     self._disconnected = False
                     self._connection_generation += 1
@@ -210,7 +219,7 @@ class PocketOptionBroker:
                     )
                     if not self.is_connected:
                         raise TimeoutError("Connection is not ready.")
-                    self._require_demo_account()
+                    self._require_account_mode()
                 except asyncio.CancelledError:
                     raise
                 except PocketOptionAuthenticationError:
@@ -230,8 +239,8 @@ class PocketOptionBroker:
 
         raise PocketOptionConnectionError(
             "Could not reconnect to Pocket Option after several attempts. "
-            "PO_SSID_DEMO may be expired or invalid; refresh the full demo SSID "
-            "and check the network."
+            f"{self.secret_name} may be expired or invalid; refresh the full "
+            f"{self.mode} SSID and check the network."
         )
 
     async def _request(self, operation: str, call: BrokerCall[T]) -> T:
@@ -248,7 +257,8 @@ class PocketOptionBroker:
             except (ValueError, TypeError) as exc:
                 raise PocketOptionOperationError(
                     f"Pocket Option could not {operation} ({type(exc).__name__}). "
-                    "If this is an authentication failure, refresh PO_SSID_DEMO; "
+                    f"If this is an authentication failure, refresh "
+                    f"{self.secret_name}; "
                     "otherwise verify the request and Pocket Option service."
                 ) from None
             except Exception as exc:
@@ -256,12 +266,7 @@ class PocketOptionBroker:
                     exc, (ConnectionError, TimeoutError, OSError)
                 ):
                     try:
-                        if not client.is_demo():
-                            raise PocketOptionAuthenticationError(
-                                "Pocket Option rejected the demo session. "
-                                "PO_SSID_DEMO may be expired or invalid; refresh "
-                                "the full demo SSID."
-                            )
+                        self._require_account_mode()
                     except PocketOptionAuthenticationError:
                         raise
                     except Exception:
@@ -269,7 +274,7 @@ class PocketOptionBroker:
                     raise PocketOptionOperationError(
                         f"Pocket Option could not {operation} "
                         f"({type(exc).__name__}). If this is an authentication "
-                        "failure, refresh PO_SSID_DEMO; otherwise verify the "
+                        f"failure, refresh {self.secret_name}; otherwise verify the "
                         "request and Pocket Option service."
                     ) from None
 
@@ -284,11 +289,13 @@ class PocketOptionBroker:
         )
 
     async def balance(self) -> float:
-        self._require_demo_account()
-        return await self._request("read the demo balance", lambda client: client.balance())
+        self._require_account_mode()
+        return await self._request(
+            f"read the {self.mode} balance", lambda client: client.balance()
+        )
 
     async def payouts(self) -> dict[str, float]:
-        self._require_demo_account()
+        self._require_account_mode()
         raw_payouts = await self._request(
             "read payouts", lambda client: client.payout()
         )
@@ -306,7 +313,7 @@ class PocketOptionBroker:
     async def candle_history(
         self, pair: str, period_seconds: int, lookback_seconds: int
     ) -> list[dict[str, Any]]:
-        self._require_demo_account()
+        self._require_account_mode()
         try:
             history = await self._request(
                 "fetch candle history",
@@ -438,8 +445,12 @@ class PocketOptionBroker:
     async def buy(
         self, pair: str, amount: float, direction: str, expiry_seconds: int
     ) -> Any:
-        """Place a demo order when called; main.py intentionally never calls this."""
-        self._require_demo_account()
+        """Place a demo order only; real mode is explicitly read-only."""
+        if self.mode == "real":
+            raise PocketOptionOperationError(
+                "Order placement is disabled in real mode; this phase is read-only."
+            )
+        self._require_account_mode()
         if amount <= 0:
             raise ValueError("amount must be greater than zero")
         if expiry_seconds <= 0:
