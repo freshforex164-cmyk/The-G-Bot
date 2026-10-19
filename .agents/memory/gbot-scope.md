@@ -3,8 +3,8 @@ name: G Bots engine scope
 description: User-stated initial scope for the Pocket Option project.
 ---
 
-G Bots engine supports demo mode by default and read-only real mode only when `MODE=real` and `--confirm-real` are both set. Real mode and the signal-only strategy must never place orders. Demo and real future storage keys for peak balance, trades, and settings must remain separate. The CLI has watch and signal-only modes; UI and database remain out of scope unless requested.
+G Bots is being built in stages: live data and signal-only paper tracking are complete; next comes an explicitly authorized single demo-trade test, then demo risk-managed trading, then mode-isolated Turso/SQLite-style persistence, Render free-tier deployment with cron keep-alive, and UI last. Real mode stays read-only and must never place orders. Demo and real peak-balance, trade, and settings state must remain separate. Keep `PROJECT_CONTEXT.md` current at the end of every task.
 
-**Why:** The user explicitly requires real mode to be read-only, requested a signal-only strategy with paper tracking, asked that future demo/real state never mix, and deferred UI and database work.
+**Why:** The user stated the staged product goal and safety rules on 2026-10-19, including that no trades may be placed except in the explicit demo-trade test and SSIDs must never be logged.
 
-**How to apply:** Preserve explicit real-mode confirmation, keep strategy output paper-only, deny real-mode order placement at the broker boundary, and use mode-prefixed state keys. Do not add database, UI, or web server unless the user changes scope.
+**How to apply:** Preserve explicit `MODE=real` plus `--confirm-real` gating, block real-mode orders at the broker boundary, and use mode-prefixed keys. Do not begin live trading, persistence, deployment, or UI work before its stated stage and user authorization. Update `PROJECT_CONTEXT.md` after every task.
