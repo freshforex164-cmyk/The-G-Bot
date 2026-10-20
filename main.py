@@ -6,6 +6,8 @@ import asyncio
 import argparse
 import csv
 import logging
+import math
+import time
 from collections.abc import AsyncGenerator, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,10 +19,12 @@ from broker.pocket_option import (
     PocketOptionBroker,
     PocketOptionBrokerError,
     PocketOptionConnectionError,
+    PocketOptionOrderRejected,
 )
 from config import (
     CANDLE_INTERVAL_SECONDS,
     ConfigurationError,
+    EXPIRY_SECONDS,
     HISTORY_LOOKBACK_SECONDS,
     MAX_CANDLES_PER_PAIR,
     MAX_PAIRS,
@@ -29,6 +33,7 @@ from config import (
     RUN_DURATION_SECONDS,
     SIGNALS_CSV_PATH,
     SIGNAL_RUN_DEFAULT_MINUTES,
+    TEST_TRADE_STAKE_CAP,
     TOP_PAIRS_COUNT,
     load_mode_ssid,
     validate_mode,
@@ -337,6 +342,112 @@ async def run_engine(
                 tracker.print_summary()
 
 
+async def run_test_trade(
+    mode: str,
+    *,
+    direction: str = "call",
+    pair: str | None = None,
+    expiry_seconds: int = EXPIRY_SECONDS,
+) -> None:
+    """Place and settle exactly one explicitly requested demo trade."""
+    active_mode = validate_mode(mode)
+    if active_mode != "demo":
+        raise ConfigurationError(
+            "--run test-trade is demo-only; real mode is read-only."
+        )
+    if expiry_seconds <= 0:
+        raise ConfigurationError("--expiry must be a positive whole number of seconds.")
+    normalized_direction = direction.strip().lower()
+    if normalized_direction not in {"call", "put"}:
+        raise ConfigurationError("--direction must be either 'call' or 'put'.")
+
+    ssid = load_mode_ssid(active_mode)
+    broker = PocketOptionBroker(ssid, mode=active_mode)
+    try:
+        await broker.connect()
+        balance_before = await broker.balance()
+        print(f"Demo balance before: ${balance_before:.2f}", flush=True)
+
+        payouts = await broker.payouts()
+        eligible = sorted(
+            (
+                (available_pair, payout)
+                for available_pair, payout in payouts.items()
+                if payout >= MIN_PAYOUT
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )
+
+        if pair is None:
+            if not eligible:
+                raise ConfigurationError(
+                    f"No open pair meets the minimum payout of {MIN_PAYOUT}%."
+                )
+            chosen_pair, payout = eligible[0]
+        else:
+            payout = payouts.get(pair)
+            if payout is None or payout < MIN_PAYOUT:
+                raise ConfigurationError(
+                    f"Pair {pair} is not open at the minimum payout of "
+                    f"{MIN_PAYOUT}% or higher."
+                )
+            chosen_pair = pair
+
+        print(
+            f"Demo test order: pair={chosen_pair} payout={payout:g}% "
+            f"direction={normalized_direction} expiry={expiry_seconds}s "
+            f"stake=${TEST_TRADE_STAKE_CAP:.2f}",
+            flush=True,
+        )
+
+        sent_at = time.perf_counter()
+        trade_id, _confirmation = await broker.buy(
+            chosen_pair,
+            TEST_TRADE_STAKE_CAP,
+            normalized_direction,
+            expiry_seconds,
+            stake_cap=TEST_TRADE_STAKE_CAP,
+        )
+        confirmation_delay_ms = (time.perf_counter() - sent_at) * 1000
+        print(
+            f"Order confirmed in {confirmation_delay_ms:.2f} ms.",
+            flush=True,
+        )
+        print(
+            f"Waiting for the {expiry_seconds}s trade expiry and settlement...",
+            flush=True,
+        )
+
+        # BinaryOptionsToolsV2.check_win waits for settlement; its timeout
+        # includes the requested expiry plus 30 seconds for provider processing.
+        result = await broker.check_win(
+            trade_id,
+            timeout_seconds=expiry_seconds + 30,
+        )
+        raw_profit = result.get("profit")
+        if isinstance(raw_profit, bool) or not isinstance(raw_profit, (int, float)):
+            raise PocketOptionBrokerError(
+                "Pocket Option returned a trade result without a numeric profit."
+            )
+        profit = float(raw_profit)
+        if not math.isfinite(profit):
+            raise PocketOptionBrokerError(
+                "Pocket Option returned a non-finite trade profit."
+            )
+
+        raw_outcome = str(result.get("result", "")).strip().lower()
+        outcomes = {"win": "WIN", "loss": "LOSS", "draw": "DRAW"}
+        outcome = outcomes.get(raw_outcome)
+        if outcome is None:
+            outcome = "WIN" if profit > 0 else "LOSS" if profit < 0 else "DRAW"
+        print(f"Result: {outcome} | profit: ${profit:+.2f}", flush=True)
+
+        balance_after = await broker.balance()
+        print(f"Demo balance after: ${balance_after:.2f}", flush=True)
+    finally:
+        await broker.close()
+
+
 def _positive_minutes(value: str) -> int:
     try:
         minutes = int(value)
@@ -347,15 +458,30 @@ def _positive_minutes(value: str) -> int:
     return minutes
 
 
+def _positive_seconds(value: str) -> int:
+    try:
+        seconds = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "expiry must be a whole number of seconds"
+        ) from None
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("expiry must be greater than zero")
+    return seconds
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Read-only Pocket Option market data and signal runner."
+        description=(
+            "Pocket Option market-data and signal runner, with an explicit "
+            "single-order demo test."
+        )
     )
     parser.add_argument(
         "--run",
-        choices=("watch", "signals"),
+        choices=("watch", "signals", "test-trade"),
         default="watch",
-        help="Watch closed candles or generate signal-only paper records.",
+        help="Watch candles, generate paper signals, or place one demo test order.",
     )
     parser.add_argument(
         "--minutes",
@@ -368,6 +494,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Required when MODE=real; real mode remains read-only.",
     )
+    parser.add_argument(
+        "--direction",
+        choices=("call", "put"),
+        default="call",
+        help="Direction for --run test-trade (default: call).",
+    )
+    parser.add_argument(
+        "--pair",
+        help="Pair for --run test-trade (default: highest-payout eligible open pair).",
+    )
+    parser.add_argument(
+        "--expiry",
+        type=_positive_seconds,
+        default=EXPIRY_SECONDS,
+        help=f"Expiry in seconds for --run test-trade (default: {EXPIRY_SECONDS}).",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -375,14 +517,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
-        asyncio.run(
-            run_engine(
-                MODE,
-                confirm_real=args.confirm_real,
-                run_mode=args.run,
-                minutes=args.minutes,
+        if args.run == "test-trade":
+            asyncio.run(
+                run_test_trade(
+                    MODE,
+                    direction=args.direction,
+                    pair=args.pair,
+                    expiry_seconds=args.expiry,
+                )
             )
-        )
+        else:
+            asyncio.run(
+                run_engine(
+                    MODE,
+                    confirm_real=args.confirm_real,
+                    run_mode=args.run,
+                    minutes=args.minutes,
+                )
+            )
     except KeyboardInterrupt:
         logger.info("Stopped by user.")
         return 130
@@ -394,6 +546,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     except PocketOptionConnectionError as exc:
         logger.error("%s", exc)
+        return 1
+    except PocketOptionOrderRejected as exc:
+        logger.error("Demo order was not confirmed: %s", exc.reason)
+        logger.error(
+            "No retry was sent. If acceptance is unclear, check demo order history "
+            "before running the test again."
+        )
         return 1
     except PocketOptionBrokerError as exc:
         logger.error("%s", exc)

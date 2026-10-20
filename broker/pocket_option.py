@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any, TypeVar
 
@@ -41,6 +42,14 @@ class PocketOptionConnectionError(PocketOptionBrokerError):
 
 class PocketOptionOperationError(PocketOptionBrokerError):
     """Raised when a broker operation fails while the connection is healthy."""
+
+
+class PocketOptionOrderRejected(PocketOptionBrokerError):
+    """Raised when a demo order cannot be confirmed by Pocket Option."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
 
 
 class CandleHistoryUnavailable(PocketOptionBrokerError):
@@ -310,6 +319,29 @@ class PocketOptionBroker:
                 parsed[pair] = float(payout)
         return parsed
 
+    async def check_win(
+        self, trade_id: str, *, timeout_seconds: int
+    ) -> dict[str, Any]:
+        """Wait for the installed client to report a completed demo trade."""
+        if self.mode != "demo":
+            raise PocketOptionOperationError(
+                "Demo trade results can only be checked in demo mode."
+            )
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be greater than zero")
+        self._require_account_mode()
+        result = await self._request(
+            "check the demo trade result",
+            lambda client: client.check_win(
+                trade_id, timeout_seconds=timeout_seconds
+            ),
+        )
+        if not isinstance(result, dict):
+            raise PocketOptionOperationError(
+                "Pocket Option returned a trade result in an unexpected format."
+            )
+        return result
+
     async def candle_history(
         self, pair: str, period_seconds: int, lookback_seconds: int
     ) -> list[dict[str, Any]]:
@@ -443,16 +475,26 @@ class PocketOptionBroker:
                 pass
 
     async def buy(
-        self, pair: str, amount: float, direction: str, expiry_seconds: int
+        self,
+        pair: str,
+        amount: float,
+        direction: str,
+        expiry_seconds: int,
+        *,
+        stake_cap: float | None = None,
     ) -> Any:
-        """Place a demo order only; real mode is explicitly read-only."""
+        """Place one demo order without retrying an ambiguous submission."""
         if self.mode == "real":
             raise PocketOptionOperationError(
                 "Order placement is disabled in real mode; this phase is read-only."
             )
         self._require_account_mode()
-        if amount <= 0:
+        if not math.isfinite(amount) or amount <= 0:
             raise ValueError("amount must be greater than zero")
+        if stake_cap is not None:
+            if not math.isfinite(stake_cap) or stake_cap <= 0:
+                raise ValueError("stake_cap must be a finite number greater than zero")
+            amount = min(amount, stake_cap)
         if expiry_seconds <= 0:
             raise ValueError("expiry_seconds must be greater than zero")
 
@@ -460,15 +502,53 @@ class PocketOptionBroker:
         if normalized_direction not in {"call", "put"}:
             raise ValueError("direction must be either 'call' or 'put'")
 
-        if normalized_direction == "call":
-            return await self._request(
-                "place the demo call order",
-                lambda client: client.buy(pair, amount, expiry_seconds),
+        client = self._require_client()
+        submit = client.buy if normalized_direction == "call" else client.sell
+        try:
+            # Do not use _request here: its retry behavior is appropriate for
+            # reads, but retrying an order after a lost confirmation can duplicate it.
+            response = await submit(pair, amount, expiry_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            reason = str(exc).strip() or type(exc).__name__
+            if self._ssid:
+                reason = reason.replace(self._ssid, "[REDACTED SSID]")
+            raise PocketOptionOrderRejected(reason) from None
+
+        if not isinstance(response, (tuple, list)) or len(response) != 2:
+            raise PocketOptionOrderRejected(
+                "Pocket Option returned an invalid order confirmation."
             )
-        return await self._request(
-            "place the demo put order",
-            lambda client: client.sell(pair, amount, expiry_seconds),
-        )
+        trade_id, confirmation = response
+        if not isinstance(trade_id, str) or not trade_id.strip():
+            reason = "Pocket Option returned no trade ID."
+            if isinstance(confirmation, dict):
+                for field in ("error", "reason", "message"):
+                    value = confirmation.get(field)
+                    if isinstance(value, str) and value.strip():
+                        reason = value.strip()
+                        if self._ssid:
+                            reason = reason.replace(self._ssid, "[REDACTED SSID]")
+                        break
+            raise PocketOptionOrderRejected(reason)
+        if not isinstance(confirmation, dict):
+            raise PocketOptionOrderRejected(
+                "Pocket Option returned an invalid order confirmation."
+            )
+        if confirmation.get("success") is False or str(
+            confirmation.get("status", "")
+        ).lower() in {"rejected", "error", "failed"}:
+            reason = "Pocket Option rejected the order."
+            for field in ("error", "reason", "message"):
+                value = confirmation.get(field)
+                if isinstance(value, str) and value.strip():
+                    reason = value.strip()
+                    break
+            if self._ssid:
+                reason = reason.replace(self._ssid, "[REDACTED SSID]")
+            raise PocketOptionOrderRejected(reason)
+        return trade_id, confirmation
 
     async def _shutdown_client(self) -> None:
         if self._client is None:

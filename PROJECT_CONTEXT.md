@@ -28,15 +28,18 @@ Safety rules:
 - **Built:** Phase 2 — indicator calculations, signal-only pullback/reversal
   strategy, paper outcome tracker, CSV signal output, and demo/real mode
   confirmation and account checks.
-- **Next:** A single, explicitly authorized demo trade test. No real trade test.
-- **After that:** Risk manager and automatic demo trading.
+- **Built:** An explicitly invoked, one-order demo `test-trade` command, capped at
+  $1. It has not been run against Pocket Option.
+- **Next:** Risk manager and automatic demo trading.
 - **Later:** Persistent storage using a Turso/SQLite-style database, not
   Supabase; deployment to Render's free tier with a cron keep-alive; then UI.
 
 The current risk manager, configurable drawdown stops, persistent database,
 Render deployment, and GBot UI are **not implemented**. `MIN_PAYOUT` is currently
 one fixed Python setting, not a selector for the planned payout choices. The
-paper tracker uses a $1 stake, but it is not a live staking/risk system.
+paper tracker uses a $1 stake, but it is not a live staking/risk system. The
+demo test command is the only CLI path that places an order; never run it without
+the user's explicit authorization to place that one demo trade.
 
 ## Architecture and file map
 
@@ -44,15 +47,17 @@ paper tracker uses a $1 stake, but it is not a live staking/risk system.
 
 - `main.py` — CLI entry point and async orchestration. `watch` reads and prints
   closed candles; `signals` evaluates setups, writes `signals.csv`, and records
-  paper outcomes. It does not call an order method.
+  paper outcomes. The separate `test-trade` mode sends exactly one capped demo
+  order, waits for settlement, and reads the resulting balance; it does not use
+  the strategy.
 - `config.py` — mode and secret selection, state-key namespaces, indicator,
   strategy, candle, paper, payout, and connection settings. Full setting
   reference is below.
 - `broker/pocket_option.py` — async adapter over
   `BinaryOptionsToolsV2`. Validates the connected account mode, reads balance
   and payouts, retrieves historical candles, streams ticks, and reconnects with
-  bounded backoff. Its `buy` method rejects real mode; do not invoke its demo
-  order path outside the explicitly authorized demo test.
+  bounded backoff. Its `buy` method rejects real mode, supports a caller-provided
+  stake cap, and submits an order once without retrying an ambiguous result.
 - `data/candles.py` — converts broker timestamps and aggregates ticks into
   aligned OHLC candles, retains recent closed candles, and seeds history.
 - `indicators/moving_average.py` — SMA and EMA series.
@@ -102,8 +107,11 @@ paper tracker uses a $1 stake, but it is not a live staking/risk system.
 - The broker verifies that Pocket Option reports the same account type as
   `MODE` after connecting and refuses a mismatch.
 - Real mode can read balance, payouts, candles, and ticks, but the broker rejects
-  real-mode orders. The CLI itself has no `buy`/`sell` calls. The signal-only
-  path is paper tracking, not trading.
+  real-mode orders. `watch` and `signals` do not place orders; `test-trade` is the
+  only CLI order path and refuses real mode before loading a secret or connecting.
+- `PocketOptionBroker.buy()` independently refuses real mode. Order submission
+  bypasses the adapter's retrying read helper so a lost confirmation cannot
+  cause an automatic second order.
 - The broker library connects during client construction. Do not run the CLI as
   a test or type a real-mode command casually; a CLI run is a live connection.
 - SSID format/validation errors name the expected secret but do not echo its
@@ -212,6 +220,7 @@ constants rather than environment-backed user preferences.
 | `SIGNAL_COOLDOWN_CANDLES` | `3` | Per-pair closed-candle cooldown after a signal. |
 | `EXPIRY_SECONDS` | `30` | Paper outcome expiry. |
 | `PAPER_STAKE` | `1.0` | Paper tracker stake in dollars; not live risk control. |
+| `TEST_TRADE_STAKE_CAP` | `1.0` | Maximum stake sent by the one-shot demo test command. |
 | `PAPER_SUMMARY_EVERY_SIGNALS` | `10` | Paper summary frequency. |
 | `SIGNALS_CSV_PATH` | `"signals.csv"` | Signal append-output path. |
 | `RECONNECT_MAX_ATTEMPTS` | `6` | Maximum reconnect attempts. |
@@ -261,6 +270,27 @@ test command. Do not run any live command without an explicit reason and the
 correct Replit Secret. There is no Python CLI workflow configured by the
 starter workspace.
 
+The one-shot order test command is:
+
+```sh
+MODE=demo uv run --locked python main.py --run test-trade
+```
+
+This command is **live**: it connects to Pocket Option and places one $1 demo
+order. It defaults to `call`, chooses the highest-payout pair currently meeting
+`MIN_PAYOUT`, and uses the configured 30-second `EXPIRY_SECONDS`. Optional
+choices are `--direction put`, `--pair EURUSD_otc`, and `--expiry 45`. An explicit
+pair must currently meet the minimum payout. Do not run this command without
+explicit authorization for that one demo trade.
+
+The installed, locked `BinaryOptionsToolsV2==0.2.15` API was inspected: `buy` and
+`sell` accept `(asset, amount, time, check_win=False)` and return a trade ID plus
+confirmation data; `check_win(id, timeout_seconds=...)` waits for the result and
+returns the result/profit mapping. This version exposes no supported-expiry list
+API. Provider rejection text is preserved (with the SSID redacted), and any
+supported-expiry details included in that response are printed. No order retry
+is made.
+
 The separate TypeScript starter workspace is installed with
 `pnpm install --frozen-lockfile`; its scripts include `pnpm run typecheck`,
 `pnpm run build`, and `pnpm --filter @workspace/api-server run dev`. Those
@@ -270,7 +300,10 @@ PostgreSQL schema push as bot storage.
 ## Verification performed for this context update
 
 - Python dependencies synced from `uv.lock` with `uv sync --locked`.
-- Ran the full Python unittest suite; **33 passed**.
-- No Pocket Option session, network market-data request, order, or trade was
-  initiated. Broker tests substitute a fake client.
-- No application source code was changed.
+- Ran the full Python unittest suite offline; **42 passed**, including mocked
+  success, loss, rejection/no-retry, real-mode refusal, stake-cap, and SSID
+  redaction coverage.
+- Checked CLI help, Python compilation, and `git diff --check`.
+- Verified the installed library order and settlement signatures without
+  connecting. No Pocket Option session, market-data request, order, or trade was
+  initiated; all order tests use fake clients.
