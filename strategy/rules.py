@@ -351,8 +351,6 @@ def trigger_a(
     forming_candle: Candle | None,
 ) -> tuple[bool, str]:
     """Evaluate a live touch in the directional middle-band zone."""
-    if not evaluation.setup_passes:
-        return False, "setup conditions have not all passed"
     if live_price is None or forming_candle is None or evaluation.middle is None:
         return False, "waiting for a live price and forming candle"
     price = float(live_price)
@@ -360,18 +358,20 @@ def trigger_a(
     bearish = price < float(forming_candle.open)
     if evaluation.direction == "SELL":
         in_zone = evaluation.middle <= price <= (evaluation.upper or evaluation.middle)
-        matched = in_zone and bullish
+        matched = evaluation.setup_passes and in_zone and bullish
         return (
             matched,
             f"price={_fmt(price)} zone=[{_fmt(evaluation.middle)},"
-            f"{_fmt(evaluation.upper)}] bullish={bullish}",
+            f"{_fmt(evaluation.upper)}] bullish={bullish} "
+            f"setup={evaluation.setup_passes}",
         )
     in_zone = (evaluation.lower or evaluation.middle) <= price <= evaluation.middle
-    matched = in_zone and bearish
+    matched = evaluation.setup_passes and in_zone and bearish
     return (
         matched,
         f"price={_fmt(price)} zone=[{_fmt(evaluation.lower)},"
-        f"{_fmt(evaluation.middle)}] bearish={bearish}",
+        f"{_fmt(evaluation.middle)}] bearish={bearish} "
+        f"setup={evaluation.setup_passes}",
     )
 
 
@@ -380,8 +380,6 @@ def trigger_b(
     rejection_candle: Candle | None,
 ) -> tuple[bool, str]:
     """Evaluate the closed-candle rejection against the prior setup's bands."""
-    if not evaluation.setup_passes:
-        return False, "setup conditions have not all passed on prior candle"
     if rejection_candle is None or evaluation.middle is None:
         return False, "waiting for the rejection candle to close"
     if evaluation.direction == "SELL":
@@ -391,7 +389,8 @@ def trigger_b(
         )
         detail = (
             f"high={_fmt(rejection_candle.high)} ≥ mid={_fmt(evaluation.middle)} "
-            f"close={_fmt(rejection_candle.close)} < mid"
+            f"close={_fmt(rejection_candle.close)} < mid "
+            f"setup={evaluation.setup_passes}"
         )
     else:
         matched = (
@@ -400,6 +399,7 @@ def trigger_b(
         )
         detail = (
             f"low={_fmt(rejection_candle.low)} ≤ mid={_fmt(evaluation.middle)} "
-            f"close={_fmt(rejection_candle.close)} > mid"
+            f"close={_fmt(rejection_candle.close)} > mid "
+            f"setup={evaluation.setup_passes}"
         )
-    return matched, detail
+    return evaluation.setup_passes and matched, detail

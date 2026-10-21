@@ -20,15 +20,25 @@ secrets disable Telegram and leave console notifications available.
 - Read-only broker connection with bounded reconnect backoff, payout reads,
   historical candle seeding, and live tick subscriptions.
 - 10-second OHLC candle construction and Stochastic, moving average, Bollinger
-  Bands, and Keltner Channel indicators.
+  Bands, and optional Keltner Channel indicators. Strategy rules use only
+  completed candles; index 0 means the latest completed candle.
+- Configurable, explainable S1-S4 setup rules, live-touch (A) and closed-rejection
+  (B) triggers, with a range-consolidation filter.
 - Pullback-reversal signals with payout-independent strength, ranked active
   signals, per-pair cooldown, duplicate suppression, and expiration.
 - `feed-check` prints every top-pair tick with UTC and local timestamps and
   reports the informational account type.
-- `replay` evaluates seeded candle history for every pair meeting
-  `MIN_PAYOUT`. Its candle-only trigger and outcomes are approximate.
+- `explain` prints both directional conditions and the current trigger state
+  every ten seconds.
+- `replay` / `strategy-lab` compares 24 rule variants on the same data and
+  reports approximate 30/60/120-second outcomes and 92%-payout break-even.
+- `scanner --record` appends every completed scanned candle to
+  `data/candles.csv`; replay reads this file when available.
 - Console and Telegram notifiers send through an asynchronous, freshness- and
   rate-limited queue.
+- `telegram-setup` lists chats returned by Telegram `getUpdates`. It never
+  prints the bot token. `test-signals` sends explicitly labeled test messages;
+  these are not confirmed signals and never submit trades.
 - Paper outcomes use a delayed entry, 30/60/120-second expiries, and in-memory
   or CSV storage. Ties count as losses.
 - `scanner` prints signals, stream health, and paper summaries. `watch` remains
@@ -41,22 +51,27 @@ uv sync --locked
 uv run --locked python -m unittest discover -s tests -v
 uv run --locked python main.py --run watch
 uv run --locked python main.py --run feed-check
+uv run --locked python main.py --run telegram-setup
+uv run --locked python main.py --run explain --seconds 30
 uv run --locked python main.py --run replay
 uv run --locked python main.py --run notify-test
-uv run --locked python main.py --run scanner --minutes 3
+uv run --locked python main.py --run test-signals
+uv run --locked python main.py --run scanner --minutes 3 --record
 ```
 
 `watch` runs for `RUN_DURATION_SECONDS`. `feed-check` samples for 30 seconds.
-`replay` uses seeded historical candles and prints per-pair and total
-approximate summaries. `notify-test` sends one sample notification. Live
-commands need valid configured secrets; offline tests use mocks and do not
-connect to Pocket Option or Telegram.
+`explain` defaults to the highest-payout three pairs and prints every ten
+seconds; `--pair X` selects one. Replay reads recorded candles first; if the
+file is absent it asks the broker for up to 3,000 closed 10-second candles per
+eligible pair and reports how many were returned. `notify-test` sends one
+sample Telegram message. `test-signals` sends up to three marked diagnostic
+messages using a fresh live price. Live commands need their configured secrets.
+Offline tests use mocks and do not connect to Pocket Option or Telegram.
 
 ## Settings
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
-| `MIN_PAYOUT_OPTIONS` | `(80, 85, 88, 92)` | Supported payout threshold choices |
 | `MIN_PAYOUT` | `80` | Minimum payout for eligible pairs |
 | `MAX_SCAN_PAIRS` | `20` | Maximum concurrent scanner pairs |
 | `PAYOUT_REFRESH_SECONDS` | `60` | Pair eligibility refresh interval |
@@ -70,38 +85,30 @@ connect to Pocket Option or Telegram.
 | `SIGNALS_CSV_PATH` | `"signals.csv"` | CSV signal-store path |
 | `CANDLE_INTERVAL_SECONDS` | `10` | Candle interval |
 | `MAX_CANDLES_PER_PAIR` | `300` | Retained/seeded candles per pair |
-| `HISTORY_LOOKBACK_SECONDS` | `3000` | History lookback for 300 ten-second candles |
-| `TOP_PAIRS_COUNT` | `3` | Highest-payout pairs for watch and feed-check |
+| `REPLAY_MAX_CANDLES_PER_PAIR` | `3000` | Maximum requested replay candles |
+| `DATA_CANDLES_CSV_PATH` | `"data/candles.csv"` | Recorded candle and replay file |
+| `TOP_PAIRS_COUNT` | `3` | Default pairs for watch, feed-check, and explain |
 | `RUN_DURATION_SECONDS` | `120` | Default watch duration |
-| `USE_MOVING_AVERAGE` | `True` | Enable moving-average confirmation |
-| `MOVING_AVERAGE_METHOD` | `"EMA"` | Moving-average method |
-| `MOVING_AVERAGE_PERIOD` | `10` | Moving-average period |
-| `USE_BOLLINGER_BANDS` | `True` | Enable Bollinger confirmation |
+| `TRIGGER_VARIANT` | `"A"` | Live touch (`A`) or closed rejection (`B`) |
+| `S1_ENABLED` … `S4_ENABLED` | `True` | Individual setup-condition switches |
+| `STOCHASTIC_LOOKBACK_CANDLES` | `5` | Stochastic setup lookback |
+| `STOCHASTIC_LOOKBACK_OPTIONS` | `(3, 5, 8)` | Strategy-lab variants |
+| `STOCHASTIC_PERIOD` | `14` | Raw stochastic lookback |
+| `STOCHASTIC_SMOOTH_K` / `STOCHASTIC_SMOOTH_D` | `3` / `3` | Stochastic smoothing |
+| `STOCHASTIC_OVERBOUGHT` / `STOCHASTIC_OVERSOLD` | `80` / `20` | Direction thresholds |
+| `MOVING_AVERAGE_PERIOD` | `10` | EMA period |
+| `MA_RISE_MIN` | `0.0005` | Minimum preceding MA move (ratio) |
+| `MA_FLAT_TOL` | `0.0005` | Maximum opposing MA slope (ratio) |
+| `MID_FLAT_TOL` | `0.0005` | Bollinger middle-band slope tolerance |
 | `BOLLINGER_PERIOD` | `20` | Bollinger period |
 | `BOLLINGER_STANDARD_DEVIATIONS` | `2.0` | Bollinger band width |
-| `USE_STOCHASTIC` | `True` | Enable Stochastic confirmation |
-| `STOCHASTIC_PERIOD` | `14` | Stochastic period |
-| `STOCHASTIC_SMOOTH_K` / `STOCHASTIC_SMOOTH_D` | `3` / `3` | Stochastic smoothing |
-| `STOCHASTIC_OVERBOUGHT` / `STOCHASTIC_OVERSOLD` | `80.0` / `20.0` | Stochastic thresholds |
-| `STOCHASTIC_USE_ALTERNATE_LEVELS` | `False` | Enable alternate thresholds |
-| `STOCHASTIC_ALTERNATE_OVERBOUGHT` / `STOCHASTIC_ALTERNATE_OVERSOLD` | `70.0` / `30.0` | Alternate thresholds |
-| `USE_KELTNER_CHANNEL` | `False` | Enable Keltner calculation |
-| `KELTNER_EMA_PERIOD` | `20` | Keltner EMA period |
-| `KELTNER_ATR_PERIOD` | `10` | Keltner ATR period |
-| `KELTNER_ATR_MULTIPLIER` | `2.0` | Keltner ATR multiplier |
-| `STOCHASTIC_OVERBOUGHT_LOOKBACK_CANDLES` | `5` | Stochastic setup lookback |
-| `MA_PRIOR_RISE_LOOKBACK_CANDLES` | `6` | Prior moving-average trend lookback |
-| `MA_TURN_LOOKBACK_CANDLES` | `3` | Moving-average turn lookback |
-| `BB_TREND_LOOKBACK_CANDLES` | `3` | Bollinger trend lookback |
-| `MA_FLAT_TOLERANCE_PERCENT` | `0.05` | Moving-average flattening tolerance |
+| `BB_WIDTH_MEAN_LOOKBACK_CANDLES` | `50` | Range-filter width average |
+| `RANGE_MAX_RATIO` | `1.2` | Maximum current/average width ratio |
 | `SIGNAL_COOLDOWN_CANDLES` | `3` | Per-pair signal cooldown |
 | `STRENGTH_WEIGHTS` | `{stochastic: 30, moving_average: 25, bollinger: 25, middle_band_touch: 20}` | Confirmation-only strength weights; total 100 |
-| `STRENGTH_STOCHASTIC_EXTREMITY_REFERENCE` | `15.0` | Stochastic extremity normalization reference |
-| `STRENGTH_STOCHASTIC_TURN_REFERENCE` | `10.0` | Stochastic turn normalization reference |
-| `STRENGTH_MA_TURN_REFERENCE_PERCENT` | `0.10` | Moving-average turn normalization reference |
-| `STRENGTH_BB_SLOPE_REFERENCE_PERCENT` | `0.10` | Bollinger slope normalization reference |
-| `STRENGTH_BB_CURVATURE_REFERENCE_PERCENT` | `0.05` | Bollinger curvature normalization reference |
+| `STRENGTH_*_REFERENCE` | in `config.py` | Strength component calibration |
 | `STRENGTH_TOUCH_REFERENCE_RANGE_MULTIPLIER` | `0.50` | Middle-band touch cleanliness reference |
+| `BREAKEVEN_PAYOUT_PERCENT` | `92` | Break-even reference for strategy lab |
 | `RECONNECT_MAX_ATTEMPTS` | `6` | Maximum broker reconnect attempts |
 | `RECONNECT_BASE_DELAY_SECONDS` | `1.0` | Initial reconnect backoff |
 | `RECONNECT_MAX_DELAY_SECONDS` | `30.0` | Maximum reconnect backoff |
@@ -112,26 +119,29 @@ connect to Pocket Option or Telegram.
 
 ## File map
 
-- `main.py` — CLI commands: watch, feed-check, replay, scanner, notify-test.
+- `main.py` — CLI commands, Telegram chat setup, explain, and test signals.
 - `config.py` — secrets loading and scanner, strategy, notification, and paper
   settings.
 - `broker/pocket_option.py` — read-only Pocket Option adapter.
 - `data/candles.py` — 10-second candle builder and history seeding.
+- `data/candle_store.py` — CSV recording and replay loading.
 - `indicators/` — moving average, Bollinger Bands, Stochastic, and Keltner.
-- `strategy/` — pullback-reversal strategy, replay, and strength scoring.
+- `strategy/SPEC.md` — exact rule, index, and trigger specification.
+- `strategy/` — rule evaluation, pullback-reversal strategy, replay lab, and
+  strength scoring.
 - `scanner.py` — multi-pair scan loop, active signals, and stream health.
 - `notifications.py` — notifier interface, console/Telegram implementations,
   and asynchronous queue.
 - `paper/` — delayed paper outcome tracking and in-memory/CSV stores.
 - `tests/` — offline tests with mocked broker and Telegram HTTP.
 
-## Parked ideas
+## Safety and scope
 
 - Signal labels `BUY` and `SELL` are direction-only labels; they never submit
   orders. Account-mode selection, `MODE`, `PO_SSID_DEMO`, and `PO_SSID_REAL` are
   retired. Account balance tracking, stake/profit calculations, peak/drawdown
   tracking, `check_win`, `test-trade`, `whoami`, and `--confirm-real` are not
   part of the scanner.
-- Automatic execution and a risk manager are out of scope.
+- Automatic execution, monetary risk management, and a database are out of
+  scope. No signal, diagnostic message, or replay can place a trade.
 - A PWA with web push may be considered later.
-- A database and user accounts are out of scope.

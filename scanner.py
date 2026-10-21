@@ -110,6 +110,9 @@ class SignalScanner:
                     config.HISTORY_LOOKBACK_SECONDS,
                 )
                 builder.seed(history)
+                if self.on_candle is not None:
+                    for candle in builder.closed:
+                        self.on_candle(pair, candle)
             except CandleHistoryUnavailable as exc:
                 logger.warning("%s", exc)
             except CandleDataError as exc:

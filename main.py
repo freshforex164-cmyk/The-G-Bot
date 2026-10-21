@@ -56,6 +56,7 @@ from strategy.replay import (
     win_rate,
 )
 from notifications import TelegramNotifier, telegram_get_updates
+from strategy.strength import score_strength
 
 logger = logging.getLogger("gbot")
 
@@ -468,6 +469,9 @@ async def run_notify_test() -> bool:
         valid_until=now + timedelta(seconds=config.SIGNAL_VALID_SECONDS),
     )
     notifier = build_notifier()
+    if not isinstance(notifier, TelegramNotifier):
+        print("NOTIFY TEST FAILED: Telegram is disabled because its secrets are missing.")
+        return False
     try:
         result = await notifier.send(sample)
     except TelegramSendError as exc:
@@ -477,21 +481,422 @@ async def run_notify_test() -> bool:
     return True
 
 
+def _chat_from_update(update: dict[str, Any]) -> dict[str, Any] | None:
+    for key in ("message", "channel_post", "edited_channel_post", "my_chat_member"):
+        item = update.get(key)
+        if isinstance(item, dict) and isinstance(item.get("chat"), dict):
+            return item["chat"]
+    callback = update.get("callback_query")
+    if isinstance(callback, dict):
+        message = callback.get("message")
+        if isinstance(message, dict) and isinstance(message.get("chat"), dict):
+            return message["chat"]
+    return None
+
+
+async def run_telegram_setup() -> bool:
+    """List Telegram chats from bot updates without exposing the bot token."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        print("TELEGRAM SETUP FAILED: missing TELEGRAM_BOT_TOKEN.")
+        print("Post in the channel or press Start on the bot first, then retry.")
+        return False
+    try:
+        updates = await telegram_get_updates(token)
+    except TelegramSendError as exc:
+        print(f"TELEGRAM SETUP FAILED: {exc}")
+        print("Post in the channel or press Start on the bot first, then retry.")
+        return False
+
+    chats: dict[str, dict[str, Any]] = {}
+    for update in updates:
+        chat = _chat_from_update(dict(update))
+        if chat is None or "id" not in chat:
+            continue
+        chats[str(chat["id"])] = chat
+    if not chats:
+        print("No chats found in the bot's pending updates.")
+    else:
+        for chat_id, chat in sorted(chats.items()):
+            title_or_username = chat.get("title") or chat.get("username") or "(not provided)"
+            print(
+                f"Chat id={chat_id} type={chat.get('type', 'unknown')} "
+                f"title/username={title_or_username}"
+            )
+    print("Reminder: post in the channel or press Start on the bot first.")
+    return True
+
+
+def _explain_for_pair(
+    pair: str,
+    builder: CandleBuilder,
+    latest_price: float | None,
+) -> list[str]:
+    closed = tuple(builder.closed)
+    lines = [f"EXPLAIN {pair}"]
+    for direction in ("SELL", "BUY"):
+        if config.TRIGGER_VARIANT == "B":
+            evaluation = evaluate_direction(closed[:-1], direction) if len(closed) > 1 else evaluate_direction((), direction)
+            rejection = closed[-1] if closed else None
+            triggered, trigger_detail = trigger_b(evaluation, rejection)
+        else:
+            evaluation = evaluate_direction(closed, direction)
+            triggered, trigger_detail = trigger_a(
+                evaluation, latest_price, builder.forming_candle
+            )
+        lines.append(f"{direction}:")
+        lines.extend(f"  {condition.line()}" for condition in evaluation.conditions)
+        trigger_mark = "✅" if triggered else "❌"
+        lines.append(
+            f"  TRIGGER {config.TRIGGER_VARIANT} {trigger_detail} {trigger_mark}"
+        )
+        if triggered:
+            result = "SIGNAL"
+        elif evaluation.first_failure is not None:
+            result = f"FAIL {evaluation.first_failure.key}"
+        else:
+            result = f"FAIL TRIGGER {config.TRIGGER_VARIANT}"
+        lines.append(f"  RESULT {result}")
+    return lines
+
+
+async def run_explain(*, pair: str | None = None, seconds: int = 30) -> bool:
+    """Print both directional rule tables on a ten-second cadence."""
+    if seconds <= 0:
+        raise ValueError("seconds must be greater than zero")
+    broker = PocketOptionBroker(load_ssid())
+    builders: dict[str, CandleBuilder] = {}
+    payouts: dict[str, float] = {}
+    latest_prices: dict[str, float] = {}
+    streams: dict[str, AsyncGenerator[dict[str, Any], None]] = {}
+    tasks: list[asyncio.Task[None]] = []
+    try:
+        await broker.connect()
+        live_payouts = await broker.payouts()
+        if pair:
+            selected = [(pair, float(live_payouts.get(pair, 0.0)))]
+        else:
+            selected = sorted(
+                (
+                    (symbol, float(payout))
+                    for symbol, payout in live_payouts.items()
+                    if float(payout) >= MIN_PAYOUT
+                ),
+                key=lambda item: (-item[1], item[0]),
+            )[:TOP_PAIRS_COUNT]
+        if not selected:
+            print("EXPLAIN FAILED: no eligible pairs were returned.")
+            return False
+
+        for symbol, payout in selected:
+            payouts[symbol] = payout
+            builder = CandleBuilder(
+                period_seconds=CANDLE_INTERVAL_SECONDS,
+                max_candles=config.REPLAY_MAX_CANDLES_PER_PAIR,
+            )
+            try:
+                history = await broker.candle_history(
+                    symbol,
+                    CANDLE_INTERVAL_SECONDS,
+                    config.REPLAY_HISTORY_LOOKBACK_SECONDS,
+                )
+                count = builder.seed(history)
+            except (CandleHistoryUnavailable, CandleDataError) as exc:
+                logger.warning("History for %s unavailable (%s).", symbol, type(exc).__name__)
+                count = 0
+            print(f"EXPLAIN seeded {symbol}: {count} closed candles")
+            builders[symbol] = builder
+            streams[symbol] = broker.subscribe_ticks(symbol)
+
+        async def pump(symbol: str) -> None:
+            stream = streams[symbol]
+            try:
+                async for tick in stream:
+                    builders[symbol].update(tick)
+                    latest_prices[symbol] = float(
+                        tick.get("close", tick.get("price"))
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Explain stream for %s stopped (%s).",
+                    symbol,
+                    type(exc).__name__,
+                )
+            finally:
+                await stream.aclose()
+
+        tasks = [
+            asyncio.create_task(pump(symbol), name=f"explain-{symbol}")
+            for symbol, _ in selected
+        ]
+        started = asyncio.get_running_loop().time()
+        next_print = started
+        deadline = started + seconds
+        while next_print <= deadline:
+            await asyncio.sleep(max(0.0, next_print - asyncio.get_running_loop().time()))
+            elapsed = int(next_print - started)
+            print(f"EXPLAIN sample +{elapsed}s")
+            for symbol, _ in selected:
+                for line in _explain_for_pair(
+                    symbol, builders[symbol], latest_prices.get(symbol)
+                ):
+                    print(line)
+            next_print += 10.0
+            if next_print > deadline:
+                break
+        return True
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for stream in streams.values():
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
+        await broker.close()
+
+
+def _test_signal_score(evaluation: DirectionEvaluation) -> int:
+    score, _components = score_strength(
+        stochastic_extremity=evaluation.stochastic_extremity,
+        stochastic_turn=evaluation.stochastic_turn,
+        moving_average_turn=evaluation.ma_turn_percent,
+        bollinger_slope=evaluation.middle_slope_percent,
+        bollinger_curvature=evaluation.band_curvature_percent,
+        touch_cleanliness=0.5,
+    )
+    return score
+
+
+def _test_signal_evaluations(
+    pair: str,
+    payout: float,
+    builder: CandleBuilder,
+    tick: dict[str, Any],
+) -> list[dict[str, Any]]:
+    try:
+        price = float(tick.get("close", tick.get("price")))
+        timestamp = datetime.fromtimestamp(
+            _normalize_broker_timestamp(tick.get("timestamp", tick.get("time"))),
+            timezone.utc,
+        )
+    except (TypeError, ValueError, OverflowError, OSError, CandleDataError):
+        return []
+    evaluations: list[dict[str, Any]] = []
+    closed = tuple(builder.closed)
+    for direction in ("SELL", "BUY"):
+        if config.TRIGGER_VARIANT == "B":
+            if len(closed) < 2:
+                continue
+            evaluation = evaluate_direction(closed[:-1], direction)
+            triggered, trigger_detail = trigger_b(evaluation, closed[-1])
+        else:
+            evaluation = evaluate_direction(closed, direction)
+            triggered, trigger_detail = trigger_a(
+                evaluation, price, builder.forming_candle
+            )
+        matched = sum(condition.eligible for condition in evaluation.conditions)
+        matched += int(triggered)
+        evaluations.append(
+            {
+                "pair": pair,
+                "payout": payout,
+                "direction": direction,
+                "evaluation": evaluation,
+                "triggered": triggered,
+                "trigger_detail": trigger_detail,
+                "match": matched,
+                "strength": _test_signal_score(evaluation),
+                "price": price,
+                "timestamp": timestamp,
+                "conditions": evaluation.conditions,
+            }
+        )
+    return evaluations
+
+
+def _format_test_signal(candidate: dict[str, Any]) -> str:
+    timestamp: datetime = candidate["timestamp"]
+    expiry = config.RECOMMENDED_EXPIRY_SECONDS
+    expiry_label = f"{expiry // 60}m" if expiry % 60 == 0 else f"{expiry}s"
+    condition_parts = [
+        f"{condition.key} {'✅' if condition.eligible else '❌'}"
+        for condition in candidate["conditions"]
+    ]
+    condition_parts.append(
+        f"TRIGGER {'✅' if candidate['triggered'] else '❌'}"
+    )
+    line_one = (
+        f"🧪 TEST {candidate['direction']} {candidate['pair']} "
+        f"@{candidate['price']:.4f} | Payout {candidate['payout']:g}% | "
+        f"Match {candidate['match']}/5 | "
+        f"Expiry {expiry_label} | "
+        f"{timestamp.strftime('%H:%M:%S')} UTC"
+    )
+    return (
+        f"{line_one}\n{' | '.join(condition_parts)}\n"
+        "Not a confirmed signal"
+    )
+
+
+async def run_test_signals() -> int:
+    """Send up to three explicitly marked diagnostic messages, never orders."""
+    notifier = build_notifier()
+    if not isinstance(notifier, TelegramNotifier):
+        print("TEST SIGNALS FAILED: Telegram is disabled because its secrets are missing.")
+        return 1
+    broker = PocketOptionBroker(load_ssid())
+    streams: dict[str, AsyncGenerator[dict[str, Any], None]] = {}
+    builders: dict[str, CandleBuilder] = {}
+    payouts: dict[str, float] = {}
+    initial_ticks: dict[str, dict[str, Any]] = {}
+    try:
+        await broker.connect()
+        live_payouts = await broker.payouts()
+        selected = sorted(
+            (
+                (symbol, float(value))
+                for symbol, value in live_payouts.items()
+                if float(value) >= MIN_PAYOUT
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )[: config.MAX_SCAN_PAIRS]
+        if not selected:
+            print("TEST SIGNALS FAILED: no eligible pairs were returned.")
+            return 1
+
+        async def prepare(symbol: str, payout: float) -> None:
+            builder = CandleBuilder(
+                period_seconds=CANDLE_INTERVAL_SECONDS,
+                max_candles=config.REPLAY_MAX_CANDLES_PER_PAIR,
+            )
+            try:
+                history = await broker.candle_history(
+                    symbol,
+                    CANDLE_INTERVAL_SECONDS,
+                    config.REPLAY_HISTORY_LOOKBACK_SECONDS,
+                )
+                builder.seed(history)
+            except (CandleHistoryUnavailable, CandleDataError) as exc:
+                logger.warning("History for %s unavailable (%s).", symbol, type(exc).__name__)
+            stream = broker.subscribe_ticks(symbol)
+            builders[symbol] = builder
+            payouts[symbol] = payout
+            streams[symbol] = stream
+            try:
+                tick = await asyncio.wait_for(anext(stream), timeout=15.0)
+                builder.update(tick)
+                initial_ticks[symbol] = tick
+            except (TimeoutError, StopAsyncIteration):
+                logger.warning("No live price arrived for %s.", symbol)
+
+        await asyncio.gather(*(prepare(symbol, payout) for symbol, payout in selected))
+        candidates = [
+            item
+            for symbol, _ in selected
+            if symbol in initial_ticks
+            for item in _test_signal_evaluations(
+                symbol,
+                payouts[symbol],
+                builders[symbol],
+                initial_ticks[symbol],
+            )
+        ]
+        best_by_pair: dict[str, dict[str, Any]] = {}
+        for candidate in candidates:
+            current = best_by_pair.get(candidate["pair"])
+            if current is None or (
+                candidate["match"], candidate["strength"]
+            ) > (current["match"], current["strength"]):
+                best_by_pair[candidate["pair"]] = candidate
+        best = sorted(
+            best_by_pair.values(),
+            key=lambda item: (-item["match"], -item["strength"], -item["payout"]),
+        )[:3]
+        if not best:
+            print("TEST SIGNALS FAILED: no pair produced a live price and candle history.")
+            return 1
+
+        sent = 0
+        for candidate in best:
+            symbol = candidate["pair"]
+            stream = streams[symbol]
+            try:
+                tick = await asyncio.wait_for(anext(stream), timeout=10.0)
+                builders[symbol].update(tick)
+                refreshed = _test_signal_evaluations(
+                    symbol, payouts[symbol], builders[symbol], tick
+                )
+                match = next(
+                    (item for item in refreshed if item["direction"] == candidate["direction"]),
+                    None,
+                )
+                if match is not None:
+                    candidate = match
+            except (TimeoutError, StopAsyncIteration):
+                logger.warning("No fresh send-time price arrived for %s.", symbol)
+                continue
+            text = _format_test_signal(candidate)
+            print(text, flush=True)
+            try:
+                await notifier.send_text(text)
+                sent += 1
+            except TelegramSendError as exc:
+                print(f"TEST SIGNAL SEND FAILED for {symbol}: {exc}", flush=True)
+        print(f"TEST SIGNALS SENT: {sent}/{len(best)}")
+        return 0 if sent == len(best) else 1
+    finally:
+        for stream in streams.values():
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
+        await broker.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Read-only Pocket Option feed and strategy scanner."
     )
     parser.add_argument(
         "--run",
-        choices=("watch", "feed-check", "replay", "scanner", "notify-test"),
+        choices=(
+            "watch",
+            "feed-check",
+            "replay",
+            "strategy-lab",
+            "scanner",
+            "notify-test",
+            "telegram-setup",
+            "explain",
+            "test-signals",
+        ),
         default="watch",
-        help="View candles, check the feed, replay history, scan signals, or test notifications.",
+        help="Select a read-only feed, strategy, or notification command.",
     )
     parser.add_argument(
         "--minutes",
         type=float,
         default=3.0,
         help="Scanner run length in minutes (default: 3).",
+    )
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        help="Append each closed scanner candle to data/candles.csv.",
+    )
+    parser.add_argument(
+        "--pair",
+        help="Pair to inspect with --run explain; defaults to the top three by payout.",
+    )
+    parser.add_argument(
+        "--seconds",
+        type=int,
+        default=30,
+        help="Explain sampling duration in seconds (default: 30).",
     )
     args = parser.parse_args(argv)
 
@@ -502,12 +907,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.run == "feed-check":
             return 0 if asyncio.run(run_feed_check()) else 1
-        if args.run == "replay":
+        if args.run in {"replay", "strategy-lab"}:
             asyncio.run(run_replay())
         elif args.run == "scanner":
-            asyncio.run(run_scanner(minutes=args.minutes))
+            asyncio.run(run_scanner(minutes=args.minutes, record=args.record))
         elif args.run == "notify-test":
             return 0 if asyncio.run(run_notify_test()) else 1
+        elif args.run == "telegram-setup":
+            return 0 if asyncio.run(run_telegram_setup()) else 1
+        elif args.run == "explain":
+            return (
+                0
+                if asyncio.run(run_explain(pair=args.pair, seconds=args.seconds))
+                else 1
+            )
+        elif args.run == "test-signals":
+            return asyncio.run(run_test_signals())
         else:
             asyncio.run(run_watch())
     except KeyboardInterrupt:
