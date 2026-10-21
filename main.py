@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import logging
 import math
+import os
 from collections.abc import AsyncGenerator, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -40,11 +41,21 @@ from data.candles import (
     CandleDataError,
     _normalize_broker_timestamp,
 )
+from data.candle_store import CsvCandleStore
 from paper.store import CsvSignalStore
 from paper.tracker import PaperTracker
 from scanner import SignalScanner
+from strategy.rules import DirectionEvaluation, evaluate_direction, trigger_a, trigger_b
 from strategy.pullback_reversal import Signal
-from strategy.replay import REPLAY_HORIZONS, ReplaySummary, replay_candles
+from strategy.replay import (
+    REPLAY_HORIZONS,
+    ReplaySummary,
+    run_strategy_lab,
+    strength_percentiles,
+    strategy_variants,
+    win_rate,
+)
+from notifications import TelegramNotifier, telegram_get_updates
 
 logger = logging.getLogger("gbot")
 
@@ -285,51 +296,109 @@ def _merge_replay_summaries(
     return total
 
 
-async def run_replay() -> list[ReplaySummary]:
-    """Replay seeded closed candles for every pair above the payout threshold."""
-    broker = PocketOptionBroker(load_ssid())
-    summaries: list[ReplaySummary] = []
-    try:
-        await broker.connect()
-        payouts = await broker.payouts()
-        pairs = sorted(
-            (
-                (pair, payout)
-                for pair, payout in payouts.items()
-                if payout >= MIN_PAYOUT
-            ),
-            key=lambda item: (-item[1], item[0]),
-        )
-        if not pairs:
-            raise PocketOptionBrokerError(
-                f"No open pair meets the minimum payout of {MIN_PAYOUT}%."
-            )
-        for pair, _payout in pairs:
-            builder = CandleBuilder(
-                period_seconds=CANDLE_INTERVAL_SECONDS,
-                max_candles=MAX_CANDLES_PER_PAIR,
-            )
-            history = await broker.candle_history(
-                pair, CANDLE_INTERVAL_SECONDS, HISTORY_LOOKBACK_SECONDS
-            )
-            seeded = builder.seed(history)
-            if seeded < MAX_CANDLES_PER_PAIR:
-                logger.warning(
-                    "%s history returned %d of %d requested candles.",
-                    pair,
-                    seeded,
-                    MAX_CANDLES_PER_PAIR,
-                )
-            summary = replay_candles(pair, tuple(builder.closed))
-            summaries.append(summary)
-            print(_format_replay_summary(summary), flush=True)
+def _format_lab_rate(summary: ReplaySummary, horizon: int) -> str:
+    rate = win_rate(summary, horizon)
+    return "n/a" if rate is None else f"{rate:.1f}%"
+
+
+def _print_strategy_lab(
+    results: dict[str, ReplaySummary],
+) -> None:
+    print("APPROXIMATE STRATEGY LAB")
+    print(
+        "Variant | Signals | 30s WR | 60s WR | 120s WR | "
+        f"Break-even @ {config.BREAKEVEN_PAYOUT_PERCENT}% payout"
+    )
+    break_even = 100.0 / (1.0 + config.BREAKEVEN_PAYOUT_PERCENT / 100.0)
+    for variant in strategy_variants():
+        summary = results[variant.name]
         print(
-            _format_replay_summary(_merge_replay_summaries(summaries)),
-            flush=True,
+            f"{variant.name} | {summary.signal_count} | "
+            f"{_format_lab_rate(summary, 3)} | "
+            f"{_format_lab_rate(summary, 6)} | "
+            f"{_format_lab_rate(summary, 12)} | {break_even:.1f}%"
         )
-        return summaries
-    finally:
-        await broker.close()
+    default_variant = next(
+        variant
+        for variant in strategy_variants()
+        if variant.trigger == config.TRIGGER_VARIANT
+        and variant.s2_enabled == config.S2_ENABLED
+        and variant.s4_enabled == config.S4_ENABLED
+        and variant.stochastic_lookback == config.STOCHASTIC_LOOKBACK_CANDLES
+    )
+    percentiles = strength_percentiles([results[default_variant.name]])
+    if percentiles is None:
+        print("Strength calibration: no replay signals to measure.")
+    else:
+        print(
+            "Default-variant strength percentiles: "
+            + " ".join(f"p{p}={value:.1f}" for p, value in percentiles.items())
+        )
+
+
+async def run_replay() -> dict[str, ReplaySummary]:
+    """Load recorded candles or seed up to 3,000 live candles, then compare variants."""
+    store = CsvCandleStore(config.DATA_CANDLES_CSV_PATH)
+    candles_by_pair = store.load()
+    if candles_by_pair:
+        candles_by_pair = {
+            pair: series[-config.REPLAY_MAX_CANDLES_PER_PAIR :]
+            for pair, series in candles_by_pair.items()
+        }
+        print(f"Replay source: {config.DATA_CANDLES_CSV_PATH}")
+        for pair, series in sorted(candles_by_pair.items()):
+            print(
+                f"Loaded {pair}: {len(series)} closed 10-second candles "
+                f"(maximum {config.REPLAY_MAX_CANDLES_PER_PAIR})"
+            )
+    else:
+        broker = PocketOptionBroker(load_ssid())
+        try:
+            await broker.connect()
+            payouts = await broker.payouts()
+            pairs = sorted(
+                (
+                    (pair, float(payout))
+                    for pair, payout in payouts.items()
+                    if float(payout) >= MIN_PAYOUT
+                ),
+                key=lambda item: (-item[1], item[0]),
+            )[: config.MAX_SCAN_PAIRS]
+            if not pairs:
+                raise PocketOptionBrokerError(
+                    f"No pair meets the minimum payout of {MIN_PAYOUT}%."
+                )
+            for pair, _payout in pairs:
+                builder = CandleBuilder(
+                    period_seconds=CANDLE_INTERVAL_SECONDS,
+                    max_candles=config.REPLAY_MAX_CANDLES_PER_PAIR,
+                )
+                try:
+                    history = await broker.candle_history(
+                        pair,
+                        CANDLE_INTERVAL_SECONDS,
+                        config.REPLAY_HISTORY_LOOKBACK_SECONDS,
+                    )
+                    actual = builder.seed(history)
+                except CandleHistoryUnavailable as exc:
+                    logger.warning("%s", exc)
+                    actual = 0
+                except CandleDataError as exc:
+                    logger.warning(
+                        "History for %s was skipped (%s).", pair, type(exc).__name__
+                    )
+                    actual = 0
+                print(
+                    f"Seeded {pair}: {actual} closed 10-second candles "
+                    f"(requested up to {config.REPLAY_MAX_CANDLES_PER_PAIR})"
+                )
+                candles_by_pair[pair] = list(builder.closed)
+        finally:
+            await broker.close()
+
+    results = run_strategy_lab(candles_by_pair)
+    _print_strategy_lab(results)
+    return results
 
 
 def _format_signal_line(signal: Signal) -> str:
@@ -349,19 +418,25 @@ def _format_signal_line(signal: Signal) -> str:
     )
 
 
-async def run_scanner(*, minutes: float) -> None:
+async def run_scanner(*, minutes: float, record: bool = False) -> None:
     tracker = PaperTracker(store=CsvSignalStore(config.SIGNALS_CSV_PATH))
     queue = NotificationQueue(build_notifier())
+    candle_store = CsvCandleStore(config.DATA_CANDLES_CSV_PATH) if record else None
 
     def on_signal(signal: Signal) -> None:
         tracker.record_signal(signal)
         print(_format_signal_line(signal), flush=True)
         queue.enqueue(signal)
 
+    def on_candle(pair: str, candle: Candle) -> None:
+        if candle_store is not None:
+            candle_store.append(pair, candle)
+
     scanner = SignalScanner(
         PocketOptionBroker(load_ssid()),
         on_signal=on_signal,
         on_tick=tracker.update_price,
+        on_candle=on_candle if record else None,
     )
     queue.start()
     try:

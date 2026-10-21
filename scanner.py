@@ -11,7 +11,7 @@ from typing import Any
 
 import config
 from broker.pocket_option import CandleHistoryUnavailable, PocketOptionBroker
-from data.candles import CandleBuilder, CandleDataError, _normalize_broker_timestamp
+from data.candles import Candle, CandleBuilder, CandleDataError, _normalize_broker_timestamp
 from strategy.pullback_reversal import PullbackReversalStrategy, Signal
 
 logger = logging.getLogger("gbot.scanner")
@@ -36,11 +36,13 @@ class SignalScanner:
         *,
         on_signal: SignalCallback | None = None,
         on_tick: TickCallback | None = None,
+        on_candle: Callable[[str, Candle], None] | None = None,
         output: OutputCallback = print,
     ) -> None:
         self.broker = broker
         self.on_signal = on_signal
         self.on_tick = on_tick
+        self.on_candle = on_candle
         self.output = output
         self.pairs: dict[str, PairScanState] = {}
         self.signals: dict[str, Signal] = {}
@@ -154,7 +156,19 @@ class SignalScanner:
     ) -> None:
         closed = state.candles.update(tick)
         if closed is not None:
-            state.strategy.on_closed_candles(pair, tuple(state.candles.closed))
+            if self.on_candle is not None:
+                try:
+                    self.on_candle(pair, closed)
+                except Exception as exc:
+                    logger.error(
+                        "Candle recording failed (%s).", type(exc).__name__
+                    )
+            state.strategy.on_closed_candles(
+                pair, tuple(state.candles.closed), payout=state.payout
+            )
+            closed_signal = state.strategy.take_closed_signal(pair)
+            if closed_signal is not None:
+                self._publish_signal(closed_signal)
         try:
             price = float(tick.get("close", tick.get("price")))
             timestamp = datetime.fromtimestamp(
@@ -177,7 +191,10 @@ class SignalScanner:
         )
         if signal is None:
             return
-        self.expire_signals(timestamp)
+        self._publish_signal(signal)
+
+    def _publish_signal(self, signal: Signal) -> None:
+        self.expire_signals(signal.time)
         if any(
             active.status == "ACTIVE"
             and active.pair == signal.pair

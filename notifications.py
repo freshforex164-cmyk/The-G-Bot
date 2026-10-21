@@ -71,7 +71,9 @@ class TelegramNotifier:
         self._opener = opener or urllib.request.urlopen
 
     async def send(self, signal: Signal) -> str:
-        message = format_signal_message(signal)
+        return await self.send_text(format_signal_message(signal))
+
+    async def send_text(self, message: str) -> str:
         await asyncio.to_thread(self._send_sync, message)
         return "sent through Telegram"
 
@@ -159,6 +161,62 @@ class TelegramNotifier:
         else:
             message = f"Telegram send failed (HTTP {status})."
         raise TelegramSendError(message)
+
+
+async def telegram_get_updates(
+    token: str,
+    *,
+    timeout: float = 5.0,
+    opener: Callable[..., object] | None = None,
+) -> list[Mapping[str, object]]:
+    """Read Telegram updates without ever including the token in errors."""
+    if not token.strip():
+        raise TelegramSendError("Missing required secret TELEGRAM_BOT_TOKEN.")
+    open_request = opener or urllib.request.urlopen
+
+    def fetch() -> list[Mapping[str, object]]:
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        try:
+            response = open_request(request, timeout=timeout)
+            with response:  # type: ignore[attr-defined]
+                status = int(
+                    getattr(response, "status", response.getcode())  # type: ignore[attr-defined]
+                )
+                body = response.read()  # type: ignore[attr-defined]
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read()
+            except Exception:
+                body = b""
+            TelegramNotifier._raise_api_error(exc.code, body)
+            raise AssertionError("unreachable")
+        except urllib.error.URLError as exc:
+            raise TelegramSendError(
+                f"Telegram getUpdates request failed ({type(exc.reason).__name__})."
+            ) from None
+        except TelegramSendError:
+            raise
+        except Exception as exc:
+            raise TelegramSendError(
+                f"Telegram getUpdates request failed ({type(exc).__name__})."
+            ) from None
+
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise TelegramSendError("Telegram returned an unreadable getUpdates response.")
+        if not 200 <= status < 300 or not payload.get("ok"):
+            TelegramNotifier._raise_api_error(status, body)
+        updates = payload.get("result", [])
+        if not isinstance(updates, list):
+            raise TelegramSendError("Telegram returned an unexpected getUpdates response.")
+        return [item for item in updates if isinstance(item, Mapping)]
+
+    return await asyncio.to_thread(fetch)
 
 
 def build_notifier(
