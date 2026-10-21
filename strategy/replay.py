@@ -10,6 +10,7 @@ from config import SIGNAL_COOLDOWN_CANDLES
 from data.candles import Candle
 from indicators.bollinger_bands import calculate_bollinger_bands
 from strategy.pullback_reversal import PullbackReversalStrategy
+from strategy.strength import score_strength
 
 REPLAY_HORIZONS = (3, 6, 12)
 
@@ -20,7 +21,7 @@ class ReplaySignal:
     direction: str
     candle_index: int
     entry_price: float
-    strength: float | None = None
+    strength: int
     outcomes: dict[int, str] = field(default_factory=dict)
 
 
@@ -73,6 +74,29 @@ def replay_candles(pair: str, candles: Iterable[Candle]) -> ReplaySummary:
         if not touched:
             continue
 
+        touch_range = max(0.0, float(current.high) - float(current.low))
+        touch_distance = (
+            max(0.0, float(current.high) - float(middle))
+            if setup.direction == "SELL"
+            else max(0.0, float(middle) - float(current.low))
+        )
+        touch_reference = (
+            touch_range * config.STRENGTH_TOUCH_REFERENCE_RANGE_MULTIPLIER
+        )
+        touch_cleanliness = (
+            max(0.0, 1.0 - touch_distance / touch_reference)
+            if touch_reference > 0
+            else 0.0
+        )
+        strength, _components = score_strength(
+            stochastic_extremity=setup.stochastic_extremity,
+            stochastic_turn=setup.stochastic_turn,
+            moving_average_turn=setup.moving_average_turn,
+            bollinger_slope=setup.bollinger_slope,
+            bollinger_curvature=setup.bollinger_curvature,
+            touch_cleanliness=touch_cleanliness,
+        )
+
         outcomes: dict[int, str] = {}
         for horizon in REPLAY_HORIZONS:
             exit_index = current_index + horizon
@@ -86,11 +110,15 @@ def replay_candles(pair: str, candles: Iterable[Candle]) -> ReplaySummary:
             direction=setup.direction,
             candle_index=current_index,
             entry_price=float(middle),
+            strength=strength,
             outcomes=outcomes,
         )
         summary.signals.append(signal)
         summary.directions[setup.direction] += 1
-        summary.strength_buckets["unscored"] += 1
+        strength_bucket = (
+            "0-59" if strength < 60 else "60-79" if strength < 80 else "80-100"
+        )
+        summary.strength_buckets[strength_bucket] += 1
         for horizon, result in outcomes.items():
             summary.outcomes[horizon][result] += 1
         last_signal_index = current_index

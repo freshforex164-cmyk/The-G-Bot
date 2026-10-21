@@ -1,134 +1,150 @@
-"""In-memory price-outcome tracking for scanner signals."""
+"""Delayed-entry, multi-expiry outcome tracking without monetary calculations."""
 
 from __future__ import annotations
 
 import math
-import time
-from collections import defaultdict
-from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from collections.abc import Callable, Iterable
+from datetime import datetime, timedelta, timezone
 
-
-@dataclass
-class PaperOutcome:
-    pair: str
-    direction: str
-    entry_price: float
-    time: datetime
-    expires_at_monotonic: float
-    exit_price: float | None = None
-    result: str | None = None
+import config
+from paper.store import (
+    ExpiryOutcome,
+    InMemorySignalStore,
+    SignalRecord,
+    SignalStore,
+)
+from strategy.pullback_reversal import Signal
 
 
 class PaperTracker:
-    """Score later price movement for signals without monetary calculations."""
-
     def __init__(
         self,
         *,
-        expiry_seconds: int = 30,
-        summary_every: int = 10,
+        store: SignalStore | None = None,
+        expiries_seconds: Iterable[int] = config.PAPER_EXPIRIES_SECONDS,
+        human_delay_seconds: int = config.HUMAN_DELAY_SECONDS,
         output: Callable[[str], None] = print,
     ) -> None:
-        if expiry_seconds <= 0:
-            raise ValueError("expiry_seconds must be greater than zero")
-        if summary_every <= 0:
-            raise ValueError("summary_every must be greater than zero")
-        self.expiry_seconds = expiry_seconds
-        self.summary_every = summary_every
+        expiries = tuple(sorted(set(expiries_seconds)))
+        if not expiries or any(expiry <= 0 for expiry in expiries):
+            raise ValueError("paper expiries must be positive")
+        if human_delay_seconds < 0:
+            raise ValueError("human delay cannot be negative")
+        self.expiries_seconds = expiries
+        self.human_delay_seconds = human_delay_seconds
+        self.store = store or InMemorySignalStore()
         self.output = output
-        self.signals: list[PaperOutcome] = []
-        self._open_by_pair: dict[str, list[PaperOutcome]] = defaultdict(list)
-        self.wins = 0
-        self.losses = 0
+        self.records: dict[str, SignalRecord] = {}
 
-    @property
-    def total(self) -> int:
-        return len(self.signals)
-
-    @property
-    def settled(self) -> int:
-        return self.wins + self.losses
-
-    @property
-    def pending(self) -> int:
-        return self.total - self.settled
-
-    @property
-    def win_rate(self) -> float:
-        return self.wins / self.settled * 100.0 if self.settled else 0.0
-
-    def record_signal(
-        self,
-        pair: str,
-        direction: str,
-        entry_price: float,
-        signal_time: datetime,
-        *,
-        monotonic_now: float | None = None,
-    ) -> PaperOutcome:
-        direction = direction.upper()
-        if direction not in {"BUY", "SELL"}:
-            raise ValueError("direction must be 'BUY' or 'SELL'")
-        if not math.isfinite(entry_price) or entry_price <= 0:
-            raise ValueError("entry_price must be a finite number greater than zero")
-        if signal_time.tzinfo is None:
-            signal_time = signal_time.replace(tzinfo=timezone.utc)
-        now = time.monotonic() if monotonic_now is None else monotonic_now
-        signal = PaperOutcome(
-            pair=pair,
-            direction=direction,
-            entry_price=float(entry_price),
-            time=signal_time,
-            expires_at_monotonic=now + self.expiry_seconds,
+    def record_signal(self, signal: Signal) -> SignalRecord:
+        if signal.direction not in {"BUY", "SELL"}:
+            raise ValueError("signal direction must be BUY or SELL")
+        if not math.isfinite(signal.entry_price) or signal.entry_price <= 0:
+            raise ValueError("signal entry price must be positive and finite")
+        record = SignalRecord(
+            signal=signal,
+            outcomes={
+                expiry: ExpiryOutcome(expiry_seconds=expiry)
+                for expiry in self.expiries_seconds
+            },
         )
-        self.signals.append(signal)
-        self._open_by_pair[pair].append(signal)
-        if self.total % self.summary_every == 0:
-            self.print_summary()
-        return signal
+        self.records[signal.id] = record
+        self._persist(record)
+        return record
 
     def update_price(
         self,
         pair: str,
         live_price: float,
-        *,
-        monotonic_now: float | None = None,
-    ) -> list[PaperOutcome]:
-        """Settle elapsed signals using the latest price; equal prices lose."""
+        timestamp: datetime,
+    ) -> list[ExpiryOutcome]:
         if not math.isfinite(live_price):
             return []
-        now = time.monotonic() if monotonic_now is None else monotonic_now
-        open_signals = self._open_by_pair.get(pair, [])
-        remaining: list[PaperOutcome] = []
-        settled: list[PaperOutcome] = []
-        for signal in open_signals:
-            if now < signal.expires_at_monotonic:
-                remaining.append(signal)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        settled: list[ExpiryOutcome] = []
+        for record in self.records.values():
+            signal = record.signal
+            if signal.pair != pair:
                 continue
-            signal.exit_price = float(live_price)
-            won = (
-                live_price < signal.entry_price
-                if signal.direction == "SELL"
-                else live_price > signal.entry_price
-            )
-            signal.result = "WIN" if won else "LOSS"
-            self.wins += int(won)
-            self.losses += int(not won)
-            settled.append(signal)
-        if remaining:
-            self._open_by_pair[pair] = remaining
-        else:
-            self._open_by_pair.pop(pair, None)
+            if signal.time.tzinfo is None:
+                signal.time = signal.time.replace(tzinfo=timezone.utc)
+            changed = False
+            entry_at = signal.time + timedelta(seconds=self.human_delay_seconds)
+            if record.entry_price is None and timestamp >= entry_at:
+                record.entry_price = float(live_price)
+                record.entry_time = timestamp
+                for outcome in record.outcomes.values():
+                    outcome.entry_price = float(live_price)
+                changed = True
+
+            if record.entry_price is not None and record.entry_time is not None:
+                for expiry, outcome in record.outcomes.items():
+                    due_at = record.entry_time + timedelta(seconds=expiry)
+                    if outcome.result is not None or timestamp < due_at:
+                        continue
+                    outcome.exit_price = float(live_price)
+                    outcome.settled_at = timestamp
+                    won = (
+                        live_price < record.entry_price
+                        if signal.direction == "SELL"
+                        else live_price > record.entry_price
+                    )
+                    outcome.result = "WIN" if won else "LOSS"
+                    settled.append(outcome)
+                    changed = True
+
+            if changed or record.saved_status != signal.status:
+                self._persist(record)
         return settled
 
+    def _persist(self, record: SignalRecord) -> None:
+        self.store.save(record)
+        record.saved_status = record.signal.status
+
+    @staticmethod
+    def _win_rate(wins: int, count: int) -> float:
+        return wins / count * 100.0 if count else 0.0
+
+    def summary_lines(self) -> list[str]:
+        for record in self.records.values():
+            if record.saved_status != record.signal.status:
+                self._persist(record)
+
+        lines: list[str] = []
+        for expiry in self.expiries_seconds:
+            outcomes = [
+                record.outcomes[expiry]
+                for record in self.records.values()
+                if record.outcomes[expiry].result is not None
+            ]
+            wins = sum(outcome.result == "WIN" for outcome in outcomes)
+            count = len(outcomes)
+            lines.append(
+                f"PAPER expiry={expiry}s count={count} wins={wins} "
+                f"win_rate={self._win_rate(wins, count):.1f}%"
+            )
+
+        buckets = (("0-59", 0, 59), ("60-79", 60, 79), ("80-100", 80, 100))
+        for label, low, high in buckets:
+            for expiry in self.expiries_seconds:
+                outcomes = [
+                    record.outcomes[expiry]
+                    for record in self.records.values()
+                    if low <= record.signal.strength <= high
+                    and record.outcomes[expiry].result is not None
+                ]
+                wins = sum(outcome.result == "WIN" for outcome in outcomes)
+                count = len(outcomes)
+                lines.append(
+                    f"PAPER strength={label} expiry={expiry}s count={count} "
+                    f"wins={wins} win_rate={self._win_rate(wins, count):.1f}%"
+                )
+        return lines
+
     def summary(self) -> str:
-        return (
-            f"[PAPER] signals={self.total} settled={self.settled} "
-            f"wins={self.wins} losses={self.losses} pending={self.pending} "
-            f"win_rate={self.win_rate:.1f}%"
-        )
+        return "\n".join(self.summary_lines())
 
     def print_summary(self) -> None:
-        self.output(self.summary())
+        for line in self.summary_lines():
+            self.output(line)

@@ -7,9 +7,10 @@ import asyncio
 import logging
 import math
 from collections.abc import AsyncGenerator, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import config
 from broker.pocket_option import (
     CandleHistoryUnavailable,
     PocketOptionAuthenticationError,
@@ -27,12 +28,22 @@ from config import (
     TOP_PAIRS_COUNT,
     load_ssid,
 )
+from notifications import (
+    NotificationQueue,
+    TelegramSendError,
+    build_notifier,
+    format_signal_message,
+)
 from data.candles import (
     Candle,
     CandleBuilder,
     CandleDataError,
     _normalize_broker_timestamp,
 )
+from paper.store import CsvSignalStore
+from paper.tracker import PaperTracker
+from scanner import SignalScanner
+from strategy.pullback_reversal import Signal
 from strategy.replay import REPLAY_HORIZONS, ReplaySummary, replay_candles
 
 logger = logging.getLogger("gbot")
@@ -321,15 +332,91 @@ async def run_replay() -> list[ReplaySummary]:
         await broker.close()
 
 
+def _format_signal_line(signal: Signal) -> str:
+    timestamp = signal.time.astimezone(timezone.utc).isoformat(timespec="seconds")
+    valid_for = max(
+        0,
+        int(
+            (signal.valid_until - signal.time).total_seconds()
+            if signal.valid_until is not None
+            else 0
+        ),
+    )
+    return (
+        f"{timestamp} {signal.pair} {signal.direction} "
+        f"payout={signal.payout:g}% strength={signal.strength} "
+        f"expiry={signal.recommended_expiry_seconds}s valid-for={valid_for}s"
+    )
+
+
+async def run_scanner(*, minutes: float) -> None:
+    tracker = PaperTracker(store=CsvSignalStore(config.SIGNALS_CSV_PATH))
+    queue = NotificationQueue(build_notifier())
+
+    def on_signal(signal: Signal) -> None:
+        tracker.record_signal(signal)
+        print(_format_signal_line(signal), flush=True)
+        queue.enqueue(signal)
+
+    scanner = SignalScanner(
+        PocketOptionBroker(load_ssid()),
+        on_signal=on_signal,
+        on_tick=tracker.update_price,
+    )
+    queue.start()
+    try:
+        await scanner.run(minutes=minutes)
+    finally:
+        await queue.close()
+        tracker.print_summary()
+
+
+async def run_notify_test() -> bool:
+    now = datetime.now(timezone.utc)
+    sample = Signal(
+        pair="BITB_otc",
+        direction="SELL",
+        price=24.0017,
+        time=now,
+        stochastic_k=80.0,
+        stochastic_d=75.0,
+        ma_slope=-0.01,
+        bollinger_middle=24.0,
+        payout=92.0,
+        strength=84,
+        strength_components={
+            "stochastic": 26,
+            "moving_average": 21,
+            "bollinger": 20,
+            "middle_band_touch": 17,
+        },
+        valid_until=now + timedelta(seconds=config.SIGNAL_VALID_SECONDS),
+    )
+    notifier = build_notifier()
+    try:
+        result = await notifier.send(sample)
+    except TelegramSendError as exc:
+        print(f"NOTIFY TEST FAILED: {exc}", flush=True)
+        return False
+    print(f"NOTIFY TEST OK: {result}", flush=True)
+    return True
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Read-only Pocket Option feed and strategy scanner."
     )
     parser.add_argument(
         "--run",
-        choices=("watch", "feed-check", "replay"),
+        choices=("watch", "feed-check", "replay", "scanner", "notify-test"),
         default="watch",
-        help="View candles, sample the live feed, or replay historical candles.",
+        help="View candles, check the feed, replay history, scan signals, or test notifications.",
+    )
+    parser.add_argument(
+        "--minutes",
+        type=float,
+        default=3.0,
+        help="Scanner run length in minutes (default: 3).",
     )
     args = parser.parse_args(argv)
 
@@ -342,6 +429,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0 if asyncio.run(run_feed_check()) else 1
         if args.run == "replay":
             asyncio.run(run_replay())
+        elif args.run == "scanner":
+            asyncio.run(run_scanner(minutes=args.minutes))
+        elif args.run == "notify-test":
+            return 0 if asyncio.run(run_notify_test()) else 1
         else:
             asyncio.run(run_watch())
     except KeyboardInterrupt:

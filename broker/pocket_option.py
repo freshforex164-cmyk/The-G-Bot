@@ -30,7 +30,7 @@ class PocketOptionBrokerError(RuntimeError):
 
 
 class PocketOptionAuthenticationError(PocketOptionBrokerError):
-    """Raised when the active SSID is invalid or belongs to the wrong account mode."""
+    """Raised when the active market-data session is invalid or expired."""
 
 
 class PocketOptionConnectionError(PocketOptionBrokerError):

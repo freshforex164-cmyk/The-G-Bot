@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from data.candles import Candle
 from indicators.bollinger_bands import calculate_bollinger_bands
@@ -10,7 +10,7 @@ from indicators.keltner_channel import calculate_keltner_channel
 from indicators.moving_average import calculate_moving_average
 from indicators.stochastic import calculate_stochastic
 from paper.tracker import PaperTracker
-from strategy.pullback_reversal import PullbackReversalStrategy
+from strategy.pullback_reversal import PullbackReversalStrategy, Signal
 
 
 def candles_from_closes(closes: list[float]) -> list[Candle]:
@@ -189,41 +189,65 @@ class PullbackReversalStrategyTests(unittest.TestCase):
 
 
 class PaperTrackerTests(unittest.TestCase):
-    def test_price_outcomes_and_ties_are_losses(self) -> None:
-        tracker = PaperTracker(expiry_seconds=30, summary_every=10, output=lambda _: None)
+    def test_human_delay_and_all_three_expiries_score_ties_as_losses(self) -> None:
+        tracker = PaperTracker(output=lambda _: None)
         now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        sell_win = tracker.record_signal(
-            "EURUSD_otc", "SELL", 1.2, now, monotonic_now=100
+        signal = Signal(
+            pair="EURUSD_otc",
+            direction="SELL",
+            price=1.2,
+            time=now,
+            stochastic_k=90,
+            stochastic_d=85,
+            ma_slope=-0.01,
+            bollinger_middle=1.1,
+            payout=92,
+            strength=84,
+            strength_components={"stochastic": 25},
+            valid_until=now + timedelta(seconds=15),
         )
-        buy_loss = tracker.record_signal(
-            "EURUSD_otc", "BUY", 1.2, now, monotonic_now=200
-        )
-        tie = tracker.record_signal("USDCHF_otc", "SELL", 1.0, now, monotonic_now=300)
-        self.assertEqual(
-            tracker.update_price("EURUSD_otc", 1.1, monotonic_now=130), [sell_win]
-        )
-        self.assertEqual(
-            tracker.update_price("EURUSD_otc", 1.1, monotonic_now=230), [buy_loss]
-        )
-        self.assertEqual(
-            tracker.update_price("USDCHF_otc", 1.0, monotonic_now=330), [tie]
-        )
-        self.assertEqual([sell_win.result, buy_loss.result, tie.result],
-                         ["WIN", "LOSS", "LOSS"])
-        self.assertEqual(tracker.total, 3)
-        self.assertEqual((tracker.wins, tracker.losses), (1, 2))
-        self.assertAlmostEqual(tracker.win_rate, 100.0 / 3.0)
-        self.assertNotIn("$", tracker.summary())
+        record = tracker.record_signal(signal)
 
-    def test_tracker_summary_at_configured_signal_count(self) -> None:
-        output: list[str] = []
-        tracker = PaperTracker(summary_every=2, output=output.append)
-        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        tracker.record_signal("A", "BUY", 1.0, now, monotonic_now=0)
-        tracker.record_signal("A", "BUY", 1.0, now, monotonic_now=1)
-        self.assertEqual(len(output), 1)
-        self.assertIn("signals=2", output[0])
-        self.assertIn("pending=2", output[0])
+        self.assertEqual(
+            tracker.update_price(
+                "EURUSD_otc", 1.3, now + timedelta(seconds=4)
+            ),
+            [],
+        )
+        self.assertIsNone(record.entry_price)
+        self.assertEqual(
+            tracker.update_price(
+                "EURUSD_otc", 1.2, now + timedelta(seconds=5)
+            ),
+            [],
+        )
+        self.assertEqual(record.entry_price, 1.2)
+        self.assertEqual(
+            [item.result for item in tracker.update_price(
+                "EURUSD_otc", 1.1, now + timedelta(seconds=35)
+            )],
+            ["WIN"],
+        )
+        self.assertEqual(
+            [item.result for item in tracker.update_price(
+                "EURUSD_otc", 1.3, now + timedelta(seconds=65)
+            )],
+            ["LOSS"],
+        )
+        self.assertEqual(
+            [item.result for item in tracker.update_price(
+                "EURUSD_otc", 1.2, now + timedelta(seconds=125)
+            )],
+            ["LOSS"],
+        )
+        summary = tracker.summary()
+        self.assertIn("expiry=30s count=1 wins=1 win_rate=100.0%", summary)
+        self.assertIn("expiry=60s count=1 wins=0 win_rate=0.0%", summary)
+        self.assertIn("expiry=120s count=1 wins=0 win_rate=0.0%", summary)
+        self.assertIn(
+            "strength=80-100 expiry=120s count=1 wins=0 win_rate=0.0%",
+            summary,
+        )
 
 
 if __name__ == "__main__":
