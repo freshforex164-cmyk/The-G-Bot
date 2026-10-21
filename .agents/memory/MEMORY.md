@@ -1,1 +1,0 @@
-- [G Bots engine scope](gbot-scope.md) — real mode requires explicit confirmation and stays read-only; future state keys must remain mode-isolated.

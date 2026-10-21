@@ -6,6 +6,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Iterable
 
+import config
 from config import SIGNAL_COOLDOWN_CANDLES
 from data.candles import Candle
 from indicators.bollinger_bands import calculate_bollinger_bands

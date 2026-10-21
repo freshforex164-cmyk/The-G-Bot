@@ -85,6 +85,7 @@ class SignalScanner:
 
         removed = set(self.pairs) - set(desired)
         for pair in removed:
+            self._receiving_pairs.discard(pair)
             task = self._tasks.pop(pair, None)
             if task is not None:
                 task.cancel()

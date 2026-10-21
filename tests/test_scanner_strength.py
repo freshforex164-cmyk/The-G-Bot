@@ -192,10 +192,13 @@ class MultiPairScannerTests(unittest.IsolatedAsyncioTestCase):
         await broker.connect()
         await scanner.refresh_pairs()
         self.assertEqual(set(scanner.pairs), {"A", "B"})
+        scanner._receiving_pairs.update({"A", "B"})
         broker.payout_map = {"B": 88.0, "C": 92.0}
         await scanner.refresh_pairs()
         await asyncio.sleep(0)
         self.assertEqual(set(scanner.pairs), {"B", "C"})
+        self.assertEqual(scanner._receiving_pairs, {"B", "C"})
+        self.assertNotIn("A", scanner._receiving_pairs)
         self.assertEqual(scanner.pairs["B"].payout, 88.0)
         for task in scanner._tasks.values():
             task.cancel()

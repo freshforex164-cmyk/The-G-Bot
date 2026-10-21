@@ -70,7 +70,14 @@ class ReplayTests(unittest.TestCase):
         candles[23] = Candle(230, 99.0, 99.1, 98.9, 99.0)
         candles[26] = Candle(260, 101.0, 101.1, 100.9, 101.0)
         candles[32] = Candle(320, 99.0, 99.1, 98.9, 99.0)
-        setup = SimpleNamespace(direction="SELL")
+        setup = SimpleNamespace(
+            direction="SELL",
+            stochastic_extremity=10.0,
+            stochastic_turn=5.0,
+            moving_average_turn=0.04,
+            bollinger_slope=0.05,
+            bollinger_curvature=0.025,
+        )
 
         with patch.object(
             PullbackReversalStrategy,
@@ -87,7 +94,8 @@ class ReplayTests(unittest.TestCase):
             signal.outcomes,
             {3: "WIN", 6: "LOSS", 12: "WIN"},
         )
-        self.assertEqual(summary.strength_buckets["unscored"], 1)
+        self.assertEqual(signal.strength, 39)
+        self.assertEqual(summary.strength_buckets["0-59"], 1)
 
 
 if __name__ == "__main__":
