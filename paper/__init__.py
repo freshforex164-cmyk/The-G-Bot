@@ -1,5 +1,5 @@
 """Paper-only signal tracking."""
 
-from paper.tracker import PaperTrade, PaperTracker
+from paper.tracker import PaperOutcome, PaperTracker
 
-__all__ = ["PaperTrade", "PaperTracker"]
+__all__ = ["PaperOutcome", "PaperTracker"]

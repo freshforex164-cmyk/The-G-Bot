@@ -1,16 +1,13 @@
-"""Run the read-only G Bots watch and signal engine."""
+"""Read-only command-line market-data viewer for GBot."""
 
 from __future__ import annotations
 
-import asyncio
 import argparse
-import csv
+import asyncio
 import logging
 import math
-import time
 from collections.abc import AsyncGenerator, Sequence
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from broker.pocket_option import (
@@ -19,42 +16,26 @@ from broker.pocket_option import (
     PocketOptionBroker,
     PocketOptionBrokerError,
     PocketOptionConnectionError,
-    PocketOptionOrderRejected,
 )
 from config import (
     CANDLE_INTERVAL_SECONDS,
     ConfigurationError,
-    EXPIRY_SECONDS,
     HISTORY_LOOKBACK_SECONDS,
     MAX_CANDLES_PER_PAIR,
-    MAX_PAIRS,
-    MODE,
     MIN_PAYOUT,
     RUN_DURATION_SECONDS,
-    SIGNALS_CSV_PATH,
-    SIGNAL_RUN_DEFAULT_MINUTES,
-    TEST_TRADE_STAKE_CAP,
     TOP_PAIRS_COUNT,
-    load_mode_ssid,
-    validate_mode,
+    load_ssid,
 )
-from data.candles import Candle, CandleBuilder, CandleDataError
-from paper.tracker import PaperTracker
-from strategy.pullback_reversal import PullbackReversalStrategy, Signal
-
-logger = logging.getLogger("g_bots")
-
-SIGNAL_CSV_FIELDS = (
-    "time",
-    "pair",
-    "direction",
-    "price",
-    "stochastic_k",
-    "stochastic_d",
-    "ma_slope",
-    "bollinger_middle",
-    "payout_percent",
+from data.candles import (
+    Candle,
+    CandleBuilder,
+    CandleDataError,
+    _normalize_broker_timestamp,
 )
+from strategy.replay import REPLAY_HORIZONS, ReplaySummary, replay_candles
+
+logger = logging.getLogger("gbot")
 
 
 def _format_candle(pair: str, candle: Candle) -> str:
@@ -62,51 +43,9 @@ def _format_candle(pair: str, candle: Candle) -> str:
         timespec="seconds"
     )
     return (
-        f"{pair} {timestamp} "
-        f"O={candle.open:g} H={candle.high:g} "
+        f"{timestamp} {pair} O={candle.open:g} H={candle.high:g} "
         f"L={candle.low:g} C={candle.close:g}"
     )
-
-
-def _display_value(value: float | None) -> str:
-    return "off" if value is None else f"{value:g}"
-
-
-def _format_signal(signal: Signal) -> str:
-    timestamp = signal.time.astimezone(timezone.utc).isoformat(timespec="seconds")
-    return (
-        f"[SIGNAL] {timestamp} {signal.pair} {signal.direction} {signal.price:g} "
-        f"| stoch {_display_value(signal.stochastic_k)}/"
-        f"{_display_value(signal.stochastic_d)} "
-        f"| MA slope {_display_value(signal.ma_slope)} "
-        f"| BB mid {signal.bollinger_middle:g}"
-    )
-
-
-def _append_signal_csv(
-    signal: Signal,
-    payout_percent: float,
-    path: str | Path | None = None,
-) -> None:
-    csv_path = Path(SIGNALS_CSV_PATH if path is None else path)
-    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
-    with csv_path.open("a", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=SIGNAL_CSV_FIELDS)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(
-            {
-                "time": signal.time.astimezone(timezone.utc).isoformat(),
-                "pair": signal.pair,
-                "direction": signal.direction,
-                "price": signal.price,
-                "stochastic_k": signal.stochastic_k,
-                "stochastic_d": signal.stochastic_d,
-                "ma_slope": signal.ma_slope,
-                "bollinger_middle": signal.bollinger_middle,
-                "payout_percent": payout_percent,
-            }
-        )
 
 
 async def _stream_pair(
@@ -121,98 +60,121 @@ async def _stream_pair(
         async for tick in ticks:
             if loop.time() >= deadline:
                 return
-            closed_candle = builder.update(tick)
-            if closed_candle is not None:
-                print(_format_candle(pair, closed_candle), flush=True)
+            closed = builder.update(tick)
+            if closed is not None:
+                print(_format_candle(pair, closed), flush=True)
     finally:
         await ticks.aclose()
 
 
-async def _stream_signal_pair(
-    broker: PocketOptionBroker,
-    pair: str,
-    payout_percent: float,
-    builder: CandleBuilder,
-    strategy: PullbackReversalStrategy,
-    tracker: PaperTracker,
-    deadline: float,
-) -> None:
-    loop = asyncio.get_running_loop()
-    ticks: AsyncGenerator[dict[str, Any], None] = broker.subscribe_ticks(pair)
-    try:
-        async for tick in ticks:
-            if loop.time() >= deadline:
-                return
-            closed_candle = builder.update(tick)
-            if closed_candle is not None:
-                strategy.on_closed_candles(pair, tuple(builder.closed))
-
-            forming = builder.forming_candle
-            if forming is None:
-                continue
-            live_price = forming.close
-            tracker.update_price(pair, live_price)
-            signal = strategy.on_tick(
-                pair,
-                live_price,
-                forming,
-                timestamp=datetime.now(timezone.utc),
-            )
-            if signal is None:
-                continue
-
-            print(_format_signal(signal), flush=True)
-            _append_signal_csv(signal, payout_percent)
-            tracker.record_signal(
-                signal.pair,
-                signal.direction,
-                signal.price,
-                signal.time,
-                payout_percent,
-            )
-    finally:
-        await ticks.aclose()
-
-
-async def run_engine(
-    mode: str | None = None,
-    *,
-    confirm_real: bool = False,
-    run_mode: str = "watch",
-    minutes: int | None = None,
-) -> None:
-    active_mode = validate_mode(MODE if mode is None else mode)
-    if run_mode not in {"watch", "signals"}:
-        raise ConfigurationError("--run must be either 'watch' or 'signals'.")
-
-    if run_mode == "signals":
-        run_minutes = SIGNAL_RUN_DEFAULT_MINUTES if minutes is None else minutes
-        if run_minutes <= 0:
-            raise ConfigurationError("--minutes must be a positive whole number.")
-        run_duration = run_minutes * 60
-        pair_limit = MAX_PAIRS
-        strategy: PullbackReversalStrategy | None = PullbackReversalStrategy()
-    else:
-        run_minutes = None
-        run_duration = RUN_DURATION_SECONDS
-        pair_limit = TOP_PAIRS_COUNT
-        strategy = None
-
-    ssid = load_mode_ssid(active_mode, confirm_real=confirm_real)
-    broker = PocketOptionBroker(ssid, mode=active_mode)
+async def run_watch() -> None:
+    """Show only completed 10-second candles from currently eligible pairs."""
+    broker = PocketOptionBroker(load_ssid())
     stop_monitor = asyncio.Event()
     monitor_task: asyncio.Task[None] | None = None
-    tracker: PaperTracker | None = PaperTracker() if run_mode == "signals" else None
+    tasks: list[asyncio.Task[None]] = []
     try:
         await broker.connect()
-        monitor_task = asyncio.create_task(
-            broker.monitor_connection(stop_monitor),
-            name="pocket-option-connection-monitor",
+        monitor_task = asyncio.create_task(broker.monitor_connection(stop_monitor))
+        payouts = await broker.payouts()
+        pairs = sorted(
+            (
+                (pair, payout)
+                for pair, payout in payouts.items()
+                if payout >= MIN_PAYOUT
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )[:TOP_PAIRS_COUNT]
+        if not pairs:
+            raise PocketOptionBrokerError(
+                f"No open pair meets the minimum payout of {MIN_PAYOUT}%."
+            )
+
+        builders: dict[str, CandleBuilder] = {}
+        for pair, _payout in pairs:
+            builder = CandleBuilder(
+                period_seconds=CANDLE_INTERVAL_SECONDS,
+                max_candles=MAX_CANDLES_PER_PAIR,
+            )
+            try:
+                history = await broker.candle_history(
+                    pair, CANDLE_INTERVAL_SECONDS, HISTORY_LOOKBACK_SECONDS
+                )
+                builder.seed(history)
+            except CandleHistoryUnavailable as exc:
+                logger.warning("%s", exc)
+            except CandleDataError as exc:
+                logger.warning(
+                    "Historical candle seed for %s was skipped (%s).",
+                    pair,
+                    type(exc).__name__,
+                )
+            builders[pair] = builder
+
+        deadline = asyncio.get_running_loop().time() + RUN_DURATION_SECONDS
+        tasks = [
+            asyncio.create_task(_stream_pair(broker, pair, builder, deadline))
+            for pair, builder in builders.items()
+        ]
+        if monitor_task is not None:
+            tasks.append(monitor_task)
+        done, _pending = await asyncio.wait(
+            tasks,
+            timeout=RUN_DURATION_SECONDS,
+            return_when=asyncio.FIRST_EXCEPTION,
         )
+        for task in done:
+            if not task.cancelled() and task.exception() is not None:
+                raise task.exception()  # type: ignore[misc]
+    finally:
+        stop_monitor.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if monitor_task is not None and monitor_task not in tasks:
+            monitor_task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if monitor_task is not None and monitor_task not in tasks:
+            await asyncio.gather(monitor_task, return_exceptions=True)
+        await broker.close()
 
-        balance = await broker.balance()
-        print(f"{active_mode.capitalize()} balance: {balance}", flush=True)
 
+def _safe_reason(error: BaseException, secret: str) -> str:
+    reason = str(error).strip() or type(error).__name__
+    return reason.replace(secret, "[REDACTED]")
+
+
+def _format_feed_tick(pair: str, tick: dict[str, Any]) -> tuple[str, float]:
+    timestamp = _normalize_broker_timestamp(tick.get("timestamp", tick.get("time")))
+    price = float(tick.get("close", tick.get("price")))
+    if not math.isfinite(price):
+        raise CandleDataError("tick price is not finite")
+    utc_time = datetime.fromtimestamp(timestamp, timezone.utc)
+    local_time = utc_time.astimezone()
+    return (
+        f"{utc_time.isoformat(timespec='milliseconds')} UTC | "
+        f"{local_time.isoformat(timespec='milliseconds')} local | "
+        f"{pair} {price:.10g}",
+        price,
+    )
+
+
+async def run_feed_check(*, duration_seconds: float = 30.0) -> bool:
+    """Print a 30-second tick sample from the highest-payout eligible pair."""
+    if duration_seconds <= 0:
+        raise ValueError("duration_seconds must be greater than zero")
+    ssid = load_ssid()
+    broker = PocketOptionBroker(ssid)
+    stop_monitor = asyncio.Event()
+    monitor_task: asyncio.Task[None] | None = None
+    ticks: AsyncGenerator[dict[str, Any], None] | None = None
+    count = 0
+    last_price: float | None = None
+    failure: str | None = None
+    try:
+        await broker.connect()
+        account_type = "demo" if broker.is_demo_account else "real"
+        print(f"Account type: {account_type} (informational only)", flush=True)
         payouts = await broker.payouts()
         eligible = sorted(
             (
@@ -222,293 +184,152 @@ async def run_engine(
             ),
             key=lambda item: (-item[1], item[0]),
         )
-
-        print(f"Pairs with payout >= {MIN_PAYOUT}%:", flush=True)
         if not eligible:
-            print("No pairs currently meet the minimum payout.", flush=True)
-            return
-        for pair, payout in eligible:
-            print(f"  {pair}: {payout:g}%", flush=True)
-
-        selected_pairs = eligible[:pair_limit]
-        if len(selected_pairs) < pair_limit:
-            logger.warning(
-                "Only %d pair(s) meet the payout threshold; subscribing to all of them.",
-                len(selected_pairs),
-            )
-
-        builders: dict[str, CandleBuilder] = {}
-        for pair, _payout in selected_pairs:
-            builder = CandleBuilder(
-                period_seconds=CANDLE_INTERVAL_SECONDS,
-                max_candles=MAX_CANDLES_PER_PAIR,
-            )
-            try:
-                history = await broker.candle_history(
-                    pair,
-                    period_seconds=CANDLE_INTERVAL_SECONDS,
-                    lookback_seconds=HISTORY_LOOKBACK_SECONDS,
-                )
-                seeded_count = builder.seed(history)
-                logger.info("Seeded %d historical candles for %s.", seeded_count, pair)
-            except CandleHistoryUnavailable as exc:
-                logger.warning("%s", exc)
-            except CandleDataError as exc:
-                logger.warning(
-                    "Historical candle seed for %s was malformed (%s); "
-                    "starting from live ticks.",
-                    pair,
-                    type(exc).__name__,
-                )
-            builders[pair] = builder
-
-        if run_mode == "signals":
-            assert strategy is not None
-            for pair, builder in builders.items():
-                if builder.closed:
-                    strategy.on_closed_candles(pair, tuple(builder.closed))
-
-        deadline = asyncio.get_running_loop().time() + run_duration
-        if run_mode == "watch":
-            tasks = [
-                asyncio.create_task(
-                    _stream_pair(broker, pair, builder, deadline),
-                    name=f"ticks-{pair}",
-                )
-                for pair, builder in builders.items()
-            ]
-            run_description = (
-                f"{run_duration} seconds with "
-                f"{CANDLE_INTERVAL_SECONDS}-second candles."
-            )
+            failure = f"no open pair meets minimum payout {MIN_PAYOUT}%"
         else:
-            assert strategy is not None and tracker is not None
-            payouts_by_pair = dict(selected_pairs)
-            tasks = [
-                asyncio.create_task(
-                    _stream_signal_pair(
-                        broker,
-                        pair,
-                        payouts_by_pair[pair],
-                        builder,
-                        strategy,
-                        tracker,
-                        deadline,
-                    ),
-                    name=f"signals-{pair}",
-                )
-                for pair, builder in builders.items()
-            ]
-            run_description = f"{run_minutes} minutes in SIGNAL-ONLY mode."
-        tasks.append(monitor_task)
-
-        print(
-            f"Streaming {len(builders)} pair(s) in {active_mode} mode for "
-            f"{run_description}",
-            flush=True,
-        )
-        try:
-            done, _pending = await asyncio.wait(
-                tasks,
-                timeout=run_duration,
-                return_when=asyncio.FIRST_EXCEPTION,
+            pair = eligible[0][0]
+            ticks = broker.subscribe_ticks(pair)
+            monitor_task = asyncio.create_task(
+                broker.monitor_connection(stop_monitor),
+                name="feed-check-connection-monitor",
             )
-            for task in done:
-                if not task.cancelled():
-                    error = task.exception()
-                    if error is not None:
-                        raise error
-        finally:
-            stop_monitor.set()
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        if run_mode == "watch":
-            print("Two-minute data run complete.", flush=True)
-        else:
-            print("Signal-only run complete.", flush=True)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + duration_seconds
+            while loop.time() < deadline:
+                try:
+                    tick = await asyncio.wait_for(
+                        anext(ticks), timeout=max(0.01, deadline - loop.time())
+                    )
+                    line, price = _format_feed_tick(pair, tick)
+                    print(line, flush=True)
+                    count += 1
+                    last_price = price
+                except TimeoutError:
+                    break
+                except StopAsyncIteration:
+                    failure = "tick stream ended before 30 seconds"
+                    break
+                except Exception as exc:
+                    failure = _safe_reason(exc, ssid)
+                    break
+            if failure is None and loop.time() < deadline:
+                failure = "tick stream ended before 30 seconds"
+            if failure is None and count == 0:
+                failure = "no ticks received in 30 seconds"
+    except Exception as exc:
+        failure = _safe_reason(exc, ssid)
     finally:
+        if ticks is not None:
+            await ticks.aclose()
         stop_monitor.set()
         if monitor_task is not None:
-            if not monitor_task.done():
-                monitor_task.cancel()
+            monitor_task.cancel()
             await asyncio.gather(monitor_task, return_exceptions=True)
-        try:
-            await broker.close()
-        finally:
-            if tracker is not None:
-                tracker.print_summary()
+        await broker.close()
+
+    if failure is not None:
+        print(f"FEED FAILED: {failure}", flush=True)
+        return False
+    print(
+        f"FEED OK: {count} ticks in {duration_seconds:g}s, "
+        f"last price {last_price:.10g}",
+        flush=True,
+    )
+    return True
 
 
-async def run_test_trade(
-    mode: str,
-    *,
-    direction: str = "call",
-    pair: str | None = None,
-    expiry_seconds: int = EXPIRY_SECONDS,
-) -> None:
-    """Place and settle exactly one explicitly requested demo trade."""
-    active_mode = validate_mode(mode)
-    if active_mode != "demo":
-        raise ConfigurationError(
-            "--run test-trade is demo-only; real mode is read-only."
+def _format_replay_summary(summary: ReplaySummary) -> str:
+    directions = (
+        f"SELL {summary.directions['SELL']} / BUY {summary.directions['BUY']}"
+    )
+    if summary.strength_buckets:
+        strengths = ", ".join(
+            f"{bucket}={summary.strength_buckets[bucket]}"
+            for bucket in ("0-59", "60-79", "80-100", "unscored")
+            if summary.strength_buckets[bucket]
         )
-    if expiry_seconds <= 0:
-        raise ConfigurationError("--expiry must be a positive whole number of seconds.")
-    normalized_direction = direction.strip().lower()
-    if normalized_direction not in {"call", "put"}:
-        raise ConfigurationError("--direction must be either 'call' or 'put'.")
+    else:
+        strengths = "none"
+    outcome_text = " ".join(
+        f"{horizon * CANDLE_INTERVAL_SECONDS}s "
+        f"W{summary.outcomes[horizon]['WIN']}/L{summary.outcomes[horizon]['LOSS']}"
+        for horizon in REPLAY_HORIZONS
+    )
+    return (
+        f"APPROXIMATE {summary.pair}: signals={summary.signal_count}; "
+        f"directions {directions}; strengths {strengths}; {outcome_text}"
+    )
 
-    ssid = load_mode_ssid(active_mode)
-    broker = PocketOptionBroker(ssid, mode=active_mode)
+
+def _merge_replay_summaries(
+    summaries: list[ReplaySummary],
+) -> ReplaySummary:
+    total = ReplaySummary(pair="TOTAL", signals=[])
+    for summary in summaries:
+        total.signals.extend(summary.signals)
+        total.directions.update(summary.directions)
+        total.strength_buckets.update(summary.strength_buckets)
+        for horizon in REPLAY_HORIZONS:
+            total.outcomes[horizon].update(summary.outcomes[horizon])
+    return total
+
+
+async def run_replay() -> list[ReplaySummary]:
+    """Replay seeded closed candles for every pair above the payout threshold."""
+    broker = PocketOptionBroker(load_ssid())
+    summaries: list[ReplaySummary] = []
     try:
         await broker.connect()
-        balance_before = await broker.balance()
-        print(f"Demo balance before: ${balance_before:.2f}", flush=True)
-
         payouts = await broker.payouts()
-        eligible = sorted(
+        pairs = sorted(
             (
-                (available_pair, payout)
-                for available_pair, payout in payouts.items()
+                (pair, payout)
+                for pair, payout in payouts.items()
                 if payout >= MIN_PAYOUT
             ),
             key=lambda item: (-item[1], item[0]),
         )
-
-        if pair is None:
-            if not eligible:
-                raise ConfigurationError(
-                    f"No open pair meets the minimum payout of {MIN_PAYOUT}%."
-                )
-            chosen_pair, payout = eligible[0]
-        else:
-            payout = payouts.get(pair)
-            if payout is None or payout < MIN_PAYOUT:
-                raise ConfigurationError(
-                    f"Pair {pair} is not open at the minimum payout of "
-                    f"{MIN_PAYOUT}% or higher."
-                )
-            chosen_pair = pair
-
-        print(
-            f"Demo test order: pair={chosen_pair} payout={payout:g}% "
-            f"direction={normalized_direction} expiry={expiry_seconds}s "
-            f"stake=${TEST_TRADE_STAKE_CAP:.2f}",
-            flush=True,
-        )
-
-        sent_at = time.perf_counter()
-        trade_id, _confirmation = await broker.buy(
-            chosen_pair,
-            TEST_TRADE_STAKE_CAP,
-            normalized_direction,
-            expiry_seconds,
-            stake_cap=TEST_TRADE_STAKE_CAP,
-        )
-        confirmation_delay_ms = (time.perf_counter() - sent_at) * 1000
-        print(
-            f"Order confirmed in {confirmation_delay_ms:.2f} ms.",
-            flush=True,
-        )
-        print(
-            f"Waiting for the {expiry_seconds}s trade expiry and settlement...",
-            flush=True,
-        )
-
-        # BinaryOptionsToolsV2.check_win waits for settlement; its timeout
-        # includes the requested expiry plus 30 seconds for provider processing.
-        result = await broker.check_win(
-            trade_id,
-            timeout_seconds=expiry_seconds + 30,
-        )
-        raw_profit = result.get("profit")
-        if isinstance(raw_profit, bool) or not isinstance(raw_profit, (int, float)):
+        if not pairs:
             raise PocketOptionBrokerError(
-                "Pocket Option returned a trade result without a numeric profit."
+                f"No open pair meets the minimum payout of {MIN_PAYOUT}%."
             )
-        profit = float(raw_profit)
-        if not math.isfinite(profit):
-            raise PocketOptionBrokerError(
-                "Pocket Option returned a non-finite trade profit."
+        for pair, _payout in pairs:
+            builder = CandleBuilder(
+                period_seconds=CANDLE_INTERVAL_SECONDS,
+                max_candles=MAX_CANDLES_PER_PAIR,
             )
-
-        raw_outcome = str(result.get("result", "")).strip().lower()
-        outcomes = {"win": "WIN", "loss": "LOSS", "draw": "DRAW"}
-        outcome = outcomes.get(raw_outcome)
-        if outcome is None:
-            outcome = "WIN" if profit > 0 else "LOSS" if profit < 0 else "DRAW"
-        print(f"Result: {outcome} | profit: ${profit:+.2f}", flush=True)
-
-        balance_after = await broker.balance()
-        print(f"Demo balance after: ${balance_after:.2f}", flush=True)
+            history = await broker.candle_history(
+                pair, CANDLE_INTERVAL_SECONDS, HISTORY_LOOKBACK_SECONDS
+            )
+            seeded = builder.seed(history)
+            if seeded < MAX_CANDLES_PER_PAIR:
+                logger.warning(
+                    "%s history returned %d of %d requested candles.",
+                    pair,
+                    seeded,
+                    MAX_CANDLES_PER_PAIR,
+                )
+            summary = replay_candles(pair, tuple(builder.closed))
+            summaries.append(summary)
+            print(_format_replay_summary(summary), flush=True)
+        print(
+            _format_replay_summary(_merge_replay_summaries(summaries)),
+            flush=True,
+        )
+        return summaries
     finally:
         await broker.close()
 
 
-def _positive_minutes(value: str) -> int:
-    try:
-        minutes = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError("minutes must be a whole number") from None
-    if minutes <= 0:
-        raise argparse.ArgumentTypeError("minutes must be greater than zero")
-    return minutes
-
-
-def _positive_seconds(value: str) -> int:
-    try:
-        seconds = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            "expiry must be a whole number of seconds"
-        ) from None
-    if seconds <= 0:
-        raise argparse.ArgumentTypeError("expiry must be greater than zero")
-    return seconds
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description=(
-            "Pocket Option market-data and signal runner, with an explicit "
-            "single-order demo test."
-        )
+        description="Read-only Pocket Option feed and strategy scanner."
     )
     parser.add_argument(
         "--run",
-        choices=("watch", "signals", "test-trade"),
+        choices=("watch", "feed-check", "replay"),
         default="watch",
-        help="Watch candles, generate paper signals, or place one demo test order.",
-    )
-    parser.add_argument(
-        "--minutes",
-        type=_positive_minutes,
-        default=SIGNAL_RUN_DEFAULT_MINUTES,
-        help="Signal run duration in whole minutes.",
-    )
-    parser.add_argument(
-        "--confirm-real",
-        action="store_true",
-        help="Required when MODE=real; real mode remains read-only.",
-    )
-    parser.add_argument(
-        "--direction",
-        choices=("call", "put"),
-        default="call",
-        help="Direction for --run test-trade (default: call).",
-    )
-    parser.add_argument(
-        "--pair",
-        help="Pair for --run test-trade (default: highest-payout eligible open pair).",
-    )
-    parser.add_argument(
-        "--expiry",
-        type=_positive_seconds,
-        default=EXPIRY_SECONDS,
-        help=f"Expiry in seconds for --run test-trade (default: {EXPIRY_SECONDS}).",
+        help="View candles, sample the live feed, or replay historical candles.",
     )
     args = parser.parse_args(argv)
 
@@ -517,52 +338,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
-        if args.run == "test-trade":
-            asyncio.run(
-                run_test_trade(
-                    MODE,
-                    direction=args.direction,
-                    pair=args.pair,
-                    expiry_seconds=args.expiry,
-                )
-            )
+        if args.run == "feed-check":
+            return 0 if asyncio.run(run_feed_check()) else 1
+        if args.run == "replay":
+            asyncio.run(run_replay())
         else:
-            asyncio.run(
-                run_engine(
-                    MODE,
-                    confirm_real=args.confirm_real,
-                    run_mode=args.run,
-                    minutes=args.minutes,
-                )
-            )
+            asyncio.run(run_watch())
     except KeyboardInterrupt:
         logger.info("Stopped by user.")
         return 130
-    except ConfigurationError as exc:
-        logger.error("%s", exc)
-        return 1
-    except PocketOptionAuthenticationError as exc:
-        logger.error("%s", exc)
-        return 1
-    except PocketOptionConnectionError as exc:
-        logger.error("%s", exc)
-        return 1
-    except PocketOptionOrderRejected as exc:
-        logger.error("Demo order was not confirmed: %s", exc.reason)
-        logger.error(
-            "No retry was sent. If acceptance is unclear, check demo order history "
-            "before running the test again."
-        )
-        return 1
-    except PocketOptionBrokerError as exc:
-        logger.error("%s", exc)
-        return 1
-    except CandleDataError as exc:
+    except (ConfigurationError, PocketOptionAuthenticationError,
+            PocketOptionConnectionError, PocketOptionBrokerError,
+            CandleDataError) as exc:
         logger.error("%s", exc)
         return 1
     except Exception as exc:
-        # Do not log exception messages because they may contain broker details.
-        logger.error("Engine stopped unexpectedly (%s).", type(exc).__name__)
+        logger.error("Feed viewer stopped unexpectedly (%s).", type(exc).__name__)
         return 1
     return 0
 

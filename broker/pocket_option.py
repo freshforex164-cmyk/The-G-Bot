@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any, TypeVar
 
@@ -18,8 +17,6 @@ from config import (
     RECONNECT_CALL_TIMEOUT_SECONDS,
     RECONNECT_MAX_ATTEMPTS,
     RECONNECT_MAX_DELAY_SECONDS,
-    ssid_env_var_for_mode,
-    validate_mode,
 )
 
 logger = logging.getLogger("g_bots.broker.pocket_option")
@@ -44,14 +41,6 @@ class PocketOptionOperationError(PocketOptionBrokerError):
     """Raised when a broker operation fails while the connection is healthy."""
 
 
-class PocketOptionOrderRejected(PocketOptionBrokerError):
-    """Raised when a demo order cannot be confirmed by Pocket Option."""
-
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
-        super().__init__(reason)
-
-
 class CandleHistoryUnavailable(PocketOptionBrokerError):
     """Raised when optional historical candle seeding is unavailable."""
 
@@ -59,14 +48,12 @@ class CandleHistoryUnavailable(PocketOptionBrokerError):
 class PocketOptionBroker:
     """Small async adapter for the documented BinaryOptionsToolsV2 API."""
 
-    def __init__(self, ssid: str, mode: str) -> None:
-        self.mode = validate_mode(mode)
-        self.secret_name = ssid_env_var_for_mode(self.mode)
+    def __init__(self, ssid: str) -> None:
+        self.secret_name = "PO_SSID"
         self._ssid = ssid
         self._client: PocketOptionAsync | None = None
         self._closed = False
         self._disconnected = False
-        self._account_confirmed = False
         self._connection_generation = 0
         self._reconnect_lock = asyncio.Lock()
 
@@ -80,13 +67,12 @@ class PocketOptionBroker:
             return False
 
     async def connect(self) -> None:
-        """Create the client, wait for assets, and verify the requested account mode."""
+        """Create a read-only client and wait until market assets are available."""
         if self._closed:
             raise PocketOptionBrokerError("This broker client has already been closed.")
 
         if self._client is not None:
             if self.is_connected:
-                self._require_account_mode()
                 return
             await self._mark_disconnected("connection was unavailable during connect")
             await self._reconnect_with_backoff()
@@ -105,9 +91,9 @@ class PocketOptionBroker:
             client = PocketOptionAsync(ssid=self._ssid, config=library_config)
         except Exception as exc:
             raise PocketOptionAuthenticationError(
-                f"Pocket Option could not initialize the {self.mode} session "
+                f"Pocket Option could not initialize the configured session "
                 f"({type(exc).__name__}). Verify {self.secret_name} contains "
-                f"the full current {self.mode} SSID."
+                "the full current Pocket Option session."
             ) from None
 
         self._client = client
@@ -125,7 +111,6 @@ class PocketOptionBroker:
             )
             if not client.is_connected():
                 raise TimeoutError("Pocket Option did not report a live connection.")
-            self._require_account_mode()
         except asyncio.CancelledError:
             await self._shutdown_client()
             raise
@@ -135,51 +120,37 @@ class PocketOptionBroker:
         except Exception as exc:
             await self._shutdown_client()
             raise PocketOptionAuthenticationError(
-                f"Pocket Option did not accept or finish connecting this "
-                f"{self.mode} session ({type(exc).__name__}). "
+                f"Pocket Option did not accept or finish connecting the "
+                f"configured session ({type(exc).__name__}). "
                 f"{self.secret_name} may be invalid or expired; copy a fresh "
-                f"full SSID from the {self.mode} account. "
+                "full session. "
                 "If it is current, check the network and Pocket Option service."
             ) from None
 
         self._disconnected = False
-        logger.info("Connected to Pocket Option %s account.", self.mode)
+        logger.info("Connected to Pocket Option market data.")
 
     def _require_client(self) -> PocketOptionAsync:
         if self._client is None:
             raise PocketOptionBrokerError("Call connect() before using the broker.")
         return self._client
 
-    def _require_account_mode(self) -> None:
+    @property
+    def is_demo_account(self) -> bool:
+        """Return the provider's account-type flag for information only."""
         client = self._require_client()
         if not client.is_ssid_valid():
             raise PocketOptionAuthenticationError(
                 f"{self.secret_name} has an invalid SSID format. Replace it "
                 "with the complete current SSID."
             )
-        if not self.is_connected:
-            if self._account_confirmed:
-                return
-            raise PocketOptionConnectionError(
-                "Pocket Option is not connected yet; call connect() first."
-            )
         try:
-            actual_is_demo = client.is_demo()
+            return bool(client.is_demo())
         except Exception as exc:
             raise PocketOptionAuthenticationError(
-                "Pocket Option could not confirm the account type "
-                f"({type(exc).__name__}). Refresh {self.secret_name} from the "
-                f"{self.mode} account."
+                "Pocket Option could not read the account-type flag "
+                f"({type(exc).__name__})."
             ) from None
-        expected_is_demo = self.mode == "demo"
-        if actual_is_demo != expected_is_demo:
-            actual_mode = "demo" if actual_is_demo else "real"
-            raise PocketOptionAuthenticationError(
-                f"MODE is '{self.mode}', but Pocket Option reports a "
-                f"{actual_mode} account. Refusing to continue; use the matching "
-                f"{self.secret_name} for a {self.mode} account."
-            )
-        self._account_confirmed = True
 
     async def _mark_disconnected(
         self, reason: str, error: BaseException | None = None
@@ -197,7 +168,6 @@ class PocketOptionBroker:
 
         async with self._reconnect_lock:
             if self.is_connected:
-                self._require_account_mode()
                 if self._disconnected:
                     self._disconnected = False
                     self._connection_generation += 1
@@ -228,7 +198,6 @@ class PocketOptionBroker:
                     )
                     if not self.is_connected:
                         raise TimeoutError("Connection is not ready.")
-                    self._require_account_mode()
                 except asyncio.CancelledError:
                     raise
                 except PocketOptionAuthenticationError:
@@ -249,7 +218,7 @@ class PocketOptionBroker:
         raise PocketOptionConnectionError(
             "Could not reconnect to Pocket Option after several attempts. "
             f"{self.secret_name} may be expired or invalid; refresh the full "
-            f"{self.mode} SSID and check the network."
+            "Pocket Option session and check the network."
         )
 
     async def _request(self, operation: str, call: BrokerCall[T]) -> T:
@@ -274,12 +243,6 @@ class PocketOptionBroker:
                 if self.is_connected and not isinstance(
                     exc, (ConnectionError, TimeoutError, OSError)
                 ):
-                    try:
-                        self._require_account_mode()
-                    except PocketOptionAuthenticationError:
-                        raise
-                    except Exception:
-                        pass
                     raise PocketOptionOperationError(
                         f"Pocket Option could not {operation} "
                         f"({type(exc).__name__}). If this is an authentication "
@@ -297,14 +260,7 @@ class PocketOptionBroker:
             f"Pocket Option could not {operation} after reconnecting."
         )
 
-    async def balance(self) -> float:
-        self._require_account_mode()
-        return await self._request(
-            f"read the {self.mode} balance", lambda client: client.balance()
-        )
-
     async def payouts(self) -> dict[str, float]:
-        self._require_account_mode()
         raw_payouts = await self._request(
             "read payouts", lambda client: client.payout()
         )
@@ -319,33 +275,9 @@ class PocketOptionBroker:
                 parsed[pair] = float(payout)
         return parsed
 
-    async def check_win(
-        self, trade_id: str, *, timeout_seconds: int
-    ) -> dict[str, Any]:
-        """Wait for the installed client to report a completed demo trade."""
-        if self.mode != "demo":
-            raise PocketOptionOperationError(
-                "Demo trade results can only be checked in demo mode."
-            )
-        if timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be greater than zero")
-        self._require_account_mode()
-        result = await self._request(
-            "check the demo trade result",
-            lambda client: client.check_win(
-                trade_id, timeout_seconds=timeout_seconds
-            ),
-        )
-        if not isinstance(result, dict):
-            raise PocketOptionOperationError(
-                "Pocket Option returned a trade result in an unexpected format."
-            )
-        return result
-
     async def candle_history(
         self, pair: str, period_seconds: int, lookback_seconds: int
     ) -> list[dict[str, Any]]:
-        self._require_account_mode()
         try:
             history = await self._request(
                 "fetch candle history",
@@ -473,82 +405,6 @@ class PocketOptionBroker:
                 )
             except TimeoutError:
                 pass
-
-    async def buy(
-        self,
-        pair: str,
-        amount: float,
-        direction: str,
-        expiry_seconds: int,
-        *,
-        stake_cap: float | None = None,
-    ) -> Any:
-        """Place one demo order without retrying an ambiguous submission."""
-        if self.mode == "real":
-            raise PocketOptionOperationError(
-                "Order placement is disabled in real mode; this phase is read-only."
-            )
-        self._require_account_mode()
-        if not math.isfinite(amount) or amount <= 0:
-            raise ValueError("amount must be greater than zero")
-        if stake_cap is not None:
-            if not math.isfinite(stake_cap) or stake_cap <= 0:
-                raise ValueError("stake_cap must be a finite number greater than zero")
-            amount = min(amount, stake_cap)
-        if expiry_seconds <= 0:
-            raise ValueError("expiry_seconds must be greater than zero")
-
-        normalized_direction = direction.strip().lower()
-        if normalized_direction not in {"call", "put"}:
-            raise ValueError("direction must be either 'call' or 'put'")
-
-        client = self._require_client()
-        submit = client.buy if normalized_direction == "call" else client.sell
-        try:
-            # Do not use _request here: its retry behavior is appropriate for
-            # reads, but retrying an order after a lost confirmation can duplicate it.
-            response = await submit(pair, amount, expiry_seconds)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            reason = str(exc).strip() or type(exc).__name__
-            if self._ssid:
-                reason = reason.replace(self._ssid, "[REDACTED SSID]")
-            raise PocketOptionOrderRejected(reason) from None
-
-        if not isinstance(response, (tuple, list)) or len(response) != 2:
-            raise PocketOptionOrderRejected(
-                "Pocket Option returned an invalid order confirmation."
-            )
-        trade_id, confirmation = response
-        if not isinstance(trade_id, str) or not trade_id.strip():
-            reason = "Pocket Option returned no trade ID."
-            if isinstance(confirmation, dict):
-                for field in ("error", "reason", "message"):
-                    value = confirmation.get(field)
-                    if isinstance(value, str) and value.strip():
-                        reason = value.strip()
-                        if self._ssid:
-                            reason = reason.replace(self._ssid, "[REDACTED SSID]")
-                        break
-            raise PocketOptionOrderRejected(reason)
-        if not isinstance(confirmation, dict):
-            raise PocketOptionOrderRejected(
-                "Pocket Option returned an invalid order confirmation."
-            )
-        if confirmation.get("success") is False or str(
-            confirmation.get("status", "")
-        ).lower() in {"rejected", "error", "failed"}:
-            reason = "Pocket Option rejected the order."
-            for field in ("error", "reason", "message"):
-                value = confirmation.get(field)
-                if isinstance(value, str) and value.strip():
-                    reason = value.strip()
-                    break
-            if self._ssid:
-                reason = reason.replace(self._ssid, "[REDACTED SSID]")
-            raise PocketOptionOrderRejected(reason)
-        return trade_id, confirmation
 
     async def _shutdown_client(self) -> None:
         if self._client is None:

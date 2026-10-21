@@ -1,7 +1,7 @@
 [project]
 name = "g-bots-engine"
 version = "0.1.0"
-description = "Async Pocket Option demo-market data engine."
+description = "Read-only Pocket Option signal scanner."
 requires-python = ">=3.12"
 dependencies = [
     "binaryoptionstoolsv2==0.2.15",
