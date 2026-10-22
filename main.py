@@ -59,6 +59,13 @@ from strategy.replay import (
 )
 from notifications import TelegramNotifier, telegram_get_updates
 from strategy.strength import score_strength
+from subscriber_store import SubscriberStore
+from telegram_bot import (
+    SubscriberFanoutNotifier,
+    TelegramBotClient,
+    TelegramCommandHandler,
+    TelegramPollingService,
+)
 
 logger = logging.getLogger("gbot")
 
@@ -196,6 +203,7 @@ async def run_feed_check(*, duration_seconds: float = 30.0) -> bool:
     count = 0
     last_price: float | None = None
     failure: str | None = None
+    started_at = asyncio.get_running_loop().time()
     try:
         await broker.connect()
         account_type = "demo" if broker.is_demo_account else "real"
@@ -251,6 +259,19 @@ async def run_feed_check(*, duration_seconds: float = 30.0) -> bool:
             monitor_task.cancel()
             await asyncio.gather(monitor_task, return_exceptions=True)
         await broker.close()
+    elapsed = max(0.0, asyncio.get_running_loop().time() - started_at)
+    if failure is not None:
+        print(f"FEED FAILED: {failure}", flush=True)
+        return False
+    if count == 0:
+        print(f"FEED FAILED: no ticks received in {elapsed:.2f}s", flush=True)
+        return False
+    print(
+        f"FEED OK: {count} ticks in {duration_seconds:g}s, "
+        f"last price {last_price:g}",
+        flush=True,
+    )
+    return True
 
 
 async def run_pairs() -> bool:
@@ -494,6 +515,107 @@ async def run_scanner(*, minutes: float, record: bool = False) -> None:
     try:
         await scanner.run(minutes=minutes)
     finally:
+        await queue.close()
+        tracker.print_summary()
+
+
+async def run_serve() -> None:
+    """Run the market scanner and Telegram command poller until stopped."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        raise ConfigurationError(
+            "Missing required secret TELEGRAM_BOT_TOKEN for --run serve."
+        )
+    admin_value = os.environ.get("TELEGRAM_ADMIN_ID", "").strip()
+    try:
+        admin_id = int(admin_value) if admin_value else None
+    except ValueError:
+        raise ConfigurationError("TELEGRAM_ADMIN_ID must be a numeric Telegram user ID.") from None
+    if admin_id is None:
+        raise ConfigurationError(
+            "Missing required secret TELEGRAM_ADMIN_ID for admin commands."
+        )
+    admin_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip() or admin_id
+    bot = TelegramBotClient(token)
+    try:
+        await bot.register_commands(admin_id)
+    except TelegramSendError as exc:
+        logger.warning(
+            "Telegram command registration failed (%s); polling will still start.",
+            exc.status_code or type(exc).__name__,
+        )
+
+    subscribers = await asyncio.to_thread(SubscriberStore)
+    tracker = PaperTracker(store=CsvSignalStore(config.SIGNALS_CSV_PATH))
+    fanout = SubscriberFanoutNotifier(bot, subscribers)
+    queue = NotificationQueue(
+        fanout,
+        max_per_minute=25 * 60,
+        valid_seconds=config.SIGNAL_VALID_SECONDS,
+    )
+    queue.start()
+    service_state = {"scanner_running": False}
+
+    def on_signal(signal: Signal) -> None:
+        tracker.record_signal(signal)
+        print(_format_signal_line(signal), flush=True)
+        queue.enqueue(signal)
+
+    async def admin_alert(message: str) -> None:
+        try:
+            await bot.send_message(admin_chat_id, message, parse_mode=None)
+        except TelegramSendError as exc:
+            logger.warning(
+                "Could not send a watchdog alert (%s).",
+                exc.status_code or type(exc).__name__,
+            )
+
+    scanner = SignalScanner(
+        PocketOptionBroker(load_ssid()),
+        on_signal=on_signal,
+        on_tick=tracker.update_price,
+        on_watchdog_event=admin_alert,
+    )
+    handler = TelegramCommandHandler(
+        bot,
+        subscribers,
+        admin_id=admin_id,
+        referral_link=os.environ.get("REFERRAL_LINK"),
+        scanner=scanner,
+        tracker=tracker,
+        scanner_running=lambda: service_state["scanner_running"],
+        admin_chat_id=admin_chat_id,
+    )
+    polling = TelegramPollingService(bot, handler)
+    stop_event = asyncio.Event()
+
+    async def scan_forever() -> None:
+        service_state["scanner_running"] = True
+        try:
+            await scanner.run(minutes=None)
+        finally:
+            service_state["scanner_running"] = False
+
+    scan_task = asyncio.create_task(scan_forever(), name="gbot-market-scanner")
+    polling_task = asyncio.create_task(
+        polling.run(stop_event), name="gbot-telegram-polling"
+    )
+    try:
+        done, _pending = await asyncio.wait(
+            {scan_task, polling_task}, return_when=asyncio.FIRST_EXCEPTION
+        )
+        for task in done:
+            if task.cancelled():
+                continue
+            error = task.exception()
+            if error is not None:
+                raise error
+    finally:
+        stop_event.set()
+        for task in (scan_task, polling_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(scan_task, polling_task, return_exceptions=True)
         await queue.close()
         tracker.print_summary()
 
@@ -973,6 +1095,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "telegram-setup",
             "explain",
             "test-signals",
+            "serve",
         ),
         default="watch",
         help="Select a read-only feed, strategy, or notification command.",
@@ -1007,6 +1130,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.run == "feed-check":
             return 0 if asyncio.run(run_feed_check()) else 1
+        if args.run == "serve":
+            asyncio.run(run_serve())
+            return 0
         if args.run == "pairs":
             return 0 if asyncio.run(run_pairs()) else 1
         if args.run in {"replay", "strategy-lab"}:

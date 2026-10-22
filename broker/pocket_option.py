@@ -430,6 +430,20 @@ class PocketOptionBroker:
             except TimeoutError:
                 pass
 
+    async def rebuild_connection(self) -> None:
+        """Tear down and recreate a stalled market-data client."""
+        self._closed = False
+        await asyncio.wait_for(
+            self._shutdown_client(),
+            timeout=RECONNECT_CALL_TIMEOUT_SECONDS,
+        )
+        self._disconnected = False
+        self._connection_generation += 1
+        await asyncio.wait_for(
+            self.connect(),
+            timeout=RECONNECT_CALL_TIMEOUT_SECONDS,
+        )
+
     async def _shutdown_client(self) -> None:
         if self._client is None:
             return

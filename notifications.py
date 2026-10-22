@@ -51,9 +51,16 @@ class ConsoleNotifier:
 
 
 class TelegramSendError(RuntimeError):
-    def __init__(self, message: str, *, retry_after: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after: int | None = None,
+        status_code: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.retry_after = retry_after
+        self.status_code = status_code
 
 
 class TelegramNotifier:
@@ -165,10 +172,11 @@ class TelegramNotifier:
                 f"Telegram rate limited the request (429); wait {seconds}s "
                 "before sending again.",
                 retry_after=seconds,
+                status_code=status,
             )
         else:
             message = f"Telegram send failed (HTTP {status})."
-        raise TelegramSendError(message)
+        raise TelegramSendError(message, status_code=status)
 
 
 async def telegram_get_updates(

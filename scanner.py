@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -40,18 +41,33 @@ class SignalScanner:
         on_signal: SignalCallback | None = None,
         on_tick: TickCallback | None = None,
         on_candle: Callable[[str, Candle], None] | None = None,
+        on_watchdog_event: Callable[[str], None | Awaitable[None]] | None = None,
         output: OutputCallback = print,
     ) -> None:
         self.broker = broker
         self.on_signal = on_signal
         self.on_tick = on_tick
         self.on_candle = on_candle
+        self.on_watchdog_event = on_watchdog_event
         self.output = output
         self.pairs: dict[str, PairScanState] = {}
         self.signals: dict[str, Signal] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._receiving_pairs: set[str] = set()
         self._stopping = False
+        self._started_at: float | None = None
+        self._last_any_tick_at: float | None = None
+        self._last_tick_received: dict[str, float] = {}
+        self._last_tick_timestamp: dict[str, datetime] = {}
+        self._watchdog_rebuilding = False
+        self._watchdog_failures = 0
+        self._watchdog_retry_at = 0.0
+
+    @property
+    def last_tick_age_seconds(self) -> float | None:
+        if self._last_any_tick_at is None:
+            return None
+        return max(0.0, time.monotonic() - self._last_any_tick_at)
 
     def expire_signals(self, now: datetime | None = None) -> None:
         current = now or datetime.now(timezone.utc)
@@ -77,8 +93,14 @@ class SignalScanner:
         return f"STREAM HEALTH requested_pairs={requested} receiving_tick_pairs={receiving}"
 
     async def refresh_pairs(self) -> None:
-        payouts = await self.broker.payouts()
-        metadata = await self.broker.active_assets()
+        payouts = await asyncio.wait_for(
+            self.broker.payouts(),
+            timeout=config.WATCHDOG_CALL_TIMEOUT_SECONDS,
+        )
+        metadata = await asyncio.wait_for(
+            self.broker.active_assets(),
+            timeout=config.WATCHDOG_CALL_TIMEOUT_SECONDS,
+        )
         assets = normalize_assets(metadata, payouts)
         selected = eligible_assets(assets, config.MIN_PAYOUT, config.MAX_SCAN_PAIRS)
         desired = {asset.symbol: asset for asset in selected}
@@ -86,6 +108,8 @@ class SignalScanner:
         removed = set(self.pairs) - set(desired)
         for pair in removed:
             self._receiving_pairs.discard(pair)
+            self._last_tick_received.pop(pair, None)
+            self._last_tick_timestamp.pop(pair, None)
             task = self._tasks.pop(pair, None)
             if task is not None:
                 task.cancel()
@@ -104,10 +128,13 @@ class SignalScanner:
                 max_candles=config.MAX_CANDLES_PER_PAIR,
             )
             try:
-                history = await self.broker.candle_history(
-                    pair,
-                    config.CANDLE_INTERVAL_SECONDS,
-                    config.HISTORY_LOOKBACK_SECONDS,
+                history = await asyncio.wait_for(
+                    self.broker.candle_history(
+                        pair,
+                        config.CANDLE_INTERVAL_SECONDS,
+                        config.HISTORY_LOOKBACK_SECONDS,
+                    ),
+                    timeout=config.WATCHDOG_CALL_TIMEOUT_SECONDS,
                 )
                 builder.seed(history)
                 if self.on_candle is not None:
@@ -163,6 +190,22 @@ class SignalScanner:
     def _handle_tick(
         self, pair: str, state: PairScanState, tick: dict[str, Any]
     ) -> None:
+        try:
+            timestamp = datetime.fromtimestamp(
+                _normalize_broker_timestamp(tick.get("timestamp", tick.get("time"))),
+                timezone.utc,
+            )
+            price = float(tick.get("close", tick.get("price")))
+        except (TypeError, ValueError, OverflowError, OSError, CandleDataError):
+            return
+        age = (datetime.now(timezone.utc) - timestamp).total_seconds()
+        if age > config.WATCHDOG_TICK_MAX_AGE_SECONDS:
+            logger.debug("Stale tick ignored for %s (age=%.1fs).", pair, age)
+            return
+        received_at = time.monotonic()
+        self._last_tick_received[pair] = received_at
+        self._last_tick_timestamp[pair] = timestamp
+        self._last_any_tick_at = received_at
         closed = state.candles.update(tick)
         if closed is not None:
             if self.on_candle is not None:
@@ -178,14 +221,6 @@ class SignalScanner:
             closed_signal = state.strategy.take_closed_signal(pair)
             if closed_signal is not None:
                 self._publish_signal(closed_signal)
-        try:
-            price = float(tick.get("close", tick.get("price")))
-            timestamp = datetime.fromtimestamp(
-                _normalize_broker_timestamp(tick.get("timestamp", tick.get("time"))),
-                timezone.utc,
-            )
-        except (TypeError, ValueError, OverflowError, OSError, CandleDataError):
-            return
         if self.on_tick is not None:
             try:
                 self.on_tick(pair, price, timestamp)
@@ -205,6 +240,13 @@ class SignalScanner:
     def _publish_signal(self, signal: Signal) -> None:
         state = self.pairs.get(signal.pair)
         if state is None or not state.asset.is_open or state.payout < config.MIN_PAYOUT:
+            return
+        last_tick = self._last_tick_received.get(signal.pair)
+        if (
+            last_tick is None
+            or time.monotonic() - last_tick > config.WATCHDOG_TICK_MAX_AGE_SECONDS
+        ):
+            logger.info("Signal suppressed because %s has no fresh tick.", signal.pair)
             return
         signal.asset_name = state.asset.display_name
         self.expire_signals(signal.time)
@@ -226,29 +268,122 @@ class SignalScanner:
                     "Signal callback failed (%s).", type(exc).__name__
                 )
 
-    async def run(self, *, minutes: float) -> None:
-        if minutes <= 0:
+    async def _notify_watchdog(self, message: str) -> None:
+        if self.on_watchdog_event is None:
+            return
+        try:
+            result = self.on_watchdog_event(message)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:
+            logger.warning("Watchdog alert failed (%s).", type(exc).__name__)
+
+    async def _rebuild_feed(self, reason: str) -> None:
+        if self._watchdog_rebuilding or time.monotonic() < self._watchdog_retry_at:
+            return
+        self._watchdog_rebuilding = True
+        try:
+            logger.warning("%s; rebuilding the Pocket Option connection.", reason)
+            for task in self._tasks.values():
+                task.cancel()
+            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+            self._tasks.clear()
+            self.pairs.clear()
+            self._receiving_pairs.clear()
+            self._last_tick_received.clear()
+            self._last_tick_timestamp.clear()
+
+            rebuild = getattr(self.broker, "rebuild_connection", None)
+            if callable(rebuild):
+                await asyncio.wait_for(
+                    rebuild(), timeout=config.WATCHDOG_CALL_TIMEOUT_SECONDS
+                )
+            else:
+                await asyncio.wait_for(
+                    self.broker.connect(),
+                    timeout=config.WATCHDOG_CALL_TIMEOUT_SECONDS,
+                )
+            await asyncio.wait_for(
+                self.refresh_pairs(), timeout=config.WATCHDOG_CALL_TIMEOUT_SECONDS
+            )
+            self._watchdog_failures = 0
+            self._last_any_tick_at = time.monotonic()
+            self._watchdog_retry_at = 0.0
+            await self._notify_watchdog(
+                "Pocket Option feed recovered after a stall; scanning has resumed."
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._watchdog_failures += 1
+            self._watchdog_retry_at = (
+                time.monotonic() + config.WATCHDOG_RETRY_SECONDS
+            )
+            logger.warning(
+                "Feed rebuild %d/%d failed (%s).",
+                self._watchdog_failures,
+                config.WATCHDOG_REBUILD_FAILURE_LIMIT,
+                type(exc).__name__,
+            )
+            if self._watchdog_failures == config.WATCHDOG_REBUILD_FAILURE_LIMIT:
+                await self._notify_watchdog(
+                    "Pocket Option feed rebuild failed three times. SSID may have expired."
+                )
+            else:
+                await self._notify_watchdog(
+                    "Pocket Option feed rebuild failed; another recovery attempt is scheduled."
+                )
+        finally:
+            self._watchdog_rebuilding = False
+
+    async def _check_feed_watchdog(self) -> None:
+        baseline = self._last_any_tick_at or self._started_at
+        if baseline is None:
+            return
+        if time.monotonic() - baseline >= config.WATCHDOG_GLOBAL_STALL_SECONDS:
+            await self._rebuild_feed("No market ticks received from any pair")
+
+    async def run(self, *, minutes: float | None) -> None:
+        if minutes is not None and minutes <= 0:
             raise ValueError("minutes must be greater than zero")
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + minutes * 60.0
+        deadline = (
+            loop.time() + minutes * 60.0 if minutes is not None else float("inf")
+        )
         next_refresh = loop.time()
         next_health = loop.time() + 60.0
+        next_watchdog = loop.time() + config.WATCHDOG_CHECK_INTERVAL_SECONDS
         self._stopping = False
+        self._started_at = loop.time()
+        self._last_any_tick_at = None
         try:
-            await self.broker.connect()
+            await asyncio.wait_for(
+                self.broker.connect(),
+                timeout=config.WATCHDOG_CALL_TIMEOUT_SECONDS,
+            )
             await self.refresh_pairs()
             next_refresh = loop.time() + config.PAYOUT_REFRESH_SECONDS
             while loop.time() < deadline:
-                wake_at = min(deadline, next_refresh, next_health)
+                wake_at = min(deadline, next_refresh, next_health, next_watchdog)
                 await asyncio.sleep(max(0.0, wake_at - loop.time()))
                 now = loop.time()
                 self.expire_signals()
                 if now >= next_refresh and now < deadline:
-                    await self.refresh_pairs()
+                    try:
+                        await self.refresh_pairs()
+                    except Exception as exc:
+                        logger.warning(
+                            "Pair refresh stalled or failed (%s).",
+                            type(exc).__name__,
+                        )
+                        await self._rebuild_feed("Pair refresh failed")
                     next_refresh = now + config.PAYOUT_REFRESH_SECONDS
                 if now >= next_health:
                     self.output(self.stream_health_line())
                     next_health = now + 60.0
+                if now >= next_watchdog:
+                    await self._check_feed_watchdog()
+                    next_watchdog = loop.time() + config.WATCHDOG_CHECK_INTERVAL_SECONDS
         finally:
             self._stopping = True
             for task in self._tasks.values():
