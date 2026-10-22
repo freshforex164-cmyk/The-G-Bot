@@ -126,9 +126,9 @@ def replay_variant(
     prepared = indicators or prepare_indicators(series)
     enabled = {
         "S1": config.S1_ENABLED,
-        "S2": config.S2_ENABLED and variant.s2_enabled,
+        "S2": variant.s2_enabled,
         "S3": config.S3_ENABLED,
-        "S4": config.S4_ENABLED and variant.s4_enabled,
+        "S4": variant.s4_enabled,
     }
     last_signal_index = -config.SIGNAL_COOLDOWN_CANDLES - 1
 

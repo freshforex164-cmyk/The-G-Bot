@@ -9,7 +9,7 @@ from unittest.mock import patch
 import config
 from data.candles import Candle
 from scanner import SignalScanner
-from strategy.pullback_reversal import Signal
+from strategy.pullback_reversal import PullbackReversalStrategy, Signal
 from strategy.rules import ConditionResult, DirectionEvaluation
 from strategy.strength import score_strength
 
@@ -77,12 +77,33 @@ class StrengthTests(unittest.TestCase):
             ma_turn_percent=0.04,
             middle_slope_percent=0.03,
             band_curvature_percent=0.02,
+            stochastic_k=70,
+            stochastic_d=75,
+            middle=100,
+            upper=101,
         )
-        from strategy.pullback_reversal import PullbackReversalStrategy
+        candles = candles_from_closes([100.0] * 80)
 
-        first = PullbackReversalStrategy._score(evaluation, 0.5)
-        second = PullbackReversalStrategy._score(evaluation, 0.5)
-        self.assertEqual(first, second)
+        def make_signal(payout: float) -> Signal:
+            strategy = PullbackReversalStrategy()
+            with (
+                patch.object(config, "TRIGGER_VARIANT", "A"),
+                patch("strategy.pullback_reversal.evaluate_direction", return_value=evaluation),
+            ):
+                strategy.on_closed_candles("PAIR", candles, payout=payout)
+                result = strategy.on_tick(
+                    "PAIR",
+                    100.2,
+                    Candle(800, 100.0, 100.2, 99.9, 100.2),
+                    payout=payout,
+                )
+            assert result is not None
+            return result
+
+        low, high = make_signal(80), make_signal(99)
+        self.assertNotEqual(low.payout, high.payout)
+        self.assertEqual(low.strength, high.strength)
+        self.assertEqual(low.strength_components, high.strength_components)
 
 
 class SignalScannerTests(unittest.TestCase):

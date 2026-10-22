@@ -13,6 +13,7 @@ from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
 from config import (
     CONNECTION_MONITOR_INTERVAL_SECONDS,
     INITIAL_CONNECT_TIMEOUT_SECONDS,
+    PAYOUTS_TIMEOUT_SECONDS,
     RECONNECT_BASE_DELAY_SECONDS,
     RECONNECT_CALL_TIMEOUT_SECONDS,
     RECONNECT_MAX_ATTEMPTS,
@@ -261,9 +262,15 @@ class PocketOptionBroker:
         )
 
     async def payouts(self) -> dict[str, float]:
-        raw_payouts = await self._request(
-            "read payouts", lambda client: client.payout()
-        )
+        try:
+            raw_payouts = await asyncio.wait_for(
+                self._request("read payouts", lambda client: client.payout()),
+                timeout=PAYOUTS_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            raise PocketOptionOperationError(
+                "Pocket Option did not return payouts before the request timed out."
+            ) from None
         if not isinstance(raw_payouts, dict):
             raise PocketOptionOperationError(
                 "Pocket Option returned payouts in an unexpected format."

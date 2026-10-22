@@ -778,7 +778,7 @@ async def run_test_signals() -> int:
             print("TEST SIGNALS FAILED: no eligible pairs were returned.")
             return 1
 
-        async def prepare(symbol: str, payout: float) -> None:
+        async def prepare_history(symbol: str, payout: float) -> None:
             builder = CandleBuilder(
                 period_seconds=CANDLE_INTERVAL_SECONDS,
                 max_candles=MAX_CANDLES_PER_PAIR,
@@ -792,18 +792,25 @@ async def run_test_signals() -> int:
                 builder.seed(history)
             except (CandleHistoryUnavailable, CandleDataError) as exc:
                 logger.warning("History for %s unavailable (%s).", symbol, type(exc).__name__)
-            stream = broker.subscribe_ticks(symbol)
             builders[symbol] = builder
             payouts[symbol] = payout
-            streams[symbol] = stream
+
+        # The library shares one websocket client; seed histories one at a time
+        # before opening the simultaneous live tick subscriptions.
+        for symbol, payout in selected:
+            await prepare_history(symbol, payout)
+            streams[symbol] = broker.subscribe_ticks(symbol)
+
+        async def read_initial_tick(symbol: str) -> None:
+            stream = streams[symbol]
             try:
                 tick = await asyncio.wait_for(anext(stream), timeout=15.0)
-                builder.update(tick)
+                builders[symbol].update(tick)
                 initial_ticks[symbol] = tick
             except (TimeoutError, StopAsyncIteration):
                 logger.warning("No live price arrived for %s.", symbol)
 
-        await asyncio.gather(*(prepare(symbol, payout) for symbol, payout in selected))
+        await asyncio.gather(*(read_initial_tick(symbol) for symbol, _ in selected))
         candidates = [
             item
             for symbol, _ in selected

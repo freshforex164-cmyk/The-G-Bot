@@ -8,9 +8,12 @@ from dataclasses import dataclass
 
 import config
 from data.candles import Candle
-from indicators.bollinger_bands import calculate_bollinger_bands
+from indicators.bollinger_bands import (
+    BollingerBandSeries,
+    calculate_bollinger_bands,
+)
 from indicators.moving_average import calculate_moving_average
-from indicators.stochastic import calculate_stochastic
+from indicators.stochastic import StochasticSeries, calculate_stochastic
 
 
 @dataclass(frozen=True)
@@ -61,9 +64,9 @@ class DirectionEvaluation:
 
 @dataclass(frozen=True)
 class IndicatorSet:
-    bands: object
+    bands: BollingerBandSeries
     moving_average: list[float | None]
-    stochastic: object
+    stochastic: StochasticSeries
     widths: list[float | None]
 
 

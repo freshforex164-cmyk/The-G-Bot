@@ -1,0 +1,1 @@
+- [Pocket Option seed sequencing](pocket-option-seeding.md) — seed candle histories sequentially on the shared client before opening multi-pair tick streams.

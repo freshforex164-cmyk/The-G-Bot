@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import broker.pocket_option as pocket_option_module
-from broker.pocket_option import PocketOptionBroker
+from broker.pocket_option import PocketOptionBroker, PocketOptionOperationError
 from config import (
     ConfigurationError,
     POCKET_OPTION_TIME_OFFSET_SECONDS,
@@ -144,6 +144,17 @@ class FakePocketOptionClient:
 
 
 class ReadOnlyBrokerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_payouts_timeout_raises_safe_operation_error(self) -> None:
+        broker = PocketOptionBroker(FAKE_SSID)
+        with (
+            patch.object(pocket_option_module, "PAYOUTS_TIMEOUT_SECONDS", 0.01),
+            patch.object(broker, "_request", side_effect=TimeoutError),
+            self.assertRaisesRegex(
+                PocketOptionOperationError, "did not return payouts"
+            ),
+        ):
+            await broker.payouts()
+
     async def asyncSetUp(self) -> None:
         FakePocketOptionClient.instances.clear()
         FakePocketOptionClient.is_demo_value = True

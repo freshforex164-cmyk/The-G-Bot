@@ -42,6 +42,21 @@ class CliTests(unittest.TestCase):
             )
         scanner.assert_awaited_once_with(minutes=1.0, record=True)
 
+    def test_explain_options_are_forwarded(self) -> None:
+        with patch.object(main, "run_explain", new_callable=AsyncMock) as explain:
+            self.assertEqual(
+                main.main(
+                    ["--run", "explain", "--pair", "BITB_otc", "--seconds", "30"]
+                ),
+                0,
+            )
+        explain.assert_awaited_once_with(pair="BITB_otc", seconds=30)
+
+    def test_strategy_lab_alias_runs_replay_command(self) -> None:
+        with patch.object(main, "run_replay", new_callable=AsyncMock) as replay:
+            self.assertEqual(main.main(["--run", "strategy-lab"]), 0)
+        replay.assert_awaited_once_with()
+
     def test_notify_test_command_returns_failure_code_when_send_fails(self) -> None:
         with patch.object(
             main, "run_notify_test", new_callable=AsyncMock, return_value=False
