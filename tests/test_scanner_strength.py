@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import config
 from data.candles import Candle
+from market_assets import MarketAsset
 from scanner import SignalScanner
 from strategy.pullback_reversal import PullbackReversalStrategy, Signal
 from strategy.rules import ConditionResult, DirectionEvaluation
@@ -149,7 +150,9 @@ class SignalScannerTests(unittest.TestCase):
             candles=Candles(),
             strategy=Strategy(),
             payout=92.0,
+            asset=MarketAsset("PAIR_otc", "Pair OTC", 92.0, True),
         )
+        scanner.pairs["PAIR"] = state
         observed: list[Signal] = []
         scanner.on_signal = observed.append
         tick = {"timestamp": 1_760_000_000 + 7200, "price": 1.05}
@@ -161,7 +164,7 @@ class SignalScannerTests(unittest.TestCase):
 
 class FakeMultiPairBroker:
     def __init__(self) -> None:
-        self.payout_map = {"A": 90.0, "B": 85.0, "LOW": 70.0}
+        self.payout_map = {"A_otc": 90.0, "B_otc": 85.0, "LOW_otc": 70.0}
         self.subscribed: set[str] = set()
         self.closed = False
 
@@ -170,6 +173,18 @@ class FakeMultiPairBroker:
 
     async def payouts(self) -> dict[str, float]:
         return dict(self.payout_map)
+
+    async def active_assets(self) -> list[dict[str, object]]:
+        return [
+            {
+                "symbol": pair,
+                "name": f"{pair[:-4]} OTC",
+                "is_otc": True,
+                "is_active": True,
+                "payout": payout,
+            }
+            for pair, payout in self.payout_map.items()
+        ]
 
     async def candle_history(self, pair: str, period: int, lookback: int):
         return []
@@ -190,8 +205,8 @@ class MultiPairScannerTests(unittest.IsolatedAsyncioTestCase):
         output: list[str] = []
         scanner = SignalScanner(broker, output=output.append)
         await scanner.run(minutes=0.001)
-        self.assertEqual(set(scanner.pairs), {"A", "B"})
-        self.assertEqual(broker.subscribed, {"A", "B"})
+        self.assertEqual(set(scanner.pairs), {"A_otc", "B_otc"})
+        self.assertEqual(broker.subscribed, {"A_otc", "B_otc"})
         self.assertTrue(broker.closed)
         self.assertTrue(
             any("requested_pairs=2 receiving_tick_pairs=2" in line for line in output)
@@ -202,15 +217,15 @@ class MultiPairScannerTests(unittest.IsolatedAsyncioTestCase):
         scanner = SignalScanner(broker, output=lambda _: None)
         await broker.connect()
         await scanner.refresh_pairs()
-        self.assertEqual(set(scanner.pairs), {"A", "B"})
-        scanner._receiving_pairs.update({"A", "B"})
-        broker.payout_map = {"B": 88.0, "C": 92.0}
+        self.assertEqual(set(scanner.pairs), {"A_otc", "B_otc"})
+        scanner._receiving_pairs.update({"A_otc", "B_otc"})
+        broker.payout_map = {"B_otc": 88.0, "C_otc": 92.0}
         await scanner.refresh_pairs()
         await asyncio.sleep(0)
-        self.assertEqual(set(scanner.pairs), {"B", "C"})
-        self.assertEqual(scanner._receiving_pairs, {"B", "C"})
-        self.assertNotIn("A", scanner._receiving_pairs)
-        self.assertEqual(scanner.pairs["B"].payout, 88.0)
+        self.assertEqual(set(scanner.pairs), {"B_otc", "C_otc"})
+        self.assertEqual(scanner._receiving_pairs, {"B_otc", "C_otc"})
+        self.assertNotIn("A_otc", scanner._receiving_pairs)
+        self.assertEqual(scanner.pairs["B_otc"].payout, 88.0)
         for task in scanner._tasks.values():
             task.cancel()
         await asyncio.gather(*scanner._tasks.values(), return_exceptions=True)

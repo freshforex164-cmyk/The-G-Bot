@@ -12,7 +12,9 @@ from typing import Any
 import config
 from broker.pocket_option import CandleHistoryUnavailable, PocketOptionBroker
 from data.candles import Candle, CandleBuilder, CandleDataError, _normalize_broker_timestamp
-from strategy.pullback_reversal import PullbackReversalStrategy, Signal
+from market_assets import MarketAsset, eligible_assets, normalize_assets
+from strategy.close_engine import CloseOnlyStrategy
+from strategy.pullback_reversal import Signal
 
 logger = logging.getLogger("gbot.scanner")
 SignalCallback = Callable[[Signal], None | Awaitable[None]]
@@ -23,8 +25,9 @@ OutputCallback = Callable[[str], None]
 @dataclass
 class PairScanState:
     payout: float
+    asset: MarketAsset
     candles: CandleBuilder
-    strategy: PullbackReversalStrategy
+    strategy: CloseOnlyStrategy
 
 
 class SignalScanner:
@@ -75,15 +78,10 @@ class SignalScanner:
 
     async def refresh_pairs(self) -> None:
         payouts = await self.broker.payouts()
-        selected = sorted(
-            (
-                (pair, float(payout))
-                for pair, payout in payouts.items()
-                if float(payout) >= config.MIN_PAYOUT
-            ),
-            key=lambda item: (-item[1], item[0]),
-        )[: config.MAX_SCAN_PAIRS]
-        desired = dict(selected)
+        metadata = await self.broker.active_assets()
+        assets = normalize_assets(metadata, payouts)
+        selected = eligible_assets(assets, config.MIN_PAYOUT, config.MAX_SCAN_PAIRS)
+        desired = {asset.symbol: asset for asset in selected}
 
         removed = set(self.pairs) - set(desired)
         for pair in removed:
@@ -94,10 +92,12 @@ class SignalScanner:
                 await asyncio.gather(task, return_exceptions=True)
             self.pairs.pop(pair, None)
 
-        for pair, payout in selected:
+        for asset in selected:
+            pair, payout = asset.symbol, asset.payout
             state = self.pairs.get(pair)
             if state is not None:
                 state.payout = payout
+                state.asset = asset
                 continue
             builder = CandleBuilder(
                 period_seconds=config.CANDLE_INTERVAL_SECONDS,
@@ -123,14 +123,20 @@ class SignalScanner:
                 )
             state = PairScanState(
                 payout=payout,
+                asset=asset,
                 candles=builder,
-                strategy=PullbackReversalStrategy(),
+                strategy=CloseOnlyStrategy(),
             )
             self.pairs[pair] = state
-            self._tasks[pair] = asyncio.create_task(
-                self._stream_pair(pair, state),
-                name=f"scanner-{pair}",
-            )
+        # Seed all pairs in sequence on the shared broker client before any
+        # concurrent tick subscriptions are opened.
+        for pair in desired:
+            state = self.pairs[pair]
+            if pair not in self._tasks:
+                self._tasks[pair] = asyncio.create_task(
+                    self._stream_pair(pair, state),
+                    name=f"scanner-{pair}",
+                )
 
     async def _stream_pair(self, pair: str, state: PairScanState) -> None:
         while not self._stopping and self.pairs.get(pair) is state:
@@ -197,6 +203,10 @@ class SignalScanner:
         self._publish_signal(signal)
 
     def _publish_signal(self, signal: Signal) -> None:
+        state = self.pairs.get(signal.pair)
+        if state is None or not state.asset.is_open or state.payout < config.MIN_PAYOUT:
+            return
+        signal.asset_name = state.asset.display_name
         self.expire_signals(signal.time)
         if any(
             active.status == "ACTIVE"

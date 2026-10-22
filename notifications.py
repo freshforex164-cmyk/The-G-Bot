@@ -10,7 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timezone
 from typing import Protocol
 
@@ -31,7 +31,7 @@ def format_signal_message(signal: Signal) -> str:
     icon = "🔴" if direction == "SELL" else "🟢"
     seconds_left = max(0, config.SIGNAL_VALID_SECONDS)
     return (
-        f"{icon} {direction} {signal.pair} @{signal.entry_price:.4f} | "
+        f"{icon} {direction} {signal.asset_name or signal.pair} @{signal.entry_price:.4f} | "
         f"Payout {signal.payout:g}% | Strength {signal.strength} | "
         f"Expiry {_expiry_label(signal.recommended_expiry_seconds)} | "
         f"Valid {seconds_left}s"
@@ -256,6 +256,7 @@ class NotificationQueue:
         max_per_minute: int = config.MAX_NOTIFICATIONS_PER_MINUTE,
         valid_seconds: int = config.SIGNAL_VALID_SECONDS,
         batch_window_seconds: float = 0.05,
+        pre_send: Callable[[Signal], Awaitable[bool]] | None = None,
     ) -> None:
         if max_per_minute <= 0 or valid_seconds <= 0:
             raise ValueError("notification limits must be greater than zero")
@@ -264,6 +265,7 @@ class NotificationQueue:
         self.max_per_minute = max_per_minute
         self.valid_seconds = valid_seconds
         self.batch_window_seconds = batch_window_seconds
+        self.pre_send = pre_send
         self._pending: list[Signal] = []
         self._sent_at: deque[float] = deque()
         self._wake = asyncio.Event()
@@ -372,6 +374,18 @@ class NotificationQueue:
                 if self._is_stale(signal, datetime.now(timezone.utc)):
                     logger.info("Expired queued notification was dropped.")
                     continue
+                if self.pre_send is not None:
+                    try:
+                        eligible = await self.pre_send(signal)
+                    except Exception as exc:
+                        logger.error(
+                            "Send-time signal validation failed (%s); signal dropped.",
+                            type(exc).__name__,
+                        )
+                        continue
+                    if not eligible:
+                        logger.info("Signal no longer meets send-time asset rules.")
+                        continue
                 self._sent_at.append(time.monotonic())
                 try:
                     await self.notifier.send(signal)

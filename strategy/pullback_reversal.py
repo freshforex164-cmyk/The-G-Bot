@@ -31,6 +31,8 @@ class Signal:
     recommended_expiry_seconds: int = config.RECOMMENDED_EXPIRY_SECONDS
     valid_until: datetime | None = None
     status: str = "ACTIVE"
+    asset_name: str | None = None
+    trigger_type: str | None = None
 
     @property
     def entry_price(self) -> float:

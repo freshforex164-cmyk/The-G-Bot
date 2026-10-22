@@ -282,6 +282,23 @@ class PocketOptionBroker:
                 parsed[pair] = float(payout)
         return parsed
 
+    async def active_assets(self) -> list[dict[str, Any]]:
+        """Read provider asset names and open flags without printing metadata."""
+        try:
+            rows = await asyncio.wait_for(
+                self._request("read asset metadata", lambda client: client.active_assets()),
+                timeout=PAYOUTS_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            raise PocketOptionOperationError(
+                "Pocket Option did not return asset metadata before the request timed out."
+            ) from None
+        if not isinstance(rows, list):
+            raise PocketOptionOperationError(
+                "Pocket Option returned asset metadata in an unexpected format."
+            )
+        return [row for row in rows if isinstance(row, dict)]
+
     async def candle_history(
         self, pair: str, period_seconds: int, lookback_seconds: int
     ) -> list[dict[str, Any]]:

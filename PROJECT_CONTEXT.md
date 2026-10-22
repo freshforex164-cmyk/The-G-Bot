@@ -145,3 +145,8 @@ Offline tests use mocks and do not connect to Pocket Option or Telegram.
 - Automatic execution, monetary risk management, and a database are out of
   scope. No signal, diagnostic message, or replay can place a trade.
 - A PWA with web push may be considered later.
+
+## PROGRESS
+
+- P1: OTC-only metadata filtering, app names, open/payout eligibility, send-time payout validation, and `--run pairs` implemented; 15 focused tests pass; live app cross-check pending.
+- P2: Candle defaults are 15 seconds; Stochastic 14,3,3; Bollinger 5/1; SMA 10 default with EMA support; ATR 14; Keltner remains disabled; 12 focused tests pass.

@@ -63,6 +63,11 @@ class CliTests(unittest.TestCase):
         ):
             self.assertEqual(main.main(["--run", "notify-test"]), 1)
 
+    def test_pairs_command_calls_live_pair_listing(self) -> None:
+        with patch.object(main, "run_pairs", new_callable=AsyncMock, return_value=True) as pairs:
+            self.assertEqual(main.main(["--run", "pairs"]), 0)
+        pairs.assert_awaited_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

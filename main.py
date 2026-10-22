@@ -42,9 +42,11 @@ from data.candles import (
     _normalize_broker_timestamp,
 )
 from data.candle_store import CsvCandleStore
+from market_assets import normalize_assets
 from paper.store import CsvSignalStore
 from paper.tracker import PaperTracker
 from scanner import SignalScanner
+from strategy.close_engine import CloseOnlyStrategy, explain_close_state
 from strategy.rules import DirectionEvaluation, evaluate_direction, trigger_a, trigger_b
 from strategy.pullback_reversal import Signal
 from strategy.replay import (
@@ -250,6 +252,43 @@ async def run_feed_check(*, duration_seconds: float = 30.0) -> bool:
             await asyncio.gather(monitor_task, return_exceptions=True)
         await broker.close()
 
+
+async def run_pairs() -> bool:
+    """Print OTC asset metadata for comparison with the Pocket Option app."""
+    broker = PocketOptionBroker(load_ssid())
+    try:
+        await broker.connect()
+        rows = await broker.active_assets()
+        payouts = await broker.payouts()
+        otc_rows = sorted(
+            (
+                row for row in rows
+                if isinstance(row.get("symbol"), str)
+                and row["symbol"].endswith("_otc")
+            ),
+            key=lambda row: str(row.get("symbol")),
+        )
+        if not otc_rows:
+            print("No OTC pairs were returned.")
+            return False
+        for row in otc_rows:
+            symbol = str(row["symbol"])
+            name = row.get("name")
+            if not isinstance(name, str) or not name.strip():
+                logger.warning(
+                    "Skipping OTC pair %s: Pocket Option provided no display name.",
+                    symbol,
+                )
+                name = "(missing display name; skipped by scanner)"
+            payout = payouts.get(symbol, row.get("payout"))
+            print(
+                f"{symbol} | {name} | payout={payout if payout is not None else 'unknown'} "
+                f"| open={bool(row.get('is_active', False))}"
+            )
+        return True
+    finally:
+        await broker.close()
+
     if failure is not None:
         print(f"FEED FAILED: {failure}", flush=True)
         return False
@@ -421,7 +460,6 @@ def _format_signal_line(signal: Signal) -> str:
 
 async def run_scanner(*, minutes: float, record: bool = False) -> None:
     tracker = PaperTracker(store=CsvSignalStore(config.SIGNALS_CSV_PATH))
-    queue = NotificationQueue(build_notifier())
     candle_store = CsvCandleStore(config.DATA_CANDLES_CSV_PATH) if record else None
 
     def on_signal(signal: Signal) -> None:
@@ -439,6 +477,19 @@ async def run_scanner(*, minutes: float, record: bool = False) -> None:
         on_tick=tracker.update_price,
         on_candle=on_candle if record else None,
     )
+
+    async def validate_at_send(signal: Signal) -> bool:
+        payouts = await scanner.broker.payouts()
+        rows = await scanner.broker.active_assets()
+        assets = normalize_assets(rows, payouts)
+        asset = assets.get(signal.pair)
+        if asset is None or not asset.is_open or asset.payout < config.MIN_PAYOUT:
+            return False
+        signal.payout = asset.payout
+        signal.asset_name = asset.display_name
+        return True
+
+    queue = NotificationQueue(build_notifier(), pre_send=validate_at_send)
     queue.start()
     try:
         await scanner.run(minutes=minutes)
@@ -571,35 +622,30 @@ def _explain_for_pair(
 
 
 async def run_explain(*, pair: str | None = None, seconds: int = 30) -> bool:
-    """Print both directional rule tables on a ten-second cadence."""
+    """Print close-only setup state on a 15-second cadence."""
     if seconds <= 0:
         raise ValueError("seconds must be greater than zero")
     broker = PocketOptionBroker(load_ssid())
     builders: dict[str, CandleBuilder] = {}
-    payouts: dict[str, float] = {}
-    latest_prices: dict[str, float] = {}
+    strategies: dict[str, CloseOnlyStrategy] = {}
+    assets_by_symbol: dict[str, Any] = {}
     streams: dict[str, AsyncGenerator[dict[str, Any], None]] = {}
     tasks: list[asyncio.Task[None]] = []
     try:
         await broker.connect()
         live_payouts = await broker.payouts()
-        if pair:
-            selected = [(pair, float(live_payouts.get(pair, 0.0)))]
-        else:
-            selected = sorted(
-                (
-                    (symbol, float(payout))
-                    for symbol, payout in live_payouts.items()
-                    if float(payout) >= MIN_PAYOUT
-                ),
-                key=lambda item: (-item[1], item[0]),
-            )[:TOP_PAIRS_COUNT]
+        metadata = normalize_assets(await broker.active_assets(), live_payouts)
+        selected_assets = (
+            [metadata[pair]] if pair in metadata else []
+        ) if pair else eligible_assets(
+            metadata, MIN_PAYOUT, TOP_PAIRS_COUNT
+        )
+        selected = [(asset.symbol, asset.payout) for asset in selected_assets]
         if not selected:
             print("EXPLAIN FAILED: no eligible pairs were returned.")
             return False
 
         for symbol, payout in selected:
-            payouts[symbol] = payout
             builder = CandleBuilder(
                 period_seconds=CANDLE_INTERVAL_SECONDS,
                 max_candles=MAX_CANDLES_PER_PAIR,
@@ -614,18 +660,29 @@ async def run_explain(*, pair: str | None = None, seconds: int = 30) -> bool:
             except (CandleHistoryUnavailable, CandleDataError) as exc:
                 logger.warning("History for %s unavailable (%s).", symbol, type(exc).__name__)
                 count = 0
-            print(f"EXPLAIN seeded {symbol}: {count} closed candles")
+            print(
+                f"EXPLAIN seeded {metadata[symbol].display_name}: "
+                f"{count} closed candles"
+            )
             builders[symbol] = builder
+            strategies[symbol] = CloseOnlyStrategy()
+            assets_by_symbol[symbol] = metadata[symbol]
+
+        for symbol, _payout in selected:
             streams[symbol] = broker.subscribe_ticks(symbol)
 
         async def pump(symbol: str) -> None:
             stream = streams[symbol]
             try:
                 async for tick in stream:
-                    builders[symbol].update(tick)
-                    latest_prices[symbol] = float(
-                        tick.get("close", tick.get("price"))
-                    )
+                    closed = builders[symbol].update(tick)
+                    if closed is not None:
+                        strategies[symbol].on_closed_candles(
+                            symbol,
+                            tuple(builders[symbol].closed),
+                            payout=assets_by_symbol[symbol].payout,
+                        )
+                        strategies[symbol].take_closed_signal(symbol)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -653,7 +710,7 @@ async def run_explain(*, pair: str | None = None, seconds: int = 30) -> bool:
                     symbol, builders[symbol], latest_prices.get(symbol)
                 ):
                     print(line)
-            next_print += 10.0
+            next_print += config.CANDLE_SECONDS
             if next_print > deadline:
                 break
         return True
@@ -883,6 +940,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=(
             "watch",
             "feed-check",
+            "pairs",
             "replay",
             "strategy-lab",
             "scanner",
@@ -924,6 +982,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.run == "feed-check":
             return 0 if asyncio.run(run_feed_check()) else 1
+        if args.run == "pairs":
+            return 0 if asyncio.run(run_pairs()) else 1
         if args.run in {"replay", "strategy-lab"}:
             asyncio.run(run_replay())
         elif args.run == "scanner":

@@ -4,6 +4,7 @@ import math
 import unittest
 from datetime import datetime, timedelta, timezone
 
+import config
 from data.candles import Candle
 from indicators.bollinger_bands import calculate_bollinger_bands
 from indicators.keltner_channel import calculate_keltner_channel
@@ -36,6 +37,29 @@ def sell_setup_closes(tail: list[float] | None = None) -> list[float]:
 
 
 class IndicatorTests(unittest.TestCase):
+    def test_requested_default_indicator_settings(self) -> None:
+        self.assertEqual((config.CANDLE_SECONDS, config.CANDLE_INTERVAL_SECONDS), (15, 15))
+        self.assertEqual(
+            (
+                config.STOCHASTIC_PERIOD,
+                config.STOCHASTIC_SMOOTH_K,
+                config.STOCHASTIC_SMOOTH_D,
+                config.STOCHASTIC_OVERBOUGHT,
+                config.STOCHASTIC_OVERSOLD,
+            ),
+            (14, 3, 3, 80.0, 20.0),
+        )
+        self.assertEqual(
+            (config.BOLLINGER_PERIOD, config.BOLLINGER_STANDARD_DEVIATIONS),
+            (5, 1.0),
+        )
+        self.assertEqual(
+            (config.MOVING_AVERAGE_PERIOD, config.MOVING_AVERAGE_METHOD),
+            (10, "SMA"),
+        )
+        self.assertEqual(config.KELTNER_ATR_PERIOD, 14)
+        self.assertFalse(config.USE_KELTNER_CHANNEL)
+
     def test_simple_and_exponential_average_values(self) -> None:
         candles = candles_from_closes([1.0, 2.0, 3.0, 6.0])
         sma = calculate_moving_average(candles, period=3, method="SMA")
