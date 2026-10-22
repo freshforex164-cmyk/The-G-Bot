@@ -523,6 +523,16 @@ async def run_telegram_setup() -> bool:
                 f"Chat id={chat_id} type={chat.get('type', 'unknown')} "
                 f"title/username={title_or_username}"
             )
+    configured_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if configured_chat_id and configured_chat_id in chats:
+        print("Configured TELEGRAM_CHAT_ID matches a chat returned by getUpdates.")
+    elif configured_chat_id:
+        print(
+            "Configured TELEGRAM_CHAT_ID was not found in these updates. "
+            "It may be the wrong chat ID, or the bot may not be in the chat."
+        )
+    else:
+        print("TELEGRAM_CHAT_ID is not configured.")
     print("Reminder: post in the channel or press Start on the bot first.")
     return True
 
@@ -592,13 +602,13 @@ async def run_explain(*, pair: str | None = None, seconds: int = 30) -> bool:
             payouts[symbol] = payout
             builder = CandleBuilder(
                 period_seconds=CANDLE_INTERVAL_SECONDS,
-                max_candles=config.REPLAY_MAX_CANDLES_PER_PAIR,
+                max_candles=MAX_CANDLES_PER_PAIR,
             )
             try:
                 history = await broker.candle_history(
                     symbol,
                     CANDLE_INTERVAL_SECONDS,
-                    config.REPLAY_HISTORY_LOOKBACK_SECONDS,
+                    HISTORY_LOOKBACK_SECONDS,
                 )
                 count = builder.seed(history)
             except (CandleHistoryUnavailable, CandleDataError) as exc:
@@ -771,13 +781,13 @@ async def run_test_signals() -> int:
         async def prepare(symbol: str, payout: float) -> None:
             builder = CandleBuilder(
                 period_seconds=CANDLE_INTERVAL_SECONDS,
-                max_candles=config.REPLAY_MAX_CANDLES_PER_PAIR,
+                max_candles=MAX_CANDLES_PER_PAIR,
             )
             try:
                 history = await broker.candle_history(
                     symbol,
                     CANDLE_INTERVAL_SECONDS,
-                    config.REPLAY_HISTORY_LOOKBACK_SECONDS,
+                    HISTORY_LOOKBACK_SECONDS,
                 )
                 builder.seed(history)
             except (CandleHistoryUnavailable, CandleDataError) as exc:

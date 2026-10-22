@@ -15,6 +15,7 @@ from notifications import (
     TelegramNotifier,
     TelegramSendError,
     build_notifier,
+    telegram_get_updates,
 )
 from strategy.pullback_reversal import Signal
 
@@ -84,6 +85,64 @@ class TelegramNotifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(captured["body"]["text"].startswith("🔴 SELL BITB_otc @24.0017"))
         self.assertNotIn("parse_mode", captured["body"])
 
+    async def test_send_text_posts_test_message_as_plain_text(self) -> None:
+        captured: dict[str, object] = {}
+
+        def opener(request, timeout):
+            captured["body"] = json.loads(request.data)
+            return FakeResponse(b'{"ok": true}')
+
+        notifier = TelegramNotifier("test-token", "-100123", opener=opener)
+        self.assertEqual(
+            await notifier.send_text("🧪 TEST SELL PAIR\nNot a confirmed signal"),
+            "sent through Telegram",
+        )
+        self.assertEqual(captured["body"]["chat_id"], "-100123")
+        self.assertEqual(
+            captured["body"]["text"],
+            "🧪 TEST SELL PAIR\nNot a confirmed signal",
+        )
+
+    async def test_get_updates_lists_response_without_echoing_token(self) -> None:
+        token = "private-test-token"
+        captured: dict[str, object] = {}
+
+        def opener(request, timeout):
+            captured["url"] = request.full_url
+            return FakeResponse(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "result": [
+                            {
+                                "update_id": 1,
+                                "channel_post": {
+                                    "chat": {
+                                        "id": -100123,
+                                        "type": "channel",
+                                        "title": "GBot alerts",
+                                    }
+                                },
+                            }
+                        ],
+                    }
+                ).encode()
+            )
+
+        result = await telegram_get_updates(token, opener=opener)
+        self.assertEqual(len(result), 1)
+        self.assertIn("/bot" + token + "/getUpdates", captured["url"])
+
+    async def test_get_updates_errors_do_not_echo_token(self) -> None:
+        token = "private-token"
+
+        def opener(request, timeout):
+            raise urllib.error.URLError(f"failed at {request.full_url}")
+
+        with self.assertRaises(TelegramSendError) as captured:
+            await telegram_get_updates(token, opener=opener)
+        self.assertNotIn(token, str(captured.exception))
+
     async def test_reports_actionable_api_errors_without_echoing_token(self) -> None:
         cases = (
             (
@@ -99,7 +158,7 @@ class TelegramNotifierTests(unittest.IsolatedAsyncioTestCase):
             (
                 403,
                 {"ok": False, "description": "Forbidden"},
-                "blocked or lack admin rights",
+                "blocked or not a member",
             ),
             (
                 429,

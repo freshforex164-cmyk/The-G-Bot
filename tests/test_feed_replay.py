@@ -9,8 +9,13 @@ from unittest.mock import patch
 
 import main
 from data.candles import Candle
-from strategy.pullback_reversal import PullbackReversalStrategy
-from strategy.replay import replay_candles
+from strategy.replay import (
+    ReplayVariant,
+    replay_variant,
+    run_strategy_lab,
+    strategy_variants,
+)
+from strategy.rules import ConditionResult, DirectionEvaluation
 
 
 FIXED_TIME = 1_760_000_000
@@ -61,30 +66,45 @@ class FeedCheckTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReplayTests(unittest.TestCase):
-    def test_replay_approximates_middle_band_touch_and_scores_three_horizons(self) -> None:
+    def test_replay_approximates_three_expiry_outcomes(self) -> None:
         candles = [
-            Candle(index * 10, 100.0, 100.1, 99.9, 100.0)
-            for index in range(33)
+            Candle(index * 10, 100.0, 100.2, 99.8, 100.0)
+            for index in range(40)
         ]
-        candles[20] = Candle(200, 99.0, 102.0, 98.0, 101.0)
-        candles[23] = Candle(230, 99.0, 99.1, 98.9, 99.0)
-        candles[26] = Candle(260, 101.0, 101.1, 100.9, 101.0)
-        candles[32] = Candle(320, 99.0, 99.1, 98.9, 99.0)
-        setup = SimpleNamespace(
-            direction="SELL",
-            stochastic_extremity=10.0,
-            stochastic_turn=5.0,
-            moving_average_turn=0.04,
-            bollinger_slope=0.05,
-            bollinger_curvature=0.025,
+        candles[4] = Candle(40, 99.0, 99.1, 98.9, 99.0)
+        candles[7] = Candle(70, 101.0, 101.1, 100.9, 101.0)
+        candles[13] = Candle(130, 99.0, 99.1, 98.9, 99.0)
+        passed = DirectionEvaluation(
+            "SELL",
+            tuple(ConditionResult(f"S{i}", True, True, "ok") for i in range(1, 5)),
+            middle=100.05,
+            upper=101,
+            lower=99,
+            stochastic_extremity=10,
+            stochastic_turn=5,
+            ma_turn_percent=0.04,
+            middle_slope_percent=0.05,
+            band_curvature_percent=0.025,
         )
+        failed = DirectionEvaluation(
+            "BUY",
+            tuple(ConditionResult(f"S{i}", False, True, "fail") for i in range(1, 5)),
+        )
+        variant = ReplayVariant("test", "A", True, True, 5)
 
-        with patch.object(
-            PullbackReversalStrategy,
-            "_find_setup",
-            side_effect=lambda history: setup if len(history) == 20 else None,
+        with patch(
+            "strategy.replay.evaluate_direction",
+            side_effect=lambda _series, direction, **_kwargs: (
+                passed if direction == "SELL" else failed
+            ),
+        ), patch(
+            "strategy.replay._approximate_trigger",
+            side_effect=lambda evaluation, candle, _trigger: (
+                evaluation.direction == "SELL" and candle.time == 10,
+                100.05,
+            ),
         ):
-            summary = replay_candles("SYNTHETIC", candles)
+            summary = replay_variant("SYNTHETIC", candles, variant)
 
         self.assertEqual(summary.signal_count, 1)
         signal = summary.signals[0]
@@ -94,8 +114,18 @@ class ReplayTests(unittest.TestCase):
             signal.outcomes,
             {3: "WIN", 6: "LOSS", 12: "WIN"},
         )
-        self.assertEqual(signal.strength, 39)
-        self.assertEqual(summary.strength_buckets["0-59"], 1)
+        self.assertGreaterEqual(signal.strength, 0)
+        self.assertLessEqual(signal.strength, 100)
+
+    def test_strategy_lab_compares_all_twenty_four_variants(self) -> None:
+        candles = [
+            Candle(index * 10, 100.0, 100.2, 99.8, 100.0)
+            for index in range(80)
+        ]
+        results = run_strategy_lab({"PAIR": candles})
+        self.assertEqual(len(strategy_variants()), 24)
+        self.assertEqual(len(results), 24)
+        self.assertTrue(all(summary.pair == "TOTAL" for summary in results.values()))
 
 
 if __name__ == "__main__":

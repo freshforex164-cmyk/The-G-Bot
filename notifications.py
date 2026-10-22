@@ -127,15 +127,17 @@ class TelegramNotifier:
             message = "Telegram rejected the request: invalid token (401)."
         elif status == 400 and "chat not found" in description:
             message = (
-                "Telegram could not find the chat: check the chat ID and make "
-                "sure the bot is in the chat or channel (400)."
+                "Telegram could not find this chat (400): TELEGRAM_CHAT_ID may "
+                "be wrong, or the bot has not been added to that chat/channel. "
+                "Use telegram-setup to check the returned chat ID, then add the "
+                "bot to the chat."
             )
         elif status == 400:
             message = "Telegram rejected the message (400)."
         elif status == 403:
             message = (
-                "Telegram denied the request: the bot may be blocked or lack "
-                "admin rights (403)."
+                "Telegram denied the request (403): the bot may be blocked or "
+                "not a member; for a channel, add it and grant admin posting rights."
             )
         elif status == 429:
             parameters = payload.get("parameters", {})

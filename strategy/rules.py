@@ -126,8 +126,10 @@ def evaluate_direction(
         raise ValueError("stochastic lookback must be greater than zero")
     n = len(candles)
     latest = n - 1 if index is None else index
-    if latest < 0 or latest >= n:
+    if n > 0 and (latest < 0 or latest >= n):
         raise IndexError("evaluation index must point to a candle in the series")
+    if n == 0 and index is not None:
+        raise IndexError("cannot evaluate an index in an empty candle series")
     s1_on = _settings(enabled, "S1", config.S1_ENABLED)
     s2_on = _settings(enabled, "S2", config.S2_ENABLED)
     s3_on = _settings(enabled, "S3", config.S3_ENABLED)

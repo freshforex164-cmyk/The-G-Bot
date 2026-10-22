@@ -33,7 +33,14 @@ class CliTests(unittest.TestCase):
     def test_scanner_command_passes_minutes(self) -> None:
         with patch.object(main, "run_scanner", new_callable=AsyncMock) as scanner:
             self.assertEqual(main.main(["--run", "scanner", "--minutes", "0.5"]), 0)
-        scanner.assert_awaited_once_with(minutes=0.5)
+        scanner.assert_awaited_once_with(minutes=0.5, record=False)
+
+    def test_scanner_record_flag_is_forwarded(self) -> None:
+        with patch.object(main, "run_scanner", new_callable=AsyncMock) as scanner:
+            self.assertEqual(
+                main.main(["--run", "scanner", "--minutes", "1", "--record"]), 0
+            )
+        scanner.assert_awaited_once_with(minutes=1.0, record=True)
 
     def test_notify_test_command_returns_failure_code_when_send_fails(self) -> None:
         with patch.object(

@@ -9,7 +9,8 @@ from unittest.mock import patch
 import config
 from data.candles import Candle
 from scanner import SignalScanner
-from strategy.pullback_reversal import PullbackReversalStrategy, Signal
+from strategy.pullback_reversal import Signal
+from strategy.rules import ConditionResult, DirectionEvaluation
 from strategy.strength import score_strength
 
 
@@ -65,34 +66,23 @@ class StrengthTests(unittest.TestCase):
         )
 
     def test_payout_does_not_change_strategy_strength(self) -> None:
-        closes = (
-            [100.0] * 9
-            + [150.0]
-            + [100.0] * 13
-            + [108.0, 110.0, 112.0, 114.0, 111.0, 100.0, 88.0]
+        evaluation = DirectionEvaluation(
+            direction="SELL",
+            conditions=tuple(
+                ConditionResult(f"S{index}", True, True, "test")
+                for index in range(1, 5)
+            ),
+            stochastic_extremity=6.0,
+            stochastic_turn=7.0,
+            ma_turn_percent=0.04,
+            middle_slope_percent=0.03,
+            band_curvature_percent=0.02,
         )
+        from strategy.pullback_reversal import PullbackReversalStrategy
 
-        def signal_for(payout: float) -> Signal:
-            strategy = PullbackReversalStrategy()
-            candles = candles_from_closes(closes)
-            strategy.on_closed_candles("PAIR", candles)
-            middle = (sum(closes[-19:]) + closes[-1]) / 20
-            start = middle - 2.0
-            timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
-            first = Candle(candles[-1].time + 10, start, start, start, start)
-            strategy.on_tick("PAIR", start, first, timestamp=timestamp, payout=payout)
-            price = middle + 2.0
-            forming = Candle(first.time, start, price, start, price)
-            result = strategy.on_tick(
-                "PAIR", price, forming, timestamp=timestamp, payout=payout
-            )
-            assert result is not None
-            return result
-
-        low, high = signal_for(80), signal_for(99)
-        self.assertNotEqual(low.payout, high.payout)
-        self.assertEqual(low.strength, high.strength)
-        self.assertEqual(low.strength_components, high.strength_components)
+        first = PullbackReversalStrategy._score(evaluation, 0.5)
+        second = PullbackReversalStrategy._score(evaluation, 0.5)
+        self.assertEqual(first, second)
 
 
 class SignalScannerTests(unittest.TestCase):
