@@ -57,6 +57,7 @@ class IndicatorTests(unittest.TestCase):
             (config.MOVING_AVERAGE_PERIOD, config.MOVING_AVERAGE_METHOD),
             (10, "SMA"),
         )
+        self.assertEqual(config.ATR_PERIOD, 14)
         self.assertEqual(config.KELTNER_ATR_PERIOD, 14)
         self.assertFalse(config.USE_KELTNER_CHANNEL)
 

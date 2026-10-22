@@ -154,3 +154,7 @@ Offline tests use mocks and do not connect to Pocket Option or Telegram.
 - P2: Verified 15-second candles and requested Stochastic/Bollinger/SMA/ATR defaults; SMA and EMA supported, Keltner disabled; 6 focused tests pass.
 - P3: Close-only state machine, SELL/BUY triggers, 45-second deadline, cooldown, payout-free weighted strength, numeric `explain`, and 15 focused tests pass.
 - P4: Telegram signal template is escaped HTML with exactly five lines, no price, 35-second expiry; stale queue entries are dropped; 10 focused tests pass.
+- P1 PARTIAL: Scanner and diagnostic signals use named, open OTC assets with send-time payout validation; focused tests pass. Live app cross-check remains for P8.
+- P2 DONE: 15-second candles and Stochastic/Bollinger/SMA/ATR defaults match the requested settings; Keltner remains disabled. `test_phase2.py`: 6 tests pass.
+- P3 DONE: Close-only state machine, 45-second window, ATR rejection rules, payout-free weighted strength, and 15-second numeric `explain` are implemented; `test_close_engine.py`: 9 tests pass.
+- P4 DONE: Telegram signal output is escaped HTML with exactly five lines, no price, and 35-second expiry; stale queued signals are dropped. Notification and live-command focused tests pass.

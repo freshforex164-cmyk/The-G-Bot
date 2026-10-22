@@ -42,7 +42,7 @@ from data.candles import (
     _normalize_broker_timestamp,
 )
 from data.candle_store import CsvCandleStore
-from market_assets import normalize_assets
+from market_assets import eligible_assets, normalize_assets
 from paper.store import CsvSignalStore
 from paper.tracker import PaperTracker
 from scanner import SignalScanner
@@ -517,6 +517,8 @@ async def run_notify_test() -> bool:
             "bollinger": 20,
             "middle_band_touch": 17,
         },
+        recommended_expiry_seconds=config.EXPIRATION_SECONDS,
+        asset_name="Bitcoin OTC",
         valid_until=now + timedelta(seconds=config.SIGNAL_VALID_SECONDS),
     )
     notifier = build_notifier()
@@ -799,7 +801,7 @@ def _format_test_signal(candidate: dict[str, Any]) -> str:
         f"TRIGGER {'✅' if candidate['triggered'] else '❌'}"
     )
     line_one = (
-        f"🧪 TEST {candidate['direction']} {candidate['pair']} "
+        f"🧪 TEST {candidate['direction']} {candidate['asset_name']} "
         f"@{candidate['price']:.4f} | Payout {candidate['payout']:g}% | "
         f"Match {candidate['match']}/5 | "
         f"Expiry {expiry_label} | "
@@ -825,16 +827,19 @@ async def run_test_signals() -> int:
     try:
         await broker.connect()
         live_payouts = await broker.payouts()
+        assets = normalize_assets(await broker.active_assets(), live_payouts)
+        eligible = eligible_assets(
+            assets, MIN_PAYOUT, config.MAX_SCAN_PAIRS
+        )
         selected = sorted(
             (
-                (symbol, float(value))
-                for symbol, value in live_payouts.items()
-                if float(value) >= MIN_PAYOUT
+                (asset.symbol, asset.payout)
+                for asset in eligible
             ),
             key=lambda item: (-item[1], item[0]),
-        )[: config.MAX_SCAN_PAIRS]
+        )
         if not selected:
-            print("TEST SIGNALS FAILED: no eligible pairs were returned.")
+            print("TEST SIGNALS FAILED: no open, named OTC pair meets the minimum payout.")
             return 1
 
         async def prepare_history(symbol: str, payout: float) -> None:
@@ -881,6 +886,8 @@ async def run_test_signals() -> int:
                 initial_ticks[symbol],
             )
         ]
+        for candidate in candidates:
+            candidate["asset_name"] = assets[candidate["pair"]].display_name
         best_by_pair: dict[str, dict[str, Any]] = {}
         for candidate in candidates:
             current = best_by_pair.get(candidate["pair"])
@@ -903,8 +910,23 @@ async def run_test_signals() -> int:
             try:
                 tick = await asyncio.wait_for(anext(stream), timeout=10.0)
                 builders[symbol].update(tick)
+                latest_payouts = await broker.payouts()
+                latest_assets = normalize_assets(
+                    await broker.active_assets(), latest_payouts
+                )
+                asset = latest_assets.get(symbol)
+                if (
+                    asset is None
+                    or not asset.is_open
+                    or asset.payout < MIN_PAYOUT
+                ):
+                    logger.info(
+                        "Test signal for %s was skipped after send-time asset validation.",
+                        symbol,
+                    )
+                    continue
                 refreshed = _test_signal_evaluations(
-                    symbol, payouts[symbol], builders[symbol], tick
+                    symbol, asset.payout, builders[symbol], tick
                 )
                 match = next(
                     (item for item in refreshed if item["direction"] == candidate["direction"]),
@@ -912,6 +934,7 @@ async def run_test_signals() -> int:
                 )
                 if match is not None:
                     candidate = match
+                candidate["asset_name"] = asset.display_name
             except (TimeoutError, StopAsyncIteration):
                 logger.warning("No fresh send-time price arrived for %s.", symbol)
                 continue

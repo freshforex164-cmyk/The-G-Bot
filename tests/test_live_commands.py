@@ -90,7 +90,22 @@ class LiveCommandTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
             async def payouts(self) -> dict[str, float]:
-                return {"PAIR1": 92, "PAIR2": 90, "PAIR3": 88}
+                return {
+                    "PAIR1_otc": 92,
+                    "PAIR2_otc": 90,
+                    "PAIR3_otc": 88,
+                }
+
+            async def active_assets(self) -> list[dict[str, object]]:
+                return [
+                    {
+                        "symbol": f"PAIR{index}_otc",
+                        "name": f"Pair {index} OTC",
+                        "is_active": True,
+                        "is_otc": True,
+                    }
+                    for index in range(1, 4)
+                ]
 
             async def candle_history(self, *_args):
                 return []
@@ -125,6 +140,12 @@ class LiveCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             all("@100.1234" in str(message["text"]) for message in captured_messages)
         )
+        self.assertTrue(
+            all(
+                f"Pair {index} OTC" in str(message["text"])
+                for index, message in enumerate(captured_messages, start=1)
+            )
+        )
         self.assertIn("TEST SIGNALS SENT: 3/3", output.getvalue())
         self.assertNotIn("mock-token", output.getvalue())
 
@@ -157,7 +178,11 @@ class LiveCommandTests(unittest.IsolatedAsyncioTestCase):
             result = await main.run_notify_test()
         self.assertTrue(result)
         self.assertEqual(len(captured), 1)
-        self.assertTrue(str(captured[0]["text"]).startswith("🔴 SELL BITB_otc"))
+        self.assertEqual(
+            str(captured[0]["text"]),
+            "🔴 <b>SELL</b>\nAsset: Bitcoin OTC\nPayout: 92%\n"
+            "Strength: 84\nExpiration: <b>35s</b>",
+        )
         self.assertIn("NOTIFY TEST OK", output.getvalue())
 
     async def test_replay_loads_recorded_candles_and_prints_lab_table(self) -> None:
