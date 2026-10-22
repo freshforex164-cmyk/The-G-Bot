@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -27,14 +28,15 @@ def _expiry_label(seconds: int) -> str:
 
 
 def format_signal_message(signal: Signal) -> str:
-    direction = signal.direction.upper()
+    direction = html.escape(signal.direction.upper(), quote=False)
     icon = "🔴" if direction == "SELL" else "🟢"
-    seconds_left = max(0, config.SIGNAL_VALID_SECONDS)
+    asset_name = html.escape(signal.asset_name or "Unknown asset", quote=False)
     return (
-        f"{icon} {direction} {signal.asset_name or signal.pair} @{signal.entry_price:.4f} | "
-        f"Payout {signal.payout:g}% | Strength {signal.strength} | "
-        f"Expiry {_expiry_label(signal.recommended_expiry_seconds)} | "
-        f"Valid {seconds_left}s"
+        f"{icon} <b>{direction}</b>\n"
+        f"Asset: {asset_name}\n"
+        f"Payout: {signal.payout:g}%\n"
+        f"Strength: {signal.strength}\n"
+        f"Expiration: <b>{_expiry_label(signal.recommended_expiry_seconds)}</b>"
     )
 
 
@@ -82,7 +84,11 @@ class TelegramNotifier:
         request = urllib.request.Request(
             url,
             data=json.dumps(
-                {"chat_id": self._chat_id, "text": message}
+                {
+                    "chat_id": self._chat_id,
+                    "text": message,
+                    "parse_mode": "HTML",
+                }
             ).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",

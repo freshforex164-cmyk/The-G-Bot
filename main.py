@@ -706,8 +706,10 @@ async def run_explain(*, pair: str | None = None, seconds: int = 30) -> bool:
             elapsed = int(next_print - started)
             print(f"EXPLAIN sample +{elapsed}s")
             for symbol, _ in selected:
-                for line in _explain_for_pair(
-                    symbol, builders[symbol], latest_prices.get(symbol)
+                for line in explain_close_state(
+                    symbol,
+                    tuple(builders[symbol].closed),
+                    strategies[symbol],
                 ):
                     print(line)
             next_print += config.CANDLE_SECONDS

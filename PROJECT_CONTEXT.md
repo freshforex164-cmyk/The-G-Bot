@@ -150,3 +150,7 @@ Offline tests use mocks and do not connect to Pocket Option or Telegram.
 
 - P1: OTC-only metadata filtering, app names, open/payout eligibility, send-time payout validation, and `--run pairs` implemented; 15 focused tests pass; live app cross-check pending.
 - P2: Candle defaults are 15 seconds; Stochastic 14,3,3; Bollinger 5/1; SMA 10 default with EMA support; ATR 14; Keltner remains disabled; 12 focused tests pass.
+- P1: Verified OTC-only filtering, provider display names, active-pair payout eligibility, send-time validation, and `--run pairs`; 9 focused tests pass; live app cross-check deferred to P8.
+- P2: Verified 15-second candles and requested Stochastic/Bollinger/SMA/ATR defaults; SMA and EMA supported, Keltner disabled; 6 focused tests pass.
+- P3: Close-only state machine, SELL/BUY triggers, 45-second deadline, cooldown, payout-free weighted strength, numeric `explain`, and 15 focused tests pass.
+- P4: Telegram signal template is escaped HTML with exactly five lines, no price, 35-second expiry; stale queue entries are dropped; 10 focused tests pass.

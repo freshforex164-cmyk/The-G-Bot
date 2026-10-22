@@ -84,41 +84,46 @@ def trigger_measurements(
     small = body_ok and (close > o if direction == "SELL" else close < o)
     wick = (h - max(o, close)) if direction == "SELL" else (min(o, close) - low)
     wick_ratio = wick / candle_range if candle_range > 0 else 0.0
+    middle_value, upper_value, lower_value = (
+        float(middle),
+        float(upper),
+        float(lower_band),
+    )
     if direction == "SELL":
-        middle_touch = low - eps <= middle <= h + eps
-        middle_overshoot = max(0.0, h - middle)
-        middle = (
+        middle_touch = low - eps <= middle_value <= h + eps
+        middle_overshoot = max(0.0, h - middle_value)
+        middle_pass = (
             config.MIDDLE_ENABLED
             and small
             and middle_touch
-            and close < middle
+            and close < middle_value
             and wick_ratio >= config.MIN_REJECTION_WICK_RATIO
             and middle_overshoot <= config.MAX_TOUCH_ATR * atr
         )
-        lower = (
+        outer_pass = (
             config.LOWER_ENABLED
             and small
-            and low - eps <= lower_band <= h + eps
-            and close < middle
+            and low - eps <= lower_value <= h + eps
+            and close < middle_value
         )
         over = middle_overshoot / atr if atr > 0 else math.inf
     else:
-        middle_touch = low - eps <= middle <= h + eps
-        middle_overshoot = max(0.0, middle - low)
-        middle = (
+        middle_touch = low - eps <= middle_value <= h + eps
+        middle_overshoot = max(0.0, middle_value - low)
+        middle_pass = (
             config.MIDDLE_ENABLED
             and small
             and middle_touch
-            and close > middle
+            and close > middle_value
             and wick_ratio >= config.MIN_REJECTION_WICK_RATIO
             and middle_overshoot <= config.MAX_TOUCH_ATR * atr
         )
-        upper_touch = low - eps <= upper <= h + eps
-        lower = (
+        upper_touch = low - eps <= upper_value <= h + eps
+        outer_pass = (
             config.LOWER_ENABLED
             and small
             and upper_touch
-            and close > middle
+            and close > middle_value
         )
         over = middle_overshoot / atr if atr > 0 else math.inf
     common = (
@@ -127,10 +132,10 @@ def trigger_measurements(
         else "candle direction/body failed"
     )
     return TriggerCheck(
-        middle=middle,
-        lower=lower,
-        middle_reason="middle rejection passed" if middle else common,
-        lower_reason="outer band touch passed" if lower else common,
+        middle=middle_pass,
+        lower=outer_pass,
+        middle_reason="middle rejection passed" if middle_pass else common,
+        lower_reason="outer band touch passed" if outer_pass else common,
         wick_ratio=wick_ratio,
         overshoot_atr=over,
         candle_range=candle_range,
@@ -233,7 +238,7 @@ class CloseOnlyStrategy:
                     atr=float(atr),
                     middle=mid,
                     upper=up,
-                    lower=lo,
+                    lower_band=lo,
                 )
                 trigger_type = (
                     "MIDDLE"
@@ -419,7 +424,7 @@ def score_close_strength(
 def explain_close_state(
     pair: str, candles: Sequence[Candle], strategy: CloseOnlyStrategy
 ) -> list[str]:
-    """Return numeric latest-candle rule diagnostics and the first failure."""
+    """Explain the close-only engine using the latest completed candle."""
     lines = [f"EXPLAIN {pair}"]
     if len(candles) < config.MIN_STRATEGY_CANDLES:
         return lines + [f"history={len(candles)} required={config.MIN_STRATEGY_CANDLES} ✗"]
@@ -433,35 +438,88 @@ def explain_close_state(
     k0, k1, k2 = (stochastic.slow_k[i] for i in (index, index - 1, index - 2))
     if atr is None or atr <= 0 or any(value is None for value in (k0, k1, k2)):
         return lines + ["ATR/Stochastic unavailable or flat ✗"]
+    mid, upper, lower = (
+        bands.middle[index],
+        bands.upper[index],
+        bands.lower[index],
+    )
+    if mid is None or upper is None or lower is None:
+        return lines + ["Bollinger values unavailable ✗"]
+    latest = candles[-1]
+    eps = config.EPS_ATR_RATIO * atr
+    slope = (
+        (float(ma[index]) - float(ma[index - 3])) / atr
+        if index >= 3 and ma[index] is not None and ma[index - 3] is not None
+        else None
+    )
+    d_value = stochastic.slow_d[index]
+    lines.append(
+        f"CLOSE O={latest.open:g} H={latest.high:g} L={latest.low:g} "
+        f"C={latest.close:g} ATR={atr:.6g} eps={eps:.6g} "
+        f"K/D={float(k0):.2f}/{float(d_value):.2f} "
+        f"mid/up/lo={float(mid):.6g}/{float(upper):.6g}/{float(lower):.6g} "
+        f"slopeMA={slope if slope is not None else 'n/a'}"
+    )
     for direction in ("SELL", "BUY"):
         passed, extreme, drop, failure = arm_measurements(
             direction, float(k0), float(k1), float(k2)
         )
         state = strategy.state(pair, direction)
         lines.append(
-            f"{direction} S1 {'✓' if passed else '✗'} K={float(k0):.2f}/"
+            f"{direction} S1 {'✓' if passed else '✗'} K[0..2]="
+            f"{float(k0):.2f}/"
             f"{float(k1):.2f}/{float(k2):.2f} extreme={extreme:.2f} "
-            f"drop={drop:.2f}; state={state.status} {state.reason}"
+            f"drop={drop:.2f} limits={config.PULLBACK_MIN_DROP:g}.."
+            f"{config.PULLBACK_MAX_DROP:g}; state={state.status} "
+            f"{state.reason or 'no active setup'}"
         )
-        if not passed:
-            lines.append(f"  first failure: {failure}")
-        if bands.middle[index] is None:
-            continue
         check = trigger_measurements(
             direction,
-            candles[-1],
+            latest,
             atr=float(atr),
-            middle=float(bands.middle[index]),
-            upper=float(bands.upper[index]),
-            lower=float(bands.lower[index]),
+            middle=float(mid),
+            upper=float(upper),
+            lower_band=float(lower),
+        )
+        o, h, low, close = map(
+            float, (latest.open, latest.high, latest.low, latest.close)
+        )
+        body_ok = check.body <= config.MAX_BODY_ATR_RATIO * float(atr)
+        directional = close > o if direction == "SELL" else close < o
+        middle_touch = low - eps <= float(mid) <= h + eps
+        outer = (
+            low - eps <= float(lower) <= h + eps
+            if direction == "SELL"
+            else low - eps <= float(upper) <= h + eps
         )
         lines.append(
-            f"  MIDDLE {'✓' if check.middle else '✗'} wick={check.wick_ratio:.3f} "
-            f"overshootATR={check.overshoot_atr:.3f} body={check.body:.6g} "
-            f"ATR={float(atr):.6g}; {check.middle_reason}"
+            f"  small/direction {'✓' if body_ok and directional else '✗'} "
+            f"body={check.body:.6g} limit="
+            f"{config.MAX_BODY_ATR_RATIO * float(atr):.6g} "
+            f"direction={'bullish' if direction == 'SELL' else 'bearish'}"
         )
         lines.append(
-            f"  LOWER {'✓' if check.lower else '✗'} range={check.candle_range:.6g}; "
-            f"{check.lower_reason}"
+            f"  MIDDLE {'✓' if check.middle else '✗'} touch={middle_touch} "
+            f"wick={check.wick_ratio:.3f} min={config.MIN_REJECTION_WICK_RATIO:g} "
+            f"overshootATR={check.overshoot_atr:.3f} max={config.MAX_TOUCH_ATR:g} "
+            f"range={check.candle_range:.6g}; {check.middle_reason}"
         )
+        lines.append(
+            f"  {'LOWER' if direction == 'SELL' else 'UPPER'} "
+            f"{'✓' if check.lower else '✗'} touch={outer} "
+            f"close-vs-mid={close:.6g}/{float(mid):.6g}; {check.lower_reason}"
+        )
+        if state.status == "ARMED" and state.reason.startswith("ARMED"):
+            first_failure = (
+                "small directional candle"
+                if not body_ok or not directional
+                else "MIDDLE rejection and LOWER/UPPER touch both failed"
+                if not check.middle and not check.lower
+                else "trigger conditions not all satisfied"
+            )
+        elif not passed and state.status != "ARMED":
+            first_failure = failure
+        else:
+            first_failure = state.reason or "none"
+        lines.append(f"  first failure: {first_failure}")
     return lines

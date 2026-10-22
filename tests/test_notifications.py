@@ -15,6 +15,7 @@ from notifications import (
     TelegramNotifier,
     TelegramSendError,
     build_notifier,
+    format_signal_message,
     telegram_get_updates,
 )
 from strategy.pullback_reversal import Signal
@@ -38,6 +39,8 @@ def sample_signal(
         bollinger_middle=24.0,
         payout=92,
         strength=strength,
+        recommended_expiry_seconds=35,
+        asset_name="Bitcoin OTC",
         valid_until=valid_until or created + timedelta(seconds=15),
     )
 
@@ -61,7 +64,7 @@ class FakeResponse:
 
 
 class TelegramNotifierTests(unittest.IsolatedAsyncioTestCase):
-    async def test_success_posts_plain_json_with_five_second_timeout(self) -> None:
+    async def test_success_posts_html_signal_with_five_second_timeout(self) -> None:
         token = "test-token-never-log"
         captured: dict[str, object] = {}
 
@@ -82,8 +85,24 @@ class TelegramNotifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             captured["body"]["chat_id"], "chat-123"
         )
-        self.assertTrue(captured["body"]["text"].startswith("🔴 SELL BITB_otc @24.0017"))
-        self.assertNotIn("parse_mode", captured["body"])
+        self.assertEqual(
+            captured["body"]["text"],
+            "🔴 <b>SELL</b>\nAsset: Bitcoin OTC\nPayout: 92%\n"
+            "Strength: 84\nExpiration: <b>35s</b>",
+        )
+        self.assertEqual(captured["body"]["parse_mode"], "HTML")
+
+    def test_signal_message_has_exactly_five_lines_no_price_and_escapes_asset(self) -> None:
+        signal = sample_signal()
+        signal.asset_name = "EUR/GBP <OTC>"
+        message = format_signal_message(signal)
+        self.assertEqual(
+            message,
+            "🔴 <b>SELL</b>\nAsset: EUR/GBP &lt;OTC&gt;\nPayout: 92%\n"
+            "Strength: 84\nExpiration: <b>35s</b>",
+        )
+        self.assertEqual(len(message.splitlines()), 5)
+        self.assertNotIn("24.0017", message)
 
     async def test_send_text_posts_test_message_as_plain_text(self) -> None:
         captured: dict[str, object] = {}

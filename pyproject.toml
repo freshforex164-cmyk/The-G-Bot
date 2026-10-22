@@ -5,4 +5,5 @@ description = "Read-only Pocket Option signal scanner."
 requires-python = ">=3.12"
 dependencies = [
     "binaryoptionstoolsv2==0.2.15",
+    "psycopg[binary]>=3.3.6",
 ]
