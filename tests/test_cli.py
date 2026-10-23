@@ -68,6 +68,11 @@ class CliTests(unittest.TestCase):
             self.assertEqual(main.main(["--run", "pairs"]), 0)
         pairs.assert_awaited_once_with()
 
+    def test_serve_command_starts_bot_and_scanner_service(self) -> None:
+        with patch.object(main, "run_serve", new_callable=AsyncMock) as serve:
+            self.assertEqual(main.main(["--run", "serve"]), 0)
+        serve.assert_awaited_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

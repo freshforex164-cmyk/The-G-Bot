@@ -3,23 +3,21 @@
 ## Product definition
 
 GBot is a read-only Pocket Option signal scanner. It connects with one
-`PO_SSID`, builds 10-second candles for multiple pairs, evaluates the
-pullback-reversal strategy, and sends signals through a pluggable notifier.
-Telegram is the current notifier. Users decide what to do with signals
-themselves. There is no account access beyond market data and the informational
-account-type flag, no submitted actions, no stored account funds, and no
-database.
+`PO_SSID`, scans open OTC pairs, builds 15-second candles, evaluates the
+pullback-rejection strategy, and sends signals to subscribed Telegram chats.
+It never submits trades or reads account funds. Subscriber state uses Neon
+Postgres when `DATABASE_URL` is available, with a local JSON fallback.
 
-The required secret names are `PO_SSID`, `TELEGRAM_BOT_TOKEN`, and
-`TELEGRAM_CHAT_ID`. Secret values must never be printed or logged. A missing
-`PO_SSID` stops execution with a clear configuration message. Missing Telegram
-secrets disable Telegram and leave console notifications available.
+The secret names are `PO_SSID`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`,
+`TELEGRAM_ADMIN_ID`, `REFERRAL_LINK`, and `DATABASE_URL`. Secret values must
+never be printed or logged. A missing `PO_SSID` or Telegram bot token stops
+`serve` with a clear configuration message. A missing database uses JSON.
 
 ## Current capabilities
 
 - Read-only broker connection with bounded reconnect backoff, payout reads,
   historical candle seeding, and live tick subscriptions.
-- 10-second OHLC candle construction and Stochastic, moving average, Bollinger
+- 15-second OHLC candle construction and Stochastic, moving average, Bollinger
   Bands, and optional Keltner Channel indicators. Strategy rules use only
   completed candles; index 0 means the latest completed candle.
 - Configurable, explainable S1-S4 setup rules, live-touch (A) and closed-rejection
@@ -36,6 +34,11 @@ secrets disable Telegram and leave console notifications available.
   `data/candles.csv`; replay reads this file when available.
 - Console and Telegram notifiers send through an asynchronous, freshness- and
   rate-limited queue.
+- `serve` runs the scanner with a Telegram long-poll command service. Public
+  commands manage per-chat subscriptions; admin commands are restricted to
+  `TELEGRAM_ADMIN_ID`. Subscriber signal fan-out handles 403/429 responses.
+- The scanner rejects stale ticks and watches for feed stalls; after repeated
+  failed rebuilds it alerts the admin that the SSID may have expired.
 - `telegram-setup` lists chats returned by Telegram `getUpdates`. It never
   prints the bot token. `test-signals` sends explicitly labeled test messages;
   these are not confirmed signals and never submit trades.
@@ -57,12 +60,13 @@ uv run --locked python main.py --run replay
 uv run --locked python main.py --run notify-test
 uv run --locked python main.py --run test-signals
 uv run --locked python main.py --run scanner --minutes 3 --record
+uv run --locked python main.py --run serve
 ```
 
 `watch` runs for `RUN_DURATION_SECONDS`. `feed-check` samples for 30 seconds.
-`explain` defaults to the highest-payout three pairs and prints every ten
+`explain` defaults to the highest-payout three pairs and prints every 15
 seconds; `--pair X` selects one. Replay reads recorded candles first; if the
-file is absent it asks the broker for up to 3,000 closed 10-second candles per
+file is absent it asks the broker for up to 3,000 closed 15-second candles per
 eligible pair and reports how many were returned. `notify-test` sends one
 sample Telegram message. `test-signals` sends up to three marked diagnostic
 messages using a fresh live price. Live commands need their configured secrets.
@@ -76,14 +80,14 @@ Offline tests use mocks and do not connect to Pocket Option or Telegram.
 | `MAX_SCAN_PAIRS` | `20` | Maximum concurrent scanner pairs |
 | `PAYOUT_REFRESH_SECONDS` | `60` | Pair eligibility refresh interval |
 | `MAX_ACTIVE_SIGNALS` | `5` | Maximum signals shown in the active ranking |
-| `RECOMMENDED_EXPIRY_SECONDS` | `60` | Signal's recommended expiry |
+| `EXPIRATION_SECONDS` | `35` | Signal expiration |
 | `SIGNAL_VALID_SECONDS` | `15` | Signal and queued-notification lifetime |
 | `MIN_NOTIFY_STRENGTH` | `0` | Minimum strength for notification |
 | `MAX_NOTIFICATIONS_PER_MINUTE` | `6` | Notification rate limit |
 | `HUMAN_DELAY_SECONDS` | `5` | Delay before paper entry price is recorded |
 | `PAPER_EXPIRIES_SECONDS` | `(30, 60, 120)` | Paper outcome horizons |
 | `SIGNALS_CSV_PATH` | `"signals.csv"` | CSV signal-store path |
-| `CANDLE_INTERVAL_SECONDS` | `10` | Candle interval |
+| `CANDLE_INTERVAL_SECONDS` | `15` | Candle interval |
 | `MAX_CANDLES_PER_PAIR` | `300` | Retained/seeded candles per pair |
 | `REPLAY_MAX_CANDLES_PER_PAIR` | `3000` | Maximum requested replay candles |
 | `DATA_CANDLES_CSV_PATH` | `"data/candles.csv"` | Recorded candle and replay file |
@@ -96,12 +100,12 @@ Offline tests use mocks and do not connect to Pocket Option or Telegram.
 | `STOCHASTIC_PERIOD` | `14` | Raw stochastic lookback |
 | `STOCHASTIC_SMOOTH_K` / `STOCHASTIC_SMOOTH_D` | `3` / `3` | Stochastic smoothing |
 | `STOCHASTIC_OVERBOUGHT` / `STOCHASTIC_OVERSOLD` | `80` / `20` | Direction thresholds |
-| `MOVING_AVERAGE_PERIOD` | `10` | EMA period |
+| `MOVING_AVERAGE_PERIOD` | `10` | Moving-average period |
 | `MA_RISE_MIN` | `0.0005` | Minimum preceding MA move (ratio) |
 | `MA_FLAT_TOL` | `0.0005` | Maximum opposing MA slope (ratio) |
 | `MID_FLAT_TOL` | `0.0005` | Bollinger middle-band slope tolerance |
-| `BOLLINGER_PERIOD` | `20` | Bollinger period |
-| `BOLLINGER_STANDARD_DEVIATIONS` | `2.0` | Bollinger band width |
+| `BOLLINGER_PERIOD` | `5` | Bollinger period |
+| `BOLLINGER_STANDARD_DEVIATIONS` | `1.0` | Bollinger band width |
 | `BB_WIDTH_MEAN_LOOKBACK_CANDLES` | `50` | Range-filter width average |
 | `RANGE_MAX_RATIO` | `1.2` | Maximum current/average width ratio |
 | `SIGNAL_COOLDOWN_CANDLES` | `3` | Per-pair signal cooldown |
@@ -123,7 +127,7 @@ Offline tests use mocks and do not connect to Pocket Option or Telegram.
 - `config.py` — secrets loading and scanner, strategy, notification, and paper
   settings.
 - `broker/pocket_option.py` — read-only Pocket Option adapter.
-- `data/candles.py` — 10-second candle builder and history seeding.
+- `data/candles.py` — 15-second candle builder and history seeding.
 - `data/candle_store.py` — CSV recording and replay loading.
 - `indicators/` — moving average, Bollinger Bands, Stochastic, and Keltner.
 - `strategy/SPEC.md` — exact rule, index, and trigger specification.
@@ -132,6 +136,8 @@ Offline tests use mocks and do not connect to Pocket Option or Telegram.
 - `scanner.py` — multi-pair scan loop, active signals, and stream health.
 - `notifications.py` — notifier interface, console/Telegram implementations,
   and asynchronous queue.
+- `telegram_bot.py` — long polling, command routing, admin controls, and
+  subscriber signal fan-out.
 - `paper/` — delayed paper outcome tracking and in-memory/CSV stores.
 - `tests/` — offline tests with mocked broker and Telegram HTTP.
 
@@ -142,9 +148,10 @@ Offline tests use mocks and do not connect to Pocket Option or Telegram.
   retired. Account balance tracking, stake/profit calculations, peak/drawdown
   tracking, `check_win`, `test-trade`, `whoami`, and `--confirm-real` are not
   part of the scanner.
-- Automatic execution, monetary risk management, and a database are out of
-  scope. No signal, diagnostic message, or replay can place a trade.
-- A PWA with web push may be considered later.
+- Automatic execution and monetary risk management are out of scope. No signal,
+  diagnostic message, or replay can place a trade.
+- A dark-glassmorphism admin PWA is planned with Dashboard, Signals, and
+  Settings sections. End users use Telegram, not the PWA.
 
 ## PROGRESS
 
@@ -158,3 +165,5 @@ Offline tests use mocks and do not connect to Pocket Option or Telegram.
 - P2 DONE: 15-second candles and Stochastic/Bollinger/SMA/ATR defaults match the requested settings; Keltner remains disabled. `test_phase2.py`: 6 tests pass.
 - P3 DONE: Close-only state machine, 45-second window, ATR rejection rules, payout-free weighted strength, and 15-second numeric `explain` are implemented; `test_close_engine.py`: 9 tests pass.
 - P4 DONE: Telegram signal output is escaped HTML with exactly five lines, no price, and 35-second expiry; stale queued signals are dropped. Notification and live-command focused tests pass.
+- P5 DONE: Telegram long polling, seven commands, referral-backed registration, subscriber fan-out, admin restrictions, and Postgres/JSON storage are implemented; 16 focused offline tests pass.
+- P6 DONE: Stale-tick rejection, 15-second broker-call timeouts, 20-second no-feed watchdog, connection rebuilds, and the third-failure SSID alert are implemented; 9 scanner/watchdog tests pass.

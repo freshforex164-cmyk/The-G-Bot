@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -155,11 +156,40 @@ class SignalScannerTests(unittest.TestCase):
         scanner.pairs["PAIR"] = state
         observed: list[Signal] = []
         scanner.on_signal = observed.append
-        tick = {"timestamp": 1_760_000_000 + 7200, "price": 1.05}
+        tick = {
+            "timestamp": int(datetime.now(timezone.utc).timestamp()) + 7200,
+            "price": 1.05,
+        }
         scanner._handle_tick("PAIR", state, tick)
         scanner._handle_tick("PAIR", state, tick)
         self.assertEqual(len(scanner.signals), 1)
         self.assertEqual(observed, [produced])
+
+    def test_stale_tick_is_rejected_before_candle_processing(self) -> None:
+        class Candles:
+            def __init__(self) -> None:
+                self.updates = 0
+
+            def update(self, _tick):
+                self.updates += 1
+                return None
+
+        candles = Candles()
+        scanner = SignalScanner(SimpleNamespace())
+        state = SimpleNamespace(candles=candles)
+        stale_timestamp = (
+            int(datetime.now(timezone.utc).timestamp())
+            - int(config.WATCHDOG_TICK_MAX_AGE_SECONDS)
+            - 5
+            + config.POCKET_OPTION_TIME_OFFSET_SECONDS
+        )
+        scanner._handle_tick(
+            "EURGBP_otc",
+            state,
+            {"timestamp": stale_timestamp, "price": 1.0},
+        )
+        self.assertEqual(candles.updates, 0)
+        self.assertIsNone(scanner.last_tick_age_seconds)
 
 
 class FakeMultiPairBroker:
@@ -230,6 +260,56 @@ class MultiPairScannerTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
         await asyncio.gather(*scanner._tasks.values(), return_exceptions=True)
         await broker.close()
+
+
+class WatchdogTests(unittest.IsolatedAsyncioTestCase):
+    async def test_global_stall_rebuilds_connection_and_notifies_admin(self) -> None:
+        class Broker:
+            def __init__(self) -> None:
+                self.rebuild_count = 0
+
+            async def rebuild_connection(self) -> None:
+                self.rebuild_count += 1
+
+            async def payouts(self):
+                return {}
+
+            async def active_assets(self):
+                return []
+
+        broker = Broker()
+        alerts: list[str] = []
+        scanner = SignalScanner(
+            broker,
+            on_watchdog_event=alerts.append,
+            output=lambda _line: None,
+        )
+        scanner._started_at = (
+            time.monotonic() - config.WATCHDOG_GLOBAL_STALL_SECONDS - 1
+        )
+        await scanner._check_feed_watchdog()
+        self.assertEqual(broker.rebuild_count, 1)
+        self.assertIn("recovered", alerts[-1])
+
+    async def test_third_failed_rebuild_alerts_that_ssid_may_have_expired(self) -> None:
+        class Broker:
+            async def rebuild_connection(self) -> None:
+                raise RuntimeError("offline")
+
+        alerts: list[str] = []
+        scanner = SignalScanner(
+            Broker(),
+            on_watchdog_event=alerts.append,
+            output=lambda _line: None,
+        )
+        with (
+            patch.object(config, "WATCHDOG_CALL_TIMEOUT_SECONDS", 1),
+            patch.object(config, "WATCHDOG_RETRY_SECONDS", 0),
+            patch.object(config, "WATCHDOG_REBUILD_FAILURE_LIMIT", 3),
+        ):
+            for _ in range(3):
+                await scanner._rebuild_feed("test stall")
+        self.assertTrue(any("SSID may have expired" in alert for alert in alerts))
 
 
 if __name__ == "__main__":

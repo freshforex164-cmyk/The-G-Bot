@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -174,6 +175,7 @@ class TelegramCommandHandler:
         referral_link: str | None = None,
         scanner: Any = None,
         tracker: Any = None,
+        fanout: Any = None,
         scanner_running: Callable[[], bool] = lambda: False,
         admin_chat_id: int | str | None = None,
         started_at: float | None = None,
@@ -184,6 +186,7 @@ class TelegramCommandHandler:
         self.referral_link = self._valid_referral(referral_link)
         self.scanner = scanner
         self.tracker = tracker
+        self.fanout = fanout
         self.scanner_running = scanner_running
         self.admin_chat_id = admin_chat_id
         self.started_at = started_at or time.monotonic()
@@ -243,7 +246,6 @@ class TelegramCommandHandler:
         if isinstance(callback, Mapping):
             callback_id = callback.get("id")
             data = str(callback.get("data", ""))
-            message = callback.get("message")
             chat_id = self._update_chat_id(update)
             if callback_id is not None:
                 await self.client.answer_callback(str(callback_id))
@@ -284,9 +286,11 @@ class TelegramCommandHandler:
                 await self.client.send_message(
                     chat_id,
                     "How GBot works. /start begins your signals, /stop pauses them. "
-                    "Each signal shows the asset name, direction, payout, strength, "
-                    "and expiration. Signals are informational, are not financial "
-                    "advice, and are not a guarantee. Trading is risky.",
+                    "Each signal shows the asset (named as in Pocket Option), "
+                    "direction, payout, strength and expiration. Open the asset in "
+                    "Pocket Option and place the trade quickly. Strength shows how "
+                    "strong the setup is; it is not a guarantee. Signals are not "
+                    "financial advice. Trading is risky.",
                 )
             else:
                 await self._register_reply(chat_id)
@@ -335,7 +339,7 @@ class TelegramCommandHandler:
         if self.referral_link:
             text = (
                 "Don't have a Pocket Option account yet? Create one here: "
-                f"{self.referral_link}. Already have one? Tap Start signals."
+                f"{html.escape(self.referral_link)}. Already have one? Tap Start signals."
             )
         else:
             text = (
@@ -373,9 +377,18 @@ class TelegramCommandHandler:
             == now.date()
         )
         broker = getattr(self.scanner, "broker", None) if self.scanner else None
-        connected = bool(getattr(broker, "is_connected", False))
+        connected_value = getattr(broker, "is_connected", False)
+        connected = bool(
+            connected_value() if callable(connected_value) else connected_value
+        )
         age = getattr(self.scanner, "last_tick_age_seconds", None)
         age_text = "n/a" if age is None else f"{age:.1f}s"
+        scan_latency = getattr(self.scanner, "last_signal_latency_ms", None)
+        scan_latency_text = "n/a" if scan_latency is None else f"{scan_latency:.1f}ms"
+        delivery_latency = getattr(self.fanout, "last_signal_to_telegram_ms", None)
+        delivery_latency_text = (
+            "n/a" if delivery_latency is None else f"{delivery_latency:.1f}ms"
+        )
         pairs = len(getattr(self.scanner, "pairs", {})) if self.scanner else 0
         store = getattr(self.subscribers, "count", None)
         subscriber_count = store() if callable(store) else 0
@@ -397,6 +410,8 @@ class TelegramCommandHandler:
             f"Feed: {'connected' if connected else 'disconnected'}\n"
             f"SSID: {'configured' if os.environ.get('PO_SSID', '').strip() else 'missing'}\n"
             f"Last tick age: {age_text}\n"
+            f"Tick-to-signal latency: {scan_latency_text}\n"
+            f"Signal-to-Telegram latency: {delivery_latency_text}\n"
             f"Pairs streaming: {pairs}\n"
             f"Subscribers: {subscriber_count}\n"
             f"Signals today: {today}\n"
@@ -444,6 +459,7 @@ class SubscriberFanoutNotifier:
         self._sleep = sleep
         self._lock = asyncio.Lock()
         self._last_send = 0.0
+        self.last_signal_to_telegram_ms: float | None = None
 
     async def _throttle(self) -> None:
         async with self._lock:
@@ -473,6 +489,17 @@ class SubscriberFanoutNotifier:
                 try:
                     await self.client.send_message(chat_id, text)
                     sent += 1
+                    if sent == 1:
+                        signal_time = signal.time
+                        if signal_time.tzinfo is None:
+                            signal_time = signal_time.replace(tzinfo=timezone.utc)
+                        self.last_signal_to_telegram_ms = max(
+                            0.0,
+                            (
+                                datetime.now(timezone.utc) - signal_time
+                            ).total_seconds()
+                            * 1000.0,
+                        )
                     break
                 except TelegramSendError as exc:
                     if exc.status_code == 403:

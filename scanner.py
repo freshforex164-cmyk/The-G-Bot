@@ -62,6 +62,7 @@ class SignalScanner:
         self._watchdog_rebuilding = False
         self._watchdog_failures = 0
         self._watchdog_retry_at = 0.0
+        self.last_signal_latency_ms: float | None = None
 
     @property
     def last_tick_age_seconds(self) -> float | None:
@@ -249,6 +250,13 @@ class SignalScanner:
             logger.info("Signal suppressed because %s has no fresh tick.", signal.pair)
             return
         signal.asset_name = state.asset.display_name
+        signal_time = signal.time
+        if signal_time.tzinfo is None:
+            signal_time = signal_time.replace(tzinfo=timezone.utc)
+        self.last_signal_latency_ms = max(
+            0.0,
+            (datetime.now(timezone.utc) - signal_time).total_seconds() * 1000.0,
+        )
         self.expire_signals(signal.time)
         if any(
             active.status == "ACTIVE"

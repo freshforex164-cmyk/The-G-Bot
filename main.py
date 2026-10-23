@@ -310,17 +310,6 @@ async def run_pairs() -> bool:
     finally:
         await broker.close()
 
-    if failure is not None:
-        print(f"FEED FAILED: {failure}", flush=True)
-        return False
-    print(
-        f"FEED OK: {count} ticks in {duration_seconds:g}s, "
-        f"last price {last_price:.10g}",
-        flush=True,
-    )
-    return True
-
-
 def _format_replay_summary(summary: ReplaySummary) -> str:
     directions = (
         f"SELL {summary.directions['SELL']} / BUY {summary.directions['BUY']}"
@@ -583,6 +572,7 @@ async def run_serve() -> None:
         referral_link=os.environ.get("REFERRAL_LINK"),
         scanner=scanner,
         tracker=tracker,
+        fanout=fanout,
         scanner_running=lambda: service_state["scanner_running"],
         admin_chat_id=admin_chat_id,
     )

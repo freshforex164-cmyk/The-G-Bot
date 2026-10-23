@@ -338,7 +338,10 @@ class PocketOptionBroker:
             reconnect_needed = False
             try:
                 generation = self._connection_generation
-                subscription = await client.subscribe_symbol(pair)
+                subscription = await asyncio.wait_for(
+                    client.subscribe_symbol(pair),
+                    timeout=RECONNECT_CALL_TIMEOUT_SECONDS,
+                )
                 iterator = subscription.__aiter__()
                 while not self._closed:
                     if self._connection_generation != generation:
@@ -405,7 +408,10 @@ class PocketOptionBroker:
                     await asyncio.gather(next_tick, return_exceptions=True)
                 if subscription is not None and not self._closed:
                     try:
-                        await client.unsubscribe(pair)
+                        await asyncio.wait_for(
+                            client.unsubscribe(pair),
+                            timeout=RECONNECT_CALL_TIMEOUT_SECONDS,
+                        )
                     except Exception as exc:
                         logger.warning(
                             "Could not clean up the %s tick subscription (%s).",
