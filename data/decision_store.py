@@ -68,7 +68,7 @@ def _wilson_interval(wins: int, count: int) -> tuple[float, float] | None:
 
 
 class DecisionStore:
-    """Append every closed-candle decision and delayed two/three-candle outcomes."""
+    """Append every closed-candle decision and delayed outcome proxy."""
 
     def __init__(self, file_path: str | Path = "data/decisions.csv") -> None:
         self.file_path = Path(file_path)
@@ -211,7 +211,7 @@ class DecisionStore:
                     "pair": pair,
                     "direction": signal.direction,
                     "state": "FIRE",
-                    "reason": "35s outcome uses the candle+2 close (30s proxy); ties are losses",
+                    "reason": "outcome is an approximate candle-close proxy; ties are losses",
                     "signal_id": signal.id,
                     "signal_strength": signal.strength,
                     "candle_2_close": _number(candle_2_close),

@@ -86,7 +86,7 @@ Offline tests use mocks and do not connect to Pocket Option or Telegram.
 | `MIN_NOTIFY_STRENGTH` | `0` | Minimum strength for notification |
 | `MAX_NOTIFICATIONS_PER_MINUTE` | `6` | Notification rate limit |
 | `HUMAN_DELAY_SECONDS` | `5` | Delay before paper entry price is recorded |
-| `PAPER_EXPIRIES_SECONDS` | `(30, 60, 120)` | Paper outcome horizons |
+| `PAPER_EXPIRIES_SECONDS` | `(35,)` | Paper outcome horizon |
 | `SIGNALS_CSV_PATH` | `"signals.csv"` | CSV signal-store path |
 | `CANDLE_INTERVAL_SECONDS` | `15` | Candle interval |
 | `MAX_CANDLES_PER_PAIR` | `300` | Retained/seeded candles per pair |

@@ -339,7 +339,7 @@ def _format_replay_summary(summary: ReplaySummary) -> str:
     else:
         strengths = "none"
     outcome_text = " ".join(
-        f"{horizon * CANDLE_INTERVAL_SECONDS}s "
+        f"{horizon}s "
         f"W{summary.outcomes[horizon]['WIN']}/L{summary.outcomes[horizon]['LOSS']}"
         for horizon in REPLAY_HORIZONS
     )
@@ -372,7 +372,7 @@ def _print_strategy_lab(
 ) -> None:
     print("APPROXIMATE STRATEGY LAB")
     print(
-        "Variant | Signals | 30s WR | 60s WR | 120s WR | "
+        f"Variant | Signals | {config.EXPIRATION_SECONDS}s WR | "
         f"Break-even @ {config.BREAKEVEN_PAYOUT_PERCENT}% payout"
     )
     break_even = 100.0 / (1.0 + config.BREAKEVEN_PAYOUT_PERCENT / 100.0)
@@ -380,9 +380,8 @@ def _print_strategy_lab(
         summary = results[variant.name]
         print(
             f"{variant.name} | {summary.signal_count} | "
-            f"{_format_lab_rate(summary, 3)} | "
-            f"{_format_lab_rate(summary, 6)} | "
-            f"{_format_lab_rate(summary, 12)} | {break_even:.1f}%"
+            f"{_format_lab_rate(summary, config.EXPIRATION_SECONDS)} | "
+            f"{break_even:.1f}%"
         )
     default_variant = next(
         variant

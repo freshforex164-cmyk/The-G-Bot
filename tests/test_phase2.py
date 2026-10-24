@@ -17,7 +17,7 @@ from strategy.pullback_reversal import Signal
 def candles_from_closes(closes: list[float]) -> list[Candle]:
     return [
         Candle(
-            time=index * 10,
+            time=index * 15,
             open=close,
             high=close + 1,
             low=close - 1,
@@ -111,7 +111,7 @@ class IndicatorTests(unittest.TestCase):
 
 
 class PaperTrackerTests(unittest.TestCase):
-    def test_human_delay_and_all_three_expiries_score_ties_as_losses(self) -> None:
+    def test_human_delay_and_configured_expiry_scores_ties_as_losses(self) -> None:
         tracker = PaperTracker(output=lambda _: None)
         now = datetime(2026, 1, 1, tzinfo=timezone.utc)
         signal = Signal(
@@ -146,28 +146,14 @@ class PaperTrackerTests(unittest.TestCase):
         self.assertEqual(record.entry_price, 1.2)
         self.assertEqual(
             [item.result for item in tracker.update_price(
-                "EURUSD_otc", 1.1, now + timedelta(seconds=35)
+                "EURUSD_otc", 1.1, now + timedelta(seconds=40)
             )],
             ["WIN"],
         )
-        self.assertEqual(
-            [item.result for item in tracker.update_price(
-                "EURUSD_otc", 1.3, now + timedelta(seconds=65)
-            )],
-            ["LOSS"],
-        )
-        self.assertEqual(
-            [item.result for item in tracker.update_price(
-                "EURUSD_otc", 1.2, now + timedelta(seconds=125)
-            )],
-            ["LOSS"],
-        )
         summary = tracker.summary()
-        self.assertIn("expiry=30s count=1 wins=1 win_rate=100.0%", summary)
-        self.assertIn("expiry=60s count=1 wins=0 win_rate=0.0%", summary)
-        self.assertIn("expiry=120s count=1 wins=0 win_rate=0.0%", summary)
+        self.assertIn("expiry=35s count=1 wins=1 win_rate=100.0%", summary)
         self.assertIn(
-            "strength=80-100 expiry=120s count=1 wins=0 win_rate=0.0%",
+            "strength=80-100 expiry=35s count=1 wins=1 win_rate=100.0%",
             summary,
         )
 

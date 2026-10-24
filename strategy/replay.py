@@ -19,7 +19,7 @@ from strategy.rules import (
 )
 from strategy.strength import score_strength
 
-REPLAY_HORIZONS = (3, 6, 12)
+REPLAY_HORIZONS = (config.EXPIRATION_SECONDS,)
 
 
 @dataclass(frozen=True)
@@ -161,8 +161,16 @@ def replay_variant(
         )
         outcomes: dict[int, str] = {}
         for horizon in REPLAY_HORIZONS:
-            exit_index = current_index + horizon
-            if exit_index < len(series):
+            due_time = series[current_index].time + horizon
+            exit_index = next(
+                (
+                    index
+                    for index in range(current_index + 1, len(series))
+                    if series[index].time >= due_time
+                ),
+                None,
+            )
+            if exit_index is not None:
                 exit_price = float(series[exit_index].close)
                 favorable = (
                     exit_price < entry_price

@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
+import config
 from strategy.pullback_reversal import Signal
 
 
@@ -60,18 +61,11 @@ CSV_FIELDS = (
     "bollinger_middle",
     "human_delay_entry_price",
     "human_delay_entry_time",
-    "outcome_30s_entry_price",
-    "outcome_30s_exit_price",
-    "outcome_30s_result",
-    "outcome_30s_settled_at",
-    "outcome_60s_entry_price",
-    "outcome_60s_exit_price",
-    "outcome_60s_result",
-    "outcome_60s_settled_at",
-    "outcome_120s_entry_price",
-    "outcome_120s_exit_price",
-    "outcome_120s_result",
-    "outcome_120s_settled_at",
+    *(
+        f"outcome_{expiry}s_{field}"
+        for expiry in config.PAPER_EXPIRIES_SECONDS
+        for field in ("entry_price", "exit_price", "result", "settled_at")
+    ),
 )
 
 

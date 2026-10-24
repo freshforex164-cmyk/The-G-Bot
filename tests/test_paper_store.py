@@ -54,7 +54,7 @@ class SignalStoreTests(unittest.TestCase):
             signal = make_signal(at)
             tracker.record_signal(signal)
             tracker.update_price("EURUSD_otc", 1.25, at + timedelta(seconds=5))
-            tracker.update_price("EURUSD_otc", 1.26, at + timedelta(seconds=35))
+            tracker.update_price("EURUSD_otc", 1.26, at + timedelta(seconds=40))
 
             with path.open(newline="", encoding="utf-8") as handle:
                 row = next(csv.DictReader(handle))
@@ -67,10 +67,9 @@ class SignalStoreTests(unittest.TestCase):
         self.assertEqual(json.loads(row["strength_components"])["bollinger"], 19)
         self.assertEqual(row["recommended_expiry_seconds"], "35")
         self.assertEqual(row["human_delay_entry_price"], "1.25")
-        self.assertEqual(row["outcome_30s_entry_price"], "1.25")
-        self.assertEqual(row["outcome_30s_exit_price"], "1.26")
-        self.assertEqual(row["outcome_30s_result"], "WIN")
-        self.assertEqual(row["outcome_60s_result"], "")
+        self.assertEqual(row["outcome_35s_entry_price"], "1.25")
+        self.assertEqual(row["outcome_35s_exit_price"], "1.26")
+        self.assertEqual(row["outcome_35s_result"], "WIN")
 
 
 if __name__ == "__main__":

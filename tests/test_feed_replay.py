@@ -102,14 +102,14 @@ class FeedCheckTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReplayTests(unittest.TestCase):
-    def test_replay_approximates_three_expiry_outcomes(self) -> None:
+    def test_replay_approximates_configured_expiry_outcome(self) -> None:
         candles = [
-            Candle(index * 10, 100.0, 100.2, 99.8, 100.0)
+            Candle(index * 15, 100.0, 100.2, 99.8, 100.0)
             for index in range(40)
         ]
-        candles[4] = Candle(40, 99.0, 99.1, 98.9, 99.0)
-        candles[7] = Candle(70, 101.0, 101.1, 100.9, 101.0)
-        candles[13] = Candle(130, 99.0, 99.1, 98.9, 99.0)
+        candles[4] = Candle(60, 99.0, 99.1, 98.9, 99.0)
+        candles[7] = Candle(105, 101.0, 101.1, 100.9, 101.0)
+        candles[13] = Candle(195, 99.0, 99.1, 98.9, 99.0)
         passed = DirectionEvaluation(
             "SELL",
             tuple(ConditionResult(f"S{i}", True, True, "ok") for i in range(1, 5)),
@@ -136,7 +136,7 @@ class ReplayTests(unittest.TestCase):
         ), patch(
             "strategy.replay._approximate_trigger",
             side_effect=lambda evaluation, candle, _trigger: (
-                evaluation.direction == "SELL" and candle.time == 10,
+                evaluation.direction == "SELL" and candle.time == 15,
                 100.05,
             ),
         ):
@@ -148,7 +148,7 @@ class ReplayTests(unittest.TestCase):
         self.assertAlmostEqual(signal.entry_price, 100.05)
         self.assertEqual(
             signal.outcomes,
-            {3: "WIN", 6: "LOSS", 12: "WIN"},
+            {35: "WIN"},
         )
         self.assertGreaterEqual(signal.strength, 0)
         self.assertLessEqual(signal.strength, 100)

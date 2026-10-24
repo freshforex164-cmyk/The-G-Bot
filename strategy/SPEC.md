@@ -70,8 +70,9 @@ disabled condition is shown as not applicable and does not block a setup.
 - Replay reads `data/candles.csv` when it exists; otherwise it asks the broker
   for up to 3,000 closed 15-second candles per eligible pair. OHLC trigger paths
   and 35-second expiry estimates are approximate.
-- The lab reports 30/60/120-second win rates and the 52.1% break-even rate at
-  92% payout. Payout is not an input to the strength score.
+- The lab reports the configured 35-second win rate and the 52.1% break-even
+  rate at 92% payout. Candle-only replay uses the first close at or after expiry;
+  this is approximate. Payout is not an input to the strength score.
 - The target replay strength distribution is approximately p10=20, p50=50,
   p90=85. Actual percentiles are printed with replay output; references in
   `config.py` should be calibrated against recorded replay data, not guessed.

@@ -12,6 +12,7 @@ class ServeTests(unittest.IsolatedAsyncioTestCase):
     async def test_serve_starts_scanner_telegram_and_http_without_external_calls(self):
         instances = {}
         scanner_ready = asyncio.Event()
+        startup_message_sent = asyncio.Event()
 
         class FakeBot:
             def __init__(self, _token):
@@ -21,10 +22,12 @@ class ServeTests(unittest.IsolatedAsyncioTestCase):
                 instances["registered_chat"] = admin_id
 
             async def send_message(self, *_args, **_kwargs):
+                startup_message_sent.set()
                 return None
 
         class FakeStore:
             subscribers = {}
+            backend = "file"
 
             def count(self):
                 return 0
@@ -93,6 +96,9 @@ class ServeTests(unittest.IsolatedAsyncioTestCase):
                 self.started.set()
                 await self.stop.wait()
 
+            async def wait_until_ready(self):
+                await self.started.wait()
+
             def pause(self):
                 self.is_paused = True
 
@@ -149,6 +155,7 @@ class ServeTests(unittest.IsolatedAsyncioTestCase):
                     "DATABASE_URL": "",
                     "REFERRAL_LINK": "",
                 },
+                clear=True,
             ),
             patch.object(main, "TelegramBotClient", FakeBot),
             patch.object(main, "SubscriberStore", FakeStore),
@@ -171,6 +178,7 @@ class ServeTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 timeout=2,
             )
+            await asyncio.wait_for(startup_message_sent.wait(), timeout=5)
             health = instances["http"].health_provider()
             admin_status = instances["http"].admin_provider()
             self.assertEqual(health["scanner"], "running")
