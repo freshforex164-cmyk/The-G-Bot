@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -21,6 +21,7 @@ logger = logging.getLogger("gbot.scanner")
 SignalCallback = Callable[[Signal], None | Awaitable[None]]
 TickCallback = Callable[[str, float, datetime], None]
 OutputCallback = Callable[[str], None]
+DecisionCallback = Callable[[str, Candle, Sequence[Candle], Any, Signal | None], None]
 
 
 @dataclass
@@ -41,6 +42,7 @@ class SignalScanner:
         on_signal: SignalCallback | None = None,
         on_tick: TickCallback | None = None,
         on_candle: Callable[[str, Candle], None] | None = None,
+        on_decision: DecisionCallback | None = None,
         on_watchdog_event: Callable[[str], None | Awaitable[None]] | None = None,
         output: OutputCallback = print,
     ) -> None:
@@ -48,6 +50,7 @@ class SignalScanner:
         self.on_signal = on_signal
         self.on_tick = on_tick
         self.on_candle = on_candle
+        self.on_decision = on_decision
         self.on_watchdog_event = on_watchdog_event
         self.output = output
         self.pairs: dict[str, PairScanState] = {}
@@ -229,6 +232,7 @@ class SignalScanner:
                     logger.error(
                         "Candle recording failed (%s).", type(exc).__name__
                     )
+            closed_signal = None
             if not self._paused:
                 state.strategy.on_closed_candles(
                     pair, tuple(state.candles.closed), payout=state.payout
@@ -236,6 +240,17 @@ class SignalScanner:
                 closed_signal = state.strategy.take_closed_signal(pair)
                 if closed_signal is not None:
                     self._publish_signal(closed_signal)
+            if self.on_decision is not None:
+                try:
+                    self.on_decision(
+                        pair,
+                        closed,
+                        tuple(state.candles.closed),
+                        state.strategy,
+                        closed_signal,
+                    )
+                except Exception as exc:
+                    logger.error("Decision recording failed (%s).", type(exc).__name__)
         if self.on_tick is not None:
             try:
                 self.on_tick(pair, price, timestamp)

@@ -44,6 +44,7 @@ from data.candles import (
     _normalize_broker_timestamp,
 )
 from data.candle_store import CsvCandleStore
+from data.decision_store import DecisionStore
 from market_assets import eligible_assets, normalize_assets
 from paper.store import CsvSignalStore
 from paper.tracker import PaperTracker
@@ -112,7 +113,7 @@ async def _stream_pair(
 
 
 async def run_watch() -> None:
-    """Show only completed 10-second candles from currently eligible pairs."""
+    """Show only completed 15-second candles from currently eligible pairs."""
     broker = PocketOptionBroker(load_ssid())
     stop_monitor = asyncio.Event()
     monitor_task: asyncio.Task[None] | None = None
@@ -413,7 +414,7 @@ async def run_replay() -> dict[str, ReplaySummary]:
         print(f"Replay source: {config.DATA_CANDLES_CSV_PATH}")
         for pair, series in sorted(candles_by_pair.items()):
             print(
-                f"Loaded {pair}: {len(series)} closed 10-second candles "
+                f"Loaded {pair}: {len(series)} closed 15-second candles "
                 f"(maximum {config.REPLAY_MAX_CANDLES_PER_PAIR})"
             )
     else:
@@ -454,7 +455,7 @@ async def run_replay() -> dict[str, ReplaySummary]:
                     )
                     actual = 0
                 print(
-                    f"Seeded {pair}: {actual} closed 10-second candles "
+                    f"Seeded {pair}: {actual} closed 15-second candles "
                     f"(requested up to {config.REPLAY_MAX_CANDLES_PER_PAIR})"
                 )
                 candles_by_pair[pair] = list(builder.closed)
@@ -486,6 +487,7 @@ def _format_signal_line(signal: Signal) -> str:
 async def run_scanner(*, minutes: float, record: bool = False) -> None:
     tracker = PaperTracker(store=CsvSignalStore(config.SIGNALS_CSV_PATH))
     candle_store = CsvCandleStore(config.DATA_CANDLES_CSV_PATH) if record else None
+    decision_store = DecisionStore()
 
     def on_signal(signal: Signal) -> None:
         tracker.record_signal(signal)
@@ -501,6 +503,7 @@ async def run_scanner(*, minutes: float, record: bool = False) -> None:
         on_signal=on_signal,
         on_tick=tracker.update_price,
         on_candle=on_candle if record else None,
+        on_decision=decision_store.record_candle,
     )
 
     async def validate_at_send(signal: Signal) -> bool:
@@ -521,6 +524,7 @@ async def run_scanner(*, minutes: float, record: bool = False) -> None:
     finally:
         await queue.close()
         tracker.print_summary()
+        decision_store.print_summary()
 
 
 async def run_serve() -> None:
@@ -530,14 +534,17 @@ async def run_serve() -> None:
         raise ConfigurationError(
             "Missing required secret TELEGRAM_BOT_TOKEN for --run serve."
         )
-    admin_value = os.environ.get("TELEGRAM_ADMIN_ID", "").strip()
+    admin_value = (
+        os.environ.get("TELEGRAM_ADMIN_ID")
+        or os.environ.get("TELEGRAM_USER_ID", "")
+    ).strip()
     try:
         admin_id = int(admin_value) if admin_value else None
     except ValueError:
         raise ConfigurationError("TELEGRAM_ADMIN_ID must be a numeric Telegram user ID.") from None
     if admin_id is None:
         raise ConfigurationError(
-            "Missing required secret TELEGRAM_ADMIN_ID for admin commands."
+            "Missing required secret TELEGRAM_USER_ID for admin commands."
         )
     admin_chat_value = os.environ.get("TELEGRAM_ADMIN_CHAT_ID", "").strip()
     try:
@@ -569,6 +576,7 @@ async def run_serve() -> None:
 
     subscribers = await asyncio.to_thread(SubscriberStore)
     tracker = PaperTracker(store=CsvSignalStore(config.SIGNALS_CSV_PATH))
+    decision_store = DecisionStore()
     fanout = SubscriberFanoutNotifier(bot, subscribers)
     queue = NotificationQueue(
         fanout,
@@ -595,6 +603,7 @@ async def run_serve() -> None:
         PocketOptionBroker(load_ssid()),
         on_signal=on_signal,
         on_tick=tracker.update_price,
+        on_decision=decision_store.record_candle,
         on_watchdog_event=admin_alert,
     )
     handler = TelegramCommandHandler(
@@ -685,6 +694,7 @@ async def run_serve() -> None:
         await status_server.close()
         await queue.close()
         tracker.print_summary()
+        decision_store.print_summary()
 
 
 async def run_notify_test() -> bool:

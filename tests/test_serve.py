@@ -50,6 +50,16 @@ class ServeTests(unittest.IsolatedAsyncioTestCase):
             def print_summary(self):
                 instances["summary_printed"] = True
 
+        class FakeDecisionStore:
+            def __init__(self):
+                pass
+
+            def record_candle(self, *_args):
+                pass
+
+            def print_summary(self):
+                instances["decision_summary_printed"] = True
+
         class FakeQueue:
             def __init__(self, *_args, **_kwargs):
                 self.closed = False
@@ -131,7 +141,7 @@ class ServeTests(unittest.IsolatedAsyncioTestCase):
                 "os.environ",
                 {
                     "TELEGRAM_BOT_TOKEN": "mock-telegram-token",
-                    "TELEGRAM_ADMIN_ID": "123",
+                    "TELEGRAM_USER_ID": "123",
                     "TELEGRAM_CHAT_ID": "-100123",
                     "ADMIN_TOKEN": "mock-admin-token",
                     "PORT": "5000",
@@ -142,6 +152,7 @@ class ServeTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "TelegramBotClient", FakeBot),
             patch.object(main, "SubscriberStore", FakeStore),
             patch.object(main, "PaperTracker", FakeTracker),
+            patch.object(main, "DecisionStore", FakeDecisionStore),
             patch.object(main, "NotificationQueue", FakeQueue),
             patch.object(main, "SignalScanner", FakeScanner),
             patch.object(main, "TelegramPollingService", FakePolling),

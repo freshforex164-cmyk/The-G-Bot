@@ -19,7 +19,8 @@ or referral links.
 - `uv run --locked python main.py --run scanner --minutes 3` — scan for signals.
 
 Live scanning requires `PO_SSID`. `serve` additionally requires
-`TELEGRAM_BOT_TOKEN` and `TELEGRAM_ADMIN_ID`; `TELEGRAM_ADMIN_CHAT_ID` is an
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_USER_ID` (or legacy `TELEGRAM_ADMIN_ID`);
+`TELEGRAM_ADMIN_CHAT_ID` is an
 optional private/group admin-chat override and otherwise admin commands use the
 admin user's private chat. `ADMIN_TOKEN` enables `GET /admin/status`; without it
 that protected endpoint returns 503 while public `GET /health` remains
