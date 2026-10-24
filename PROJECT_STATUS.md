@@ -12,13 +12,13 @@ It sends signals to Telegram subscribers and logs every decision and outcome for
 ## Done
 - Step 0: Read this handoff and `PROJECT_CONTEXT.md`; checked current code and tests. GBot remains read-only.
 - Step 1: `run_feed_check` returns `ok`, `tick_count`, `last_price`, and `reason`; CLI exits non-zero on failure. Full offline suite: 97 tests passed on 2026-10-24.
-- Existing live-feed result in the prior status was historical and has not yet been rechecked in this run.
+- Step 2: Live feed check passed: 62 ticks over 30 seconds; process exited 0. No restart or retry was needed. Reported account type was demo (informational only).
 
 ## Not done
-- Steps 2–7: Live feed recheck, current Telegram/serve verification, decision log, current-rule replay, final checkpoint.
+- Steps 3–7: Telegram/serve verification, decision log, current-rule replay, final checkpoint.
 
 ## Known walls with fallback
-- Live Pocket Option and Telegram behavior is UNVERIFIED in this run; use offline mocks where possible.
+- Telegram live behavior is UNVERIFIED in this run; offline mocks are used.
 - Telegram `getUpdates` refusal and `chat not found` were not encountered; no live Telegram send/poll was run.
 - Current candle configuration is 15 seconds; some replay output text still says 10 seconds and needs correction.
 - `ADMIN_TOKEN` must be configured before `/admin/status` can be used.
@@ -28,7 +28,7 @@ It sends signals to Telegram subscribers and logs every decision and outcome for
 - Later: set `ADMIN_TOKEN` through Replit Secrets before using the protected web endpoint.
 
 ## Next step
-- Step 2: Recheck `--run feed-check` using the configured secret; stop live checks if authentication is rejected.
+- Step 3: Verify Telegram subscriber and admin commands with offline mocks.
 
 ## Last run date
-- 2026-10-24; offline suite: 97 passed. Live feed: NOT RUN in this pass yet.
+- 2026-10-24; offline suite: 97 passed; live feed: 62 ticks / 30 seconds.
