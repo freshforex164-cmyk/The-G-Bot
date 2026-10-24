@@ -10,26 +10,25 @@ It sends signals to Telegram subscribers and logs every decision and outcome for
 - Keep a durable record of decisions and outcomes.
 
 ## Done
-- Step 0: Read `PROJECT_CONTEXT.md`. Initial code inspection finds read-only scanning, Telegram commands, JSON/Postgres subscriber storage, and an approximate replay command; these are UNVERIFIED at runtime.
-- Step 1: Feed check returns `ok`, `tick_count`, `last_price`, and `reason`; CLI returns non-zero on failure. Full offline suite: 89 tests passed.
-- Step 2: Live `--run feed-check` passed once: 69 ticks over 30 seconds; process exited 0. Stall fallback was not needed.
-- Step 3: Mocked `/start`, `/stop`, `/register`, `/status`, `/help` tests pass. JSON and mocked Postgres tests pass, including DB load and write failures falling back to JSON without logging the database URL.
+- Step 0: Read this handoff and `PROJECT_CONTEXT.md`; checked current code and tests. GBot remains read-only.
+- Step 1: `run_feed_check` returns `ok`, `tick_count`, `last_price`, and `reason`; CLI exits non-zero on failure. Full offline suite: 97 tests passed on 2026-10-24.
+- Existing live-feed result in the prior status was historical and has not yet been rechecked in this run.
 
 ## Not done
-- Steps 4–7: Admin commands and web endpoints, serve, decision log, replay report, final checkpoint.
+- Steps 2–7: Live feed recheck, current Telegram/serve verification, decision log, current-rule replay, final checkpoint.
 
 ## Known walls with fallback
-- Live Pocket Option and Telegram behavior is UNVERIFIED; use offline mocks where possible.
+- Live Pocket Option and Telegram behavior is UNVERIFIED in this run; use offline mocks where possible.
 - Telegram `getUpdates` refusal and `chat not found` were not encountered; no live Telegram send/poll was run.
 - Current candle configuration is 15 seconds; some replay output text still says 10 seconds and needs correction.
-- `ADMIN_TOKEN` is not among the configured secrets; `/admin/status` will require it before live use.
+- `ADMIN_TOKEN` must be configured before `/admin/status` can be used.
 - GitHub push availability is UNVERIFIED; preserve local commits if remote push fails.
 
 ## Needs your action
 - Later: set `ADMIN_TOKEN` through Replit Secrets before using the protected web endpoint.
 
 ## Next step
-- Step 4: Add admin-only Telegram controls, a protected HTTP status endpoint, and run `serve`.
+- Step 2: Recheck `--run feed-check` using the configured secret; stop live checks if authentication is rejected.
 
 ## Last run date
-- 2026-10-24; offline suite: 89 passed; focused storage tests: 4 passed; mocked Telegram tests: 12 passed; live feed: 69 ticks / 30 seconds.
+- 2026-10-24; offline suite: 97 passed. Live feed: NOT RUN in this pass yet.

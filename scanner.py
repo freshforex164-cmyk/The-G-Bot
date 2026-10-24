@@ -241,7 +241,10 @@ class SignalScanner:
                 self.on_tick(pair, price, timestamp)
             except Exception as exc:
                 logger.error("Paper tracking update failed (%s).", type(exc).__name__)
-        signal = state.strategy.on_tick(
+        on_tick = getattr(state.strategy, "on_tick", None)
+        if not callable(on_tick):
+            return
+        signal = on_tick(
             pair,
             price,
             state.candles.forming_candle,
