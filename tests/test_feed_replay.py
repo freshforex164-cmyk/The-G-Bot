@@ -54,15 +54,51 @@ class FeedCheckTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "load_ssid", return_value="fake-ssid"),
             redirect_stdout(output),
         ):
-            ok = await main.run_feed_check(duration_seconds=0.02)
+            result = await main.run_feed_check(duration_seconds=0.02)
 
         text = output.getvalue()
-        self.assertTrue(ok)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.tick_count, 2)
+        self.assertEqual(result.last_price, 24.002)
+        self.assertIsNone(result.reason)
         self.assertEqual(FakeBroker.requested_pair, "TOP")
         self.assertIn("Account type: demo (informational only)", text)
         self.assertIn("UTC |", text)
         self.assertIn(" local | TOP 24.0017", text)
         self.assertIn("FEED OK: 2 ticks in 0.02s, last price 24.002", text)
+
+    async def test_feed_check_returns_failure_details_when_stream_ends(self) -> None:
+        class FakeBroker:
+            def __init__(self, _ssid: str) -> None:
+                self.is_demo_account = True
+
+            async def connect(self) -> None:
+                return None
+
+            async def payouts(self) -> dict[str, float]:
+                return {"TOP": 92}
+
+            async def subscribe_ticks(self, _pair: str):
+                if False:
+                    yield {}
+
+            async def monitor_connection(self, stop_event: asyncio.Event) -> None:
+                await stop_event.wait()
+
+            async def close(self) -> None:
+                return None
+
+        with (
+            patch.object(main, "PocketOptionBroker", FakeBroker),
+            patch.object(main, "load_ssid", return_value="fake-ssid"),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = await main.run_feed_check(duration_seconds=0.1)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.tick_count, 0)
+        self.assertIsNone(result.last_price)
+        self.assertEqual(result.reason, "tick stream ended before 0.1 seconds")
 
 
 class ReplayTests(unittest.TestCase):

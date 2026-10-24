@@ -8,6 +8,7 @@ import logging
 import math
 import os
 from collections.abc import AsyncGenerator, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -68,6 +69,16 @@ from telegram_bot import (
 )
 
 logger = logging.getLogger("gbot")
+
+
+@dataclass(frozen=True)
+class FeedCheckResult:
+    """Machine-readable outcome from a bounded market-feed check."""
+
+    ok: bool
+    tick_count: int
+    last_price: float | None
+    reason: str | None
 
 
 def _format_candle(pair: str, candle: Candle) -> str:
@@ -191,7 +202,7 @@ def _format_feed_tick(pair: str, tick: dict[str, Any]) -> tuple[str, float]:
     )
 
 
-async def run_feed_check(*, duration_seconds: float = 30.0) -> bool:
+async def run_feed_check(*, duration_seconds: float = 30.0) -> FeedCheckResult:
     """Print a 30-second tick sample from the highest-payout eligible pair."""
     if duration_seconds <= 0:
         raise ValueError("duration_seconds must be greater than zero")
@@ -240,7 +251,9 @@ async def run_feed_check(*, duration_seconds: float = 30.0) -> bool:
                 except TimeoutError:
                     break
                 except StopAsyncIteration:
-                    failure = "tick stream ended before 30 seconds"
+                    failure = (
+                        f"tick stream ended before {duration_seconds:g} seconds"
+                    )
                     break
                 except Exception as exc:
                     failure = _safe_reason(exc, ssid)
@@ -262,16 +275,17 @@ async def run_feed_check(*, duration_seconds: float = 30.0) -> bool:
     elapsed = max(0.0, asyncio.get_running_loop().time() - started_at)
     if failure is not None:
         print(f"FEED FAILED: {failure}", flush=True)
-        return False
+        return FeedCheckResult(False, count, last_price, failure)
     if count == 0:
-        print(f"FEED FAILED: no ticks received in {elapsed:.2f}s", flush=True)
-        return False
+        failure = f"no ticks received in {elapsed:.2f}s"
+        print(f"FEED FAILED: {failure}", flush=True)
+        return FeedCheckResult(False, count, last_price, failure)
     print(
         f"FEED OK: {count} ticks in {duration_seconds:g}s, "
         f"last price {last_price:g}",
         flush=True,
     )
-    return True
+    return FeedCheckResult(True, count, last_price, None)
 
 
 async def run_pairs() -> bool:
@@ -1119,7 +1133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     try:
         if args.run == "feed-check":
-            return 0 if asyncio.run(run_feed_check()) else 1
+            return 0 if asyncio.run(run_feed_check()).ok else 1
         if args.run == "serve":
             asyncio.run(run_serve())
             return 0

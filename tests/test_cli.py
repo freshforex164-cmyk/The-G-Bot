@@ -63,6 +63,20 @@ class CliTests(unittest.TestCase):
         ):
             self.assertEqual(main.main(["--run", "notify-test"]), 1)
 
+    def test_feed_check_command_returns_failure_code_when_feed_fails(self) -> None:
+        with patch.object(
+            main,
+            "run_feed_check",
+            new_callable=AsyncMock,
+            return_value=main.FeedCheckResult(
+                ok=False,
+                tick_count=0,
+                last_price=None,
+                reason="no ticks received",
+            ),
+        ):
+            self.assertEqual(main.main(["--run", "feed-check"]), 1)
+
     def test_pairs_command_calls_live_pair_listing(self) -> None:
         with patch.object(main, "run_pairs", new_callable=AsyncMock, return_value=True) as pairs:
             self.assertEqual(main.main(["--run", "pairs"]), 0)
