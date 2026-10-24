@@ -86,6 +86,36 @@ class SubscriberStoreTests(unittest.TestCase):
             self.assertEqual(data[0]["chat_id"], 456)
             self.assertTrue(data[0]["subscribed"])
 
+    def test_database_write_failure_falls_back_and_keeps_loaded_subscribers(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "subscribers.json"
+            connection = FakeConnection([(123, True, "free", None, None)])
+            calls = 0
+
+            def connect(_url, *, connect_timeout):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return connection
+                raise ConnectionError("database write unavailable")
+
+            with self.assertLogs("gbot.subscribers", level="WARNING") as output:
+                store = SubscriberStore(
+                    "postgres://private-placeholder",
+                    file_path=path,
+                    connect=connect,
+                    sleep=lambda _seconds: None,
+                )
+                self.assertTrue(store.set_subscribed(123, False))
+
+            joined_logs = "\n".join(output.output)
+            self.assertNotIn("private-placeholder", joined_logs)
+            self.assertIn("JSON fallback", joined_logs)
+            self.assertEqual(store.backend, "json")
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(data[0]["chat_id"], 123)
+            self.assertFalse(data[0]["subscribed"])
+
     def test_missing_database_uses_json_storage(self) -> None:
         with TemporaryDirectory() as temp_dir:
             with self.assertLogs("gbot.subscribers", level="WARNING"):
