@@ -567,7 +567,7 @@ async def run_serve() -> None:
 
     bot = TelegramBotClient(token)
     try:
-        await bot.register_commands(admin_chat_id)
+        await bot.register_commands(admin_id)
     except TelegramSendError as exc:
         logger.warning(
             "Telegram command registration failed (%s); polling will still start.",

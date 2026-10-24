@@ -17,8 +17,8 @@ class ServeTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, _token):
                 pass
 
-            async def register_commands(self, admin_chat_id):
-                instances["registered_chat"] = admin_chat_id
+            async def register_commands(self, admin_id):
+                instances["registered_chat"] = admin_id
 
             async def send_message(self, *_args, **_kwargs):
                 return None
@@ -141,7 +141,8 @@ class ServeTests(unittest.IsolatedAsyncioTestCase):
                 "os.environ",
                 {
                     "TELEGRAM_BOT_TOKEN": "mock-telegram-token",
-                    "TELEGRAM_USER_ID": "123",
+                    "TELEGRAM_ADMIN_ID": "123",
+                    "TELEGRAM_USER_ID": "456",
                     "TELEGRAM_CHAT_ID": "-100123",
                     "ADMIN_TOKEN": "mock-admin-token",
                     "PORT": "5000",
@@ -179,7 +180,7 @@ class ServeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 instances["registered_chat"],
                 123,
-                "The signal channel ID must not become the admin command chat.",
+                "The admin command scope must use the admin user ID.",
             )
             self.assertTrue(instances["queue_started"])
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import io
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from tempfile import TemporaryDirectory
 from pathlib import Path
@@ -10,6 +12,7 @@ import config
 from notifications import TelegramSendError
 from subscriber_store import SubscriberStore
 from telegram_bot import (
+    ADMIN_ONLY_COMMANDS,
     SubscriberFanoutNotifier,
     TelegramBotClient,
     TelegramCommandHandler,
@@ -290,10 +293,14 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
 
 class TelegramApiAndPollingTests(unittest.IsolatedAsyncioTestCase):
     async def test_command_registration_sets_default_and_admin_scopes(self) -> None:
-        requests: list[dict] = []
+        requests: list[tuple[str, dict]] = []
+        configured: dict[str, list[dict]] = {}
 
         class Response:
             status = 200
+
+            def __init__(self, result):
+                self.result = result
 
             def __enter__(self):
                 return self
@@ -302,24 +309,59 @@ class TelegramApiAndPollingTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
             def read(self):
-                return b'{"ok": true, "result": true}'
+                return json.dumps({"ok": True, "result": self.result}).encode()
 
             def getcode(self):
                 return self.status
 
         def opener(request, timeout):
-            requests.append(json.loads(request.data))
-            return Response()
+            method = request.full_url.rsplit("/", maxsplit=1)[-1]
+            payload = json.loads(request.data)
+            requests.append((method, payload))
+            scope = payload.get("scope", {})
+            key = str(scope.get("chat_id", "default"))
+            if method == "setMyCommands":
+                configured[key] = payload["commands"]
+                result = True
+            elif method == "getMyCommands":
+                result = configured[key]
+            else:
+                raise AssertionError(f"Unexpected API method: {method}")
+            return Response(result)
 
         client = TelegramBotClient("mock-token-never-log", opener=opener)
-        await client.register_commands(admin_id=900)
-        self.assertEqual(len(requests), 2)
-        self.assertEqual(requests[0]["scope"], {"type": "default"})
-        self.assertEqual(requests[0]["commands"][-1]["command"], "register")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            await client.register_commands(admin_id=900)
+        self.assertEqual(len(requests), 4)
+        self.assertEqual(requests[0][0], "setMyCommands")
+        self.assertEqual(requests[0][1]["scope"], {"type": "default"})
+        default_names = [
+            item["command"] for item in requests[0][1]["commands"]
+        ]
         self.assertEqual(
-            requests[1]["scope"], {"type": "chat", "chat_id": 900}
+            default_names, ["start", "stop", "register", "status", "help"]
         )
-        self.assertIn("testsignal", [item["command"] for item in requests[1]["commands"]])
+        self.assertTrue(ADMIN_ONLY_COMMANDS.isdisjoint(default_names))
+        self.assertEqual(
+            requests[1][1]["scope"], {"type": "chat", "chat_id": 900}
+        )
+        admin_names = [item["command"] for item in requests[1][1]["commands"]]
+        self.assertEqual(admin_names, default_names + sorted(ADMIN_ONLY_COMMANDS))
+        self.assertEqual(requests[2][0], "getMyCommands")
+        self.assertEqual(requests[2][1]["scope"], {"type": "default"})
+        self.assertEqual(requests[3][0], "getMyCommands")
+        self.assertEqual(
+            requests[3][1]["scope"], {"type": "chat", "chat_id": 900}
+        )
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            [
+                "Telegram commands (default): start, stop, register, status, help",
+                "Telegram commands (admin): "
+                + ", ".join(default_names + sorted(ADMIN_ONLY_COMMANDS)),
+            ],
+        )
 
     async def test_poller_advances_offset_and_sends_it_on_next_request(self) -> None:
         client = FakeClient()

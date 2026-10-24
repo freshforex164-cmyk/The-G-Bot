@@ -25,9 +25,9 @@ logger = logging.getLogger("gbot.telegram")
 PUBLIC_COMMANDS = [
     {"command": "start", "description": "Start receiving signals"},
     {"command": "stop", "description": "Stop receiving signals"},
+    {"command": "register", "description": "Pocket Option account information"},
     {"command": "status", "description": "Check your signal status"},
     {"command": "help", "description": "How GBot works"},
-    {"command": "register", "description": "Pocket Option account information"},
 ]
 ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     {"command": "admin", "description": "Check signal stats"},
@@ -160,21 +160,30 @@ class TelegramBotClient:
     async def answer_callback(self, callback_id: str) -> None:
         await self.call("answerCallbackQuery", {"callback_query_id": callback_id})
 
-    async def register_commands(
-        self, admin_id: int | str | None = None
-    ) -> None:
+    async def register_commands(self, admin_id: int | str) -> None:
+        default_scope = {"type": "default"}
+        admin_scope = {"type": "chat", "chat_id": admin_id}
         await self.call(
             "setMyCommands",
-            {"commands": PUBLIC_COMMANDS, "scope": {"type": "default"}},
+            {"commands": PUBLIC_COMMANDS, "scope": default_scope},
         )
-        if admin_id is not None:
-            await self.call(
-                "setMyCommands",
-                {
-                    "commands": ADMIN_COMMANDS,
-                    "scope": {"type": "chat", "chat_id": admin_id},
-                },
+        await self.call(
+            "setMyCommands",
+            {"commands": ADMIN_COMMANDS, "scope": admin_scope},
+        )
+        for label, scope in (("default", default_scope), ("admin", admin_scope)):
+            commands = await self.call("getMyCommands", {"scope": scope})
+            names = (
+                [
+                    str(command["command"])
+                    for command in commands
+                    if isinstance(command, Mapping)
+                    and isinstance(command.get("command"), str)
+                ]
+                if isinstance(commands, list)
+                else []
             )
+            print(f"Telegram commands ({label}): {', '.join(names)}", flush=True)
 
 
 class TelegramCommandHandler:
