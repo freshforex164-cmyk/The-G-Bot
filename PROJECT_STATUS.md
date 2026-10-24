@@ -12,10 +12,10 @@ It sends signals to Telegram subscribers and logs every decision and outcome for
 ## Done
 - Step 0: Read `PROJECT_CONTEXT.md`. Initial code inspection finds read-only scanning, Telegram commands, JSON/Postgres subscriber storage, and an approximate replay command; these are UNVERIFIED at runtime.
 - Step 1: Feed check returns `ok`, `tick_count`, `last_price`, and `reason`; CLI returns non-zero on failure. Full offline suite: 89 tests passed.
+- Step 2: Live `--run feed-check` passed once: 69 ticks over 30 seconds; process exited 0. Stall fallback was not needed.
 
 ## Not done
-- Step 2: Bounded live feed check and result.
-- Steps 3–7: Verify/build commands, admin and serve endpoints, decision log, replay report, final checkpoint.
+- Steps 3–7: Verify commands, admin and serve endpoints, decision log, replay report, final checkpoint.
 
 ## Known walls with fallback
 - Live Pocket Option and Telegram behavior is UNVERIFIED; use offline mocks where possible.
@@ -27,7 +27,7 @@ It sends signals to Telegram subscribers and logs every decision and outcome for
 - Later: set `ADMIN_TOKEN` through Replit Secrets before using the protected web endpoint.
 
 ## Next step
-- Step 2: Run the bounded live feed check once; apply only the requested stall recovery if needed.
+- Step 3: Verify Telegram commands with mocked updates and make storage fallback robust.
 
 ## Last run date
-- 2026-10-24; offline suite: 89 passed. Live connections not run.
+- 2026-10-24; offline suite: 89 passed. Live feed: 69 ticks / 30 seconds.
