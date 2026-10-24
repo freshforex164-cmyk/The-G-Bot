@@ -80,35 +80,47 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    async def test_start_subscribes_and_returns_account_and_control_buttons(self) -> None:
+    async def test_start_subscribes_and_shows_only_stop_and_status(self) -> None:
         await self.handler.handle_update(message_update("/start@gbot"))
         self.assertEqual(self.store.subscribed_chat_ids(), [101])
         chat_id, text, markup, _ = self.client.messages[-1]
         self.assertEqual(chat_id, 101)
-        self.assertIn("Signals are now enabled", text)
+        self.assertEqual(text, "Signals are on for this chat")
         self.assertEqual(
             [row[0]["text"] for row in markup["inline_keyboard"]],
-            [
-                "Create Pocket Option account",
-                "Start signals",
-                "Stop signals",
-                "Status",
-            ],
+            ["Stop signals", "Status"],
         )
+
+    async def test_start_again_is_idempotent_and_does_not_repeat_welcome(self) -> None:
+        await self.handler.handle_update(message_update("/start"))
+        await self.handler.handle_update(message_update("/start"))
+        self.assertEqual(self.store.subscribed_chat_ids(), [101])
+        self.assertEqual(self.client.messages[-1][1], "Signals are already on")
         self.assertEqual(
-            markup["inline_keyboard"][0][0]["url"],
-            "https://example.test/join?src=gbot&tag=one",
+            [row[0]["text"] for row in self.client.messages[-1][2]["inline_keyboard"]],
+            ["Stop signals", "Status"],
         )
 
     async def test_stop_unsubscribes_and_status_reports_state(self) -> None:
         await self.handler.handle_update(message_update("/start"))
         await self.handler.handle_update(message_update("/stop"))
         self.assertEqual(self.store.subscribed_chat_ids(), [])
-        self.assertIn("paused", self.client.messages[-1][1])
+        self.assertEqual(self.client.messages[-1][1], "Signals are off")
+        self.assertEqual(
+            [row[0]["text"] for row in self.client.messages[-1][2]["inline_keyboard"]],
+            ["Start signals", "Register"],
+        )
         await self.handler.handle_update(message_update("/status"))
         self.assertIn("Signals: off", self.client.messages[-1][1])
         self.assertIn("Scanner: running", self.client.messages[-1][1])
         self.assertIn(f"Minimum payout: {config.MIN_PAYOUT}%", self.client.messages[-1][1])
+
+    async def test_stop_again_is_idempotent(self) -> None:
+        await self.handler.handle_update(message_update("/stop"))
+        self.assertEqual(self.client.messages[-1][1], "Signals are off")
+        await self.handler.handle_update(message_update("/stop"))
+        self.assertEqual(self.client.messages[-1][1], "Signals are already off")
+        self.assertEqual(self.store.subscribed_chat_ids(), [])
 
     async def test_register_injects_referral_link_and_start_button(self) -> None:
         await self.handler.handle_update(message_update("/register"))
@@ -116,7 +128,10 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://example.test/join?src=gbot&amp;tag=one", text)
         self.assertEqual(
             markup["inline_keyboard"],
-            [[{"text": "Start signals", "callback_data": "signals:start"}]],
+            [
+                [{"text": "Start signals", "callback_data": "signals:start"}],
+                [{"text": "Register", "callback_data": "signals:register"}],
+            ],
         )
 
     async def test_register_without_referral_omits_url_button(self) -> None:
@@ -239,6 +254,38 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.client.callbacks, ["callback-1"])
         self.assertEqual(self.store.subscribed_chat_ids(), [101])
+        self.assertEqual(self.client.messages[-1][1], "Signals are on for this chat")
+        self.assertEqual(
+            [row[0]["text"] for row in self.client.messages[-1][2]["inline_keyboard"]],
+            ["Stop signals", "Status"],
+        )
+
+    async def test_unrecognized_callback_is_still_acknowledged(self) -> None:
+        await self.handler.handle_update(
+            {
+                "callback_query": {
+                    "id": "callback-unknown",
+                    "data": "other:action",
+                    "message": {"chat": {"id": 101}},
+                }
+            }
+        )
+        self.assertEqual(self.client.callbacks, ["callback-unknown"])
+        self.assertEqual(self.client.messages, [])
+
+    async def test_subscription_persists_across_store_restart(self) -> None:
+        await self.handler.handle_update(message_update("/start"))
+        restarted = SubscriberStore(
+            database_url="",
+            file_path=Path(self.temp_dir.name) / "subscribers.json",
+        )
+        self.assertEqual(restarted.subscribed_chat_ids(), [101])
+        restarted.set_subscribed(101, False)
+        reloaded = SubscriberStore(
+            database_url="",
+            file_path=Path(self.temp_dir.name) / "subscribers.json",
+        )
+        self.assertEqual(reloaded.subscribed_chat_ids(), [])
 
 
 class TelegramApiAndPollingTests(unittest.IsolatedAsyncioTestCase):

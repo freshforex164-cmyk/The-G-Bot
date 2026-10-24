@@ -263,7 +263,12 @@ class TelegramCommandHandler:
             chat_id = self._update_chat_id(update)
             if callback_id is not None:
                 await self.client.answer_callback(str(callback_id))
-            if chat_id is not None and data in {"signals:start", "signals:stop", "signals:status"}:
+            if chat_id is not None and data in {
+                "signals:start",
+                "signals:stop",
+                "signals:status",
+                "signals:register",
+            }:
                 await self._dispatch(data.removeprefix("signals:"), chat_id)
             return
 
@@ -289,11 +294,27 @@ class TelegramCommandHandler:
     ) -> None:
         if command in {"start", "stop", "status", "help", "register"}:
             if command == "start":
-                await asyncio.to_thread(self.subscribers.set_subscribed, chat_id, True)
-                await self._start_reply(chat_id)
+                changed = await asyncio.to_thread(
+                    self.subscribers.set_subscribed, chat_id, True
+                )
+                await self.client.send_message(
+                    chat_id,
+                    "Signals are on for this chat"
+                    if changed
+                    else "Signals are already on",
+                    reply_markup=self._keyboard(chat_id),
+                )
             elif command == "stop":
-                await asyncio.to_thread(self.subscribers.set_subscribed, chat_id, False)
-                await self.client.send_message(chat_id, "Signals paused for this chat.")
+                changed = await asyncio.to_thread(
+                    self.subscribers.set_subscribed, chat_id, False
+                )
+                await self.client.send_message(
+                    chat_id,
+                    "Signals are off"
+                    if changed
+                    else "Signals are already off",
+                    reply_markup=self._keyboard(chat_id),
+                )
             elif command == "status":
                 await self._status_reply(chat_id)
             elif command == "help":
@@ -359,27 +380,24 @@ class TelegramCommandHandler:
 
         await self.client.send_message(chat_id, "Unknown command. Use /help.")
 
-    def _keyboard(self) -> dict[str, Any]:
+    def _keyboard(self, chat_id: int) -> dict[str, Any]:
         rows: list[list[dict[str, str]]] = []
-        if self.referral_link:
-            rows.append(
-                [{"text": "Create Pocket Option account", "url": self.referral_link}]
+        subscriber = self.subscribers.subscribers.get(chat_id)
+        if subscriber is not None and subscriber.subscribed:
+            rows.extend(
+                [
+                    [{"text": "Stop signals", "callback_data": "signals:stop"}],
+                    [{"text": "Status", "callback_data": "signals:status"}],
+                ]
             )
-        rows.extend(
-            [
-                [{"text": "Start signals", "callback_data": "signals:start"}],
-                [{"text": "Stop signals", "callback_data": "signals:stop"}],
-                [{"text": "Status", "callback_data": "signals:status"}],
-            ]
-        )
+        else:
+            rows.extend(
+                [
+                    [{"text": "Start signals", "callback_data": "signals:start"}],
+                    [{"text": "Register", "callback_data": "signals:register"}],
+                ]
+            )
         return {"inline_keyboard": rows}
-
-    async def _start_reply(self, chat_id: int) -> None:
-        await self.client.send_message(
-            chat_id,
-            "Welcome to GBot. Signals are now enabled for this chat.",
-            reply_markup=self._keyboard(),
-        )
 
     async def _register_reply(self, chat_id: int) -> None:
         if self.referral_link:
@@ -395,11 +413,7 @@ class TelegramCommandHandler:
         await self.client.send_message(
             chat_id,
             text,
-            reply_markup={
-                "inline_keyboard": [
-                    [{"text": "Start signals", "callback_data": "signals:start"}]
-                ]
-            },
+            reply_markup=self._keyboard(chat_id),
         )
 
     async def _status_reply(self, chat_id: int) -> None:
@@ -414,6 +428,7 @@ class TelegramCommandHandler:
             f"Signals: {'on' if subscribed else 'off'}\n"
             f"Scanner: {scanner_status}\n"
             f"Minimum payout: {config.MIN_PAYOUT}%",
+            reply_markup=self._keyboard(chat_id),
         )
 
     def _admin_report(self) -> str:
