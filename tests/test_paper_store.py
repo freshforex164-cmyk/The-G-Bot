@@ -65,7 +65,7 @@ class SignalStoreTests(unittest.TestCase):
         self.assertEqual(row["payout"], "88")
         self.assertEqual(row["strength"], "72")
         self.assertEqual(json.loads(row["strength_components"])["bollinger"], 19)
-        self.assertEqual(row["recommended_expiry_seconds"], "60")
+        self.assertEqual(row["recommended_expiry_seconds"], "35")
         self.assertEqual(row["human_delay_entry_price"], "1.25")
         self.assertEqual(row["outcome_30s_entry_price"], "1.25")
         self.assertEqual(row["outcome_30s_exit_price"], "1.26")

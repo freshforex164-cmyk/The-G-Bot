@@ -204,7 +204,7 @@ class LiveCommandTests(unittest.IsolatedAsyncioTestCase):
 
         text = output.getvalue()
         self.assertEqual(len(result), 24)
-        self.assertIn("Loaded PAIR: 80 closed 10-second candles", text)
+        self.assertIn("Loaded PAIR: 80 closed 15-second candles", text)
         self.assertIn("APPROXIMATE STRATEGY LAB", text)
         self.assertIn("52.1%", text)
 

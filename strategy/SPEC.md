@@ -2,7 +2,7 @@
 
 ## Candle and index convention
 
-- Strategy inputs are completed 10-second OHLC candles only.
+- Strategy inputs are completed 15-second OHLC candles only.
 - Storage and indicator functions keep candles oldest-to-newest.
 - In this specification, index `0` is the latest completed candle, index `1`
   is the candle before it, and increasing indexes mean older candles.
@@ -68,8 +68,8 @@ disabled condition is shown as not applicable and does not block a setup.
 - `--run replay` / `--run strategy-lab` compares all 24 combinations of A/B,
   S2 on/off, S4 on/off, and stochastic lookbacks 3, 5, and 8 on the same data.
 - Replay reads `data/candles.csv` when it exists; otherwise it asks the broker
-  for up to 3,000 closed 10-second candles per eligible pair. OHLC trigger paths
-  and win rates are approximate.
+  for up to 3,000 closed 15-second candles per eligible pair. OHLC trigger paths
+  and 35-second expiry estimates are approximate.
 - The lab reports 30/60/120-second win rates and the 52.1% break-even rate at
   92% payout. Payout is not an input to the strength score.
 - The target replay strength distribution is approximately p10=20, p50=50,

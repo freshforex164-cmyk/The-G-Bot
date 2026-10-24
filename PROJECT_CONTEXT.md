@@ -27,9 +27,9 @@ never be printed or logged. A missing `PO_SSID` or Telegram bot token stops
 - `feed-check` prints every top-pair tick with UTC and local timestamps and
   reports the informational account type.
 - `explain` prints both directional conditions and the current trigger state
-  every ten seconds.
-- `replay` / `strategy-lab` compares 24 rule variants on the same data and
-  reports approximate 30/60/120-second outcomes and 92%-payout break-even.
+  every 15 seconds.
+- `replay` reports approximate outcomes using 15-second candles and the
+  configured 35-second signal expiry; replay fills are estimates.
 - `scanner --record` appends every completed scanned candle to
   `data/candles.csv`; replay reads this file when available.
 - Console and Telegram notifiers send through an asynchronous, freshness- and
@@ -42,8 +42,9 @@ never be printed or logged. A missing `PO_SSID` or Telegram bot token stops
 - `telegram-setup` lists chats returned by Telegram `getUpdates`. It never
   prints the bot token. `test-signals` sends explicitly labeled test messages;
   these are not confirmed signals and never submit trades.
-- Paper outcomes use a delayed entry, 30/60/120-second expiries, and in-memory
-  or CSV storage. Ties count as losses.
+- Paper outcomes use a delayed entry and in-memory or CSV storage. Ties count
+  as losses. Decision-log outcomes use live fire-time entry and a 35-second
+  expiry.
 - `scanner` prints signals, stream health, and paper summaries. `watch` remains
   a plain live-candle viewer.
 
@@ -153,17 +154,13 @@ Offline tests use mocks and do not connect to Pocket Option or Telegram.
 - A dark-glassmorphism admin PWA is planned with Dashboard, Signals, and
   Settings sections. End users use Telegram, not the PWA.
 
-## PROGRESS
+## Handoff verification
 
-- P1: OTC-only metadata filtering, app names, open/payout eligibility, send-time payout validation, and `--run pairs` implemented; 15 focused tests pass; live app cross-check pending.
-- P2: Candle defaults are 15 seconds; Stochastic 14,3,3; Bollinger 5/1; SMA 10 default with EMA support; ATR 14; Keltner remains disabled; 12 focused tests pass.
-- P1: Verified OTC-only filtering, provider display names, active-pair payout eligibility, send-time validation, and `--run pairs`; 9 focused tests pass; live app cross-check deferred to P8.
-- P2: Verified 15-second candles and requested Stochastic/Bollinger/SMA/ATR defaults; SMA and EMA supported, Keltner disabled; 6 focused tests pass.
-- P3: Close-only state machine, SELL/BUY triggers, 45-second deadline, cooldown, payout-free weighted strength, numeric `explain`, and 15 focused tests pass.
-- P4: Telegram signal template is escaped HTML with exactly five lines, no price, 35-second expiry; stale queue entries are dropped; 10 focused tests pass.
-- P1 PARTIAL: Scanner and diagnostic signals use named, open OTC assets with send-time payout validation; focused tests pass. Live app cross-check remains for P8.
-- P2 DONE: 15-second candles and Stochastic/Bollinger/SMA/ATR defaults match the requested settings; Keltner remains disabled. `test_phase2.py`: 6 tests pass.
-- P3 DONE: Close-only state machine, 45-second window, ATR rejection rules, payout-free weighted strength, and 15-second numeric `explain` are implemented; `test_close_engine.py`: 9 tests pass.
-- P4 DONE: Telegram signal output is escaped HTML with exactly five lines, no price, and 35-second expiry; stale queued signals are dropped. Notification and live-command focused tests pass.
-- P5 DONE: Telegram long polling, seven commands, referral-backed registration, subscriber fan-out, admin restrictions, and Postgres/JSON storage are implemented; 16 focused offline tests pass.
-- P6 DONE: Stale-tick rejection, 15-second broker-call timeouts, 20-second no-feed watchdog, connection rebuilds, and the third-failure SSID alert are implemented; 9 scanner/watchdog tests pass.
+- Verified in code: 15-second candle construction, 35-second expiration, and
+  `--run serve` as the Replit run command.
+- Verified in code and offline tests: `feed-check` returns structured results
+  and exits non-zero when its feed fails.
+- UNVERIFIED: the previous live run's reported 62 ticks; repeat once during
+  this continuation.
+- UNVERIFIED: live Telegram behavior and replay results until their requested
+  checks run.

@@ -27,7 +27,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             main._format_signal_line(signal),
             "2026-01-01T00:00:00+00:00 BITB_otc SELL payout=92% "
-            "strength=84 expiry=60s valid-for=15s",
+            "strength=84 expiry=35s valid-for=15s",
         )
 
     def test_scanner_command_passes_minutes(self) -> None:

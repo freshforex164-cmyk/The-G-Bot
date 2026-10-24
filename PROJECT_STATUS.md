@@ -1,34 +1,31 @@
 # GBot status
 
 ## Goal
-GBot scans Pocket Option OTC pairs on 15-second candles with a Stochastic + Bollinger + SMA strategy.
-It sends signals to Telegram subscribers and logs every decision and outcome for measurement; users place trades themselves.
+Read-only Pocket Option signals from 15-second candles, expiring after 35 seconds.
+Users place any trades themselves; the bot never submits trades.
 
-## Core idea
-- Read market data and evaluate completed candles only.
-- Notify subscribers; never place trades.
-- Keep a durable record of decisions and outcomes.
+## Verified
+- Code uses 15-second candles and 35-second signal expiration.
+- Replit run command is `uv run --locked python main.py --run serve`.
+- `feed-check` result handling and failure exit are covered by offline tests.
 
-## Done
-- Step 0: Read this handoff and `PROJECT_CONTEXT.md`; checked current code and tests. GBot remains read-only.
-- Step 1: `run_feed_check` returns `ok`, `tick_count`, `last_price`, and `reason`; CLI exits non-zero on failure. Full offline suite: 97 tests passed on 2026-10-24.
-- Step 2: Live feed check passed: 62 ticks over 30 seconds; process exited 0. No restart or retry was needed. Reported account type was demo (informational only).
+## Not done / unverified
+- Telegram subscription controls, command scopes, and live test-signal pipeline need fixes and verification.
+- Admin metrics and the 35-second live-tick decision outcomes need completion.
+- Replay output needs to use the current 15-second / 35-second definitions.
+- Prior live feed claim (62 ticks in 30 seconds) is UNVERIFIED until repeated once in this run.
+- Telegram live checks, replay table, and remote push are NOT RUN.
 
-## Not done
-- Steps 3–7: Telegram/serve verification, decision log, current-rule replay, final checkpoint.
-
-## Known walls with fallback
-- Telegram live behavior is UNVERIFIED in this run; offline mocks are used.
-- Telegram `getUpdates` refusal and `chat not found` were not encountered; no live Telegram send/poll was run.
-- Current candle configuration is 15 seconds; some replay output text still says 10 seconds and needs correction.
-- `ADMIN_TOKEN` must be configured before `/admin/status` can be used.
-- GitHub push availability is UNVERIFIED; preserve local commits if remote push fails.
+## Walls with fallback
+- If Postgres is unavailable, subscriber state falls back to `data/subscribers.json`.
+- If the live broker or Telegram check cannot complete, report its redacted error and leave it NOT RUN.
+- The protected web status endpoint needs `ADMIN_TOKEN`; public `/health` does not.
 
 ## Needs your action
-- Later: set `ADMIN_TOKEN` through Replit Secrets before using the protected web endpoint.
+- None identified yet. Any unavailable or invalid secret will be named without showing its value.
 
 ## Next step
-- Step 3: Verify Telegram subscriber and admin commands with offline mocks.
+- Finish Steps 1–7 in order, run only the requested live checks, then commit and push.
 
 ## Last run date
-- 2026-10-24; offline suite: 97 passed; live feed: 62 ticks / 30 seconds.
+- 2026-10-24; baseline offline suite: 96 passed, 2 failed (one stale replay assertion, one test fixture affected by an inherited `TELEGRAM_ADMIN_ID`).
