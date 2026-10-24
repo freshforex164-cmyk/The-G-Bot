@@ -31,8 +31,20 @@ PUBLIC_COMMANDS = [
 ]
 ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     {"command": "admin", "description": "Check signal stats"},
+    {"command": "health", "description": "Check scanner health"},
+    {"command": "pause", "description": "Pause signal scanning"},
+    {"command": "resume", "description": "Resume signal scanning"},
+    {"command": "subscribers", "description": "List active subscriber chats"},
     {"command": "testsignal", "description": "Send a sample signal to admin"},
 ]
+ADMIN_ONLY_COMMANDS = {
+    "admin",
+    "health",
+    "pause",
+    "resume",
+    "subscribers",
+    "testsignal",
+}
 
 
 class TelegramBotClient:
@@ -148,7 +160,9 @@ class TelegramBotClient:
     async def answer_callback(self, callback_id: str) -> None:
         await self.call("answerCallbackQuery", {"callback_query_id": callback_id})
 
-    async def register_commands(self, admin_id: int | None = None) -> None:
+    async def register_commands(
+        self, admin_id: int | str | None = None
+    ) -> None:
         await self.call(
             "setMyCommands",
             {"commands": PUBLIC_COMMANDS, "scope": {"type": "default"}},
@@ -296,18 +310,50 @@ class TelegramCommandHandler:
                 await self._register_reply(chat_id)
             return
 
-        if command in {"admin", "testsignal"}:
-            if self.admin_id is None or sender_id != self.admin_id:
-                await self.client.send_message(
-                    chat_id, "This command is available to the admin only."
-                )
+        if command in ADMIN_ONLY_COMMANDS:
+            if (
+                self.admin_id is None
+                or sender_id != self.admin_id
+                or self.admin_chat_id is None
+                or str(chat_id) != str(self.admin_chat_id)
+            ):
                 return
-            if command == "admin":
+            if command in {"admin", "health"}:
                 await self.client.send_message(chat_id, self._admin_report())
+            elif command == "pause":
+                pause = getattr(self.scanner, "pause", None)
+                if callable(pause):
+                    pause()
+                    text = "Signal scanning is paused."
+                else:
+                    text = "Signal scanning is unavailable."
+                await self.client.send_message(chat_id, text)
+            elif command == "resume":
+                resume = getattr(self.scanner, "resume", None)
+                if callable(resume):
+                    resume()
+                    text = "Signal scanning has resumed."
+                else:
+                    text = "Signal scanning is unavailable."
+                await self.client.send_message(chat_id, text)
+            elif command == "subscribers":
+                chat_ids = await asyncio.to_thread(
+                    self.subscribers.subscribed_chat_ids
+                )
+                text = (
+                    f"Active subscribers: {len(chat_ids)}\n"
+                    + (
+                        "Chats: " + ", ".join(str(item) for item in chat_ids)
+                        if chat_ids
+                        else "No active subscriber chats."
+                    )
+                )
+                if len(text) > 3900:
+                    text = text[:3890] + "\n…"
+                await self.client.send_message(chat_id, text, parse_mode=None)
             else:
-                target = self.admin_chat_id if self.admin_chat_id is not None else chat_id
                 await self.client.send_message(
-                    target, self._test_signal_message()
+                    self.admin_chat_id, self._test_signal_message()
                 )
             return
 
@@ -359,7 +405,10 @@ class TelegramCommandHandler:
     async def _status_reply(self, chat_id: int) -> None:
         subscriber = self.subscribers.subscribers.get(chat_id)
         subscribed = bool(subscriber and subscriber.subscribed)
-        scanner_status = "running" if self.scanner_running() else "stopped"
+        if bool(getattr(self.scanner, "is_paused", False)):
+            scanner_status = "paused"
+        else:
+            scanner_status = "running" if self.scanner_running() else "stopped"
         await self.client.send_message(
             chat_id,
             f"Signals: {'on' if subscribed else 'off'}\n"

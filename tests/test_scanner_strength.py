@@ -109,6 +109,47 @@ class StrengthTests(unittest.TestCase):
 
 
 class SignalScannerTests(unittest.TestCase):
+    def test_pause_cancels_setups_and_prevents_signal_evaluation_until_resume(self) -> None:
+        class Candles:
+            closed: list[Candle] = []
+
+            def update(self, tick):
+                return Candle(int(tick["timestamp"]), 1.0, 1.1, 0.9, 1.0)
+
+        class Strategy:
+            def __init__(self):
+                self.cancelled: list[tuple[str, str]] = []
+                self.evaluations = 0
+
+            def cancel_all(self, pair, reason):
+                self.cancelled.append((pair, reason))
+
+            def on_closed_candles(self, *_args, **_kwargs):
+                self.evaluations += 1
+
+            def take_closed_signal(self, _pair):
+                return None
+
+        scanner = SignalScanner(SimpleNamespace())
+        strategy = Strategy()
+        state = SimpleNamespace(candles=Candles(), strategy=strategy, payout=92.0)
+        scanner.pairs["PAIR_otc"] = state
+        scanner.pause()
+        self.assertTrue(scanner.is_paused)
+        self.assertEqual(strategy.cancelled, [("PAIR_otc", "scanner paused")])
+
+        tick = {
+            "timestamp": int(datetime.now(timezone.utc).timestamp()) + 7200,
+            "price": 1.0,
+        }
+        scanner._handle_tick("PAIR_otc", state, tick)
+        self.assertEqual(strategy.evaluations, 0)
+
+        scanner.resume()
+        scanner._handle_tick("PAIR_otc", state, tick)
+        self.assertFalse(scanner.is_paused)
+        self.assertEqual(strategy.evaluations, 1)
+
     def test_active_signals_are_ranked_capped_and_expired(self) -> None:
         scanner = SignalScanner(SimpleNamespace())
         now = datetime.now(timezone.utc)

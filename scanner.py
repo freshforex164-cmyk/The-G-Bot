@@ -55,6 +55,7 @@ class SignalScanner:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._receiving_pairs: set[str] = set()
         self._stopping = False
+        self._paused = False
         self._started_at: float | None = None
         self._last_any_tick_at: float | None = None
         self._last_tick_received: dict[str, float] = {}
@@ -69,6 +70,18 @@ class SignalScanner:
         if self._last_any_tick_at is None:
             return None
         return max(0.0, time.monotonic() - self._last_any_tick_at)
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    def pause(self) -> None:
+        self._paused = True
+        for pair, state in self.pairs.items():
+            state.strategy.cancel_all(pair, "scanner paused")
+
+    def resume(self) -> None:
+        self._paused = False
 
     def expire_signals(self, now: datetime | None = None) -> None:
         current = now or datetime.now(timezone.utc)
@@ -216,12 +229,13 @@ class SignalScanner:
                     logger.error(
                         "Candle recording failed (%s).", type(exc).__name__
                     )
-            state.strategy.on_closed_candles(
-                pair, tuple(state.candles.closed), payout=state.payout
-            )
-            closed_signal = state.strategy.take_closed_signal(pair)
-            if closed_signal is not None:
-                self._publish_signal(closed_signal)
+            if not self._paused:
+                state.strategy.on_closed_candles(
+                    pair, tuple(state.candles.closed), payout=state.payout
+                )
+                closed_signal = state.strategy.take_closed_signal(pair)
+                if closed_signal is not None:
+                    self._publish_signal(closed_signal)
         if self.on_tick is not None:
             try:
                 self.on_tick(pair, price, timestamp)

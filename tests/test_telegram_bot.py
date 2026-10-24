@@ -142,9 +142,17 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("not a guarantee", text)
 
     async def test_admin_command_is_restricted_to_configured_user(self) -> None:
-        await self.handler.handle_update(message_update("/admin", sender_id=101))
-        self.assertIn("admin only", self.client.messages[-1][1])
-        await self.handler.handle_update(message_update("/admin", sender_id=900))
+        await self.handler.handle_update(
+            message_update("/admin", chat_id=-100900, sender_id=101)
+        )
+        self.assertEqual(self.client.messages, [])
+        await self.handler.handle_update(
+            message_update("/admin", chat_id=101, sender_id=900)
+        )
+        self.assertEqual(self.client.messages, [])
+        await self.handler.handle_update(
+            message_update("/admin", chat_id=-100900, sender_id=900)
+        )
         report = self.client.messages[-1][1]
         self.assertIn("Subscribers: 0", report)
         self.assertIn("Signals today: 0", report)
@@ -154,8 +162,62 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SSID:", report)
         self.assertNotIn("42[", report)
 
+    async def test_admin_health_pause_resume_are_restricted_to_admin_chat(self) -> None:
+        class FakeScanner:
+            is_paused = False
+
+            def pause(self):
+                self.is_paused = True
+
+            def resume(self):
+                self.is_paused = False
+
+        scanner = FakeScanner()
+        self.handler.scanner = scanner
+        await self.handler.handle_update(
+            message_update("/pause", chat_id=-100900, sender_id=101)
+        )
+        await self.handler.handle_update(
+            message_update("/pause", chat_id=101, sender_id=900)
+        )
+        self.assertFalse(scanner.is_paused)
+        self.assertEqual(self.client.messages, [])
+
+        await self.handler.handle_update(
+            message_update("/pause", chat_id=-100900, sender_id=900)
+        )
+        self.assertTrue(scanner.is_paused)
+        self.assertIn("paused", self.client.messages[-1][1])
+        await self.handler.handle_update(
+            message_update("/health", chat_id=-100900, sender_id=900)
+        )
+        self.assertIn("Feed:", self.client.messages[-1][1])
+        await self.handler.handle_update(
+            message_update("/resume", chat_id=-100900, sender_id=900)
+        )
+        self.assertFalse(scanner.is_paused)
+        self.assertIn("resumed", self.client.messages[-1][1])
+
+    async def test_subscribers_command_shows_only_active_chats_in_admin_chat(self) -> None:
+        self.store.set_subscribed(555, True)
+        self.store.set_subscribed(556, False)
+        await self.handler.handle_update(
+            message_update("/subscribers", chat_id=-100900, sender_id=900)
+        )
+        chat_id, text, _markup, _mode = self.client.messages[-1]
+        self.assertEqual(chat_id, -100900)
+        self.assertIn("Active subscribers: 1", text)
+        self.assertIn("555", text)
+        self.assertNotIn("556", text)
+
     async def test_testsignal_goes_only_to_admin_chat_with_test_label(self) -> None:
-        await self.handler.handle_update(message_update("/testsignal", sender_id=900))
+        await self.handler.handle_update(
+            message_update("/testsignal", chat_id=101, sender_id=900)
+        )
+        self.assertEqual(self.client.messages, [])
+        await self.handler.handle_update(
+            message_update("/testsignal", chat_id=-100900, sender_id=900)
+        )
         chat_id, text, _markup, _mode = self.client.messages[-1]
         self.assertEqual(chat_id, -100900)
         self.assertEqual(len(text.splitlines()), 6)

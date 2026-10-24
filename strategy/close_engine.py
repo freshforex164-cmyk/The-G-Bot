@@ -316,6 +316,11 @@ class CloseOnlyStrategy:
             if state.status == "ARMED":
                 state.status, state.reason, state.arm_index = "CANCEL", reason, None
 
+    def cancel_all(self, pair: str, reason: str) -> None:
+        """Discard open setups and an unconsumed signal for one pair."""
+        self._cancel_armed(pair, reason)
+        self._closed_signals.pop(pair, None)
+
     @staticmethod
     def _make_signal(
         pair: str,

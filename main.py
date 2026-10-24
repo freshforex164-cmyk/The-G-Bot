@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import config
+from admin_http import AdminHttpServer
 from broker.pocket_option import (
     CandleHistoryUnavailable,
     PocketOptionAuthenticationError,
@@ -538,10 +539,28 @@ async def run_serve() -> None:
         raise ConfigurationError(
             "Missing required secret TELEGRAM_ADMIN_ID for admin commands."
         )
-    admin_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip() or admin_id
+    admin_chat_value = os.environ.get("TELEGRAM_ADMIN_CHAT_ID", "").strip()
+    try:
+        admin_chat_id = int(admin_chat_value) if admin_chat_value else admin_id
+    except ValueError:
+        raise ConfigurationError(
+            "TELEGRAM_CHAT_ID must be a numeric Telegram chat ID for admin commands."
+        ) from None
+    try:
+        port = int(os.environ.get("PORT", "5000"))
+    except ValueError:
+        raise ConfigurationError("PORT must be a valid TCP port number.") from None
+    if not 1 <= port <= 65535:
+        raise ConfigurationError("PORT must be between 1 and 65535.")
+    admin_token = os.environ.get("ADMIN_TOKEN", "").strip() or None
+    if admin_token is None:
+        logger.warning(
+            "ADMIN_TOKEN is missing; GET /admin/status will remain unavailable."
+        )
+
     bot = TelegramBotClient(token)
     try:
-        await bot.register_commands(admin_id)
+        await bot.register_commands(admin_chat_id)
     except TelegramSendError as exc:
         logger.warning(
             "Telegram command registration failed (%s); polling will still start.",
@@ -556,7 +575,6 @@ async def run_serve() -> None:
         max_per_minute=25 * 60,
         valid_seconds=config.SIGNAL_VALID_SECONDS,
     )
-    queue.start()
     service_state = {"scanner_running": False}
 
     def on_signal(signal: Signal) -> None:
@@ -593,6 +611,45 @@ async def run_serve() -> None:
     polling = TelegramPollingService(bot, handler)
     stop_event = asyncio.Event()
 
+    def broker_connected() -> bool:
+        try:
+            return bool(scanner.broker.is_connected)
+        except Exception:
+            return False
+
+    def public_health() -> dict[str, Any]:
+        if scanner.is_paused:
+            scanner_status = "paused"
+        elif service_state["scanner_running"]:
+            scanner_status = "running"
+        else:
+            scanner_status = "starting"
+        return {
+            "ok": True,
+            "scanner": scanner_status,
+            "feed_connected": broker_connected(),
+        }
+
+    def admin_status() -> dict[str, Any]:
+        return {
+            **public_health(),
+            "active_pairs": len(scanner.pairs),
+            "active_signals": len(scanner.active_signals),
+            "subscriber_count": subscribers.count(),
+            "last_tick_age_seconds": scanner.last_tick_age_seconds,
+            "ssid_configured": bool(os.environ.get("PO_SSID", "").strip()),
+        }
+
+    status_server = AdminHttpServer(
+        health_provider=public_health,
+        admin_provider=admin_status,
+        admin_token=admin_token,
+        port=port,
+    )
+    listener = await status_server.start()
+    listener_port = listener.sockets[0].getsockname()[1]
+    logger.info("GBot health server listening on port %d.", listener_port)
+
     async def scan_forever() -> None:
         service_state["scanner_running"] = True
         try:
@@ -600,13 +657,18 @@ async def run_serve() -> None:
         finally:
             service_state["scanner_running"] = False
 
+    queue.start()
     scan_task = asyncio.create_task(scan_forever(), name="gbot-market-scanner")
     polling_task = asyncio.create_task(
         polling.run(stop_event), name="gbot-telegram-polling"
     )
+    http_task = asyncio.create_task(
+        status_server.serve_forever(), name="gbot-health-http"
+    )
+    service_tasks = (scan_task, polling_task, http_task)
     try:
         done, _pending = await asyncio.wait(
-            {scan_task, polling_task}, return_when=asyncio.FIRST_EXCEPTION
+            set(service_tasks), return_when=asyncio.FIRST_EXCEPTION
         )
         for task in done:
             if task.cancelled():
@@ -616,10 +678,11 @@ async def run_serve() -> None:
                 raise error
     finally:
         stop_event.set()
-        for task in (scan_task, polling_task):
+        for task in service_tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(scan_task, polling_task, return_exceptions=True)
+        await asyncio.gather(*service_tasks, return_exceptions=True)
+        await status_server.close()
         await queue.close()
         tracker.print_summary()
 
