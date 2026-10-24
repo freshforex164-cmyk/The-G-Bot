@@ -618,6 +618,7 @@ async def run_serve() -> None:
         scanner=scanner,
         tracker=tracker,
         fanout=fanout,
+        decision_store=decision_store,
         scanner_running=lambda: service_state["scanner_running"],
         admin_chat_id=admin_chat_id,
         test_signal_provider=test_signal_provider,
@@ -647,10 +648,9 @@ async def run_serve() -> None:
     def admin_status() -> dict[str, Any]:
         return {
             **public_health(),
+            **handler.admin_metrics(),
             "active_pairs": len(scanner.pairs),
             "active_signals": len(scanner.active_signals),
-            "subscriber_count": subscribers.count(),
-            "last_tick_age_seconds": scanner.last_tick_age_seconds,
             "ssid_configured": bool(os.environ.get("PO_SSID", "").strip()),
         }
 
@@ -680,6 +680,39 @@ async def run_serve() -> None:
         status_server.serve_forever(), name="gbot-health-http"
     )
     service_tasks = (scan_task, polling_task, http_task)
+    try:
+        await asyncio.wait_for(
+            scanner.wait_until_ready(),
+            timeout=config.INITIAL_CONNECT_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        logger.warning("Scanner did not complete startup before the ready timeout.")
+    tick_deadline = asyncio.get_running_loop().time() + min(
+        2.0, config.WATCHDOG_TICK_MAX_AGE_SECONDS
+    )
+    while (
+        scanner.last_tick_age_seconds is None
+        and asyncio.get_running_loop().time() < tick_deadline
+    ):
+        await asyncio.sleep(0.1)
+    feed_ok = (
+        broker_connected()
+        and scanner.last_tick_age_seconds is not None
+        and scanner.last_tick_age_seconds <= config.WATCHDOG_TICK_MAX_AGE_SECONDS
+    )
+    database_label = "postgres" if subscribers.backend == "postgres" else "file"
+    startup_message = (
+        f"GBot started. Feed {'OK' if feed_ok else 'NOT OK'}, "
+        f"{len(scanner.pairs)} pairs, {subscribers.count()} subscribers, "
+        f"database {database_label}."
+    )
+    try:
+        await bot.send_message(admin_chat_id, startup_message, parse_mode=None)
+    except TelegramSendError as exc:
+        logger.warning(
+            "Startup status message could not be sent (%s).",
+            exc.status_code or type(exc).__name__,
+        )
     try:
         done, _pending = await asyncio.wait(
             set(service_tasks), return_when=asyncio.FIRST_EXCEPTION

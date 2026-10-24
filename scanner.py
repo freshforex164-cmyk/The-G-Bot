@@ -68,6 +68,7 @@ class SignalScanner:
         self._last_any_tick_at: float | None = None
         self._last_tick_received: dict[str, float] = {}
         self._last_tick_timestamp: dict[str, datetime] = {}
+        self._ready = asyncio.Event()
         self._watchdog_rebuilding = False
         self._watchdog_failures = 0
         self._watchdog_retry_at = 0.0
@@ -82,6 +83,9 @@ class SignalScanner:
     @property
     def is_paused(self) -> bool:
         return self._paused
+
+    async def wait_until_ready(self) -> None:
+        await self._ready.wait()
 
     def pause(self) -> None:
         self._paused = True
@@ -454,6 +458,7 @@ class SignalScanner:
                 timeout=config.WATCHDOG_CALL_TIMEOUT_SECONDS,
             )
             await self.refresh_pairs()
+            self._ready.set()
             next_refresh = loop.time() + config.PAYOUT_REFRESH_SECONDS
             while loop.time() < deadline:
                 wake_at = min(deadline, next_refresh, next_health, next_watchdog)

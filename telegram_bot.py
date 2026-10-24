@@ -199,6 +199,7 @@ class TelegramCommandHandler:
         scanner: Any = None,
         tracker: Any = None,
         fanout: Any = None,
+        decision_store: Any = None,
         scanner_running: Callable[[], bool] = lambda: False,
         admin_chat_id: int | str | None = None,
         started_at: float | None = None,
@@ -211,6 +212,7 @@ class TelegramCommandHandler:
         self.scanner = scanner
         self.tracker = tracker
         self.fanout = fanout
+        self.decision_store = decision_store
         self.scanner_running = scanner_running
         self.admin_chat_id = admin_chat_id
         self.started_at = started_at or time.monotonic()
@@ -440,22 +442,34 @@ class TelegramCommandHandler:
             scanner_status = "paused"
         else:
             scanner_status = "running" if self.scanner_running() else "stopped"
+        age = getattr(self.scanner, "last_tick_age_seconds", None)
+        age_text = "n/a" if age is None else f"{age:.1f}s"
+        pair_count = len(getattr(self.scanner, "pairs", {}))
         await self.client.send_message(
             chat_id,
-            f"Signals: {'on' if subscribed else 'off'}\n"
-            f"Scanner: {scanner_status}\n"
-            f"Minimum payout: {config.MIN_PAYOUT}%",
+            f"Subscribed: {'yes' if subscribed else 'no'}\n"
+            f"Scanner: {scanner_status} (last tick age: {age_text})\n"
+            f"Minimum payout: {config.MIN_PAYOUT}%\n"
+            f"OTC pairs scanned: {pair_count}",
             reply_markup=self._keyboard(chat_id),
         )
 
-    def _admin_report(self) -> str:
+    def admin_metrics(self) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         signals = getattr(self.scanner, "signals", {}) if self.scanner else {}
-        today = sum(
-            1
-            for signal in signals.values()
-            if getattr(signal, "time", now).astimezone(timezone.utc).date()
-            == now.date()
+        signal_times = []
+        for signal in signals.values():
+            signal_time = getattr(signal, "time", None)
+            if not isinstance(signal_time, datetime):
+                continue
+            if signal_time.tzinfo is None:
+                signal_time = signal_time.replace(tzinfo=timezone.utc)
+            signal_times.append(signal_time.astimezone(timezone.utc))
+        today = sum(signal_time.date() == now.date() for signal_time in signal_times)
+        last_signal_time = (
+            max(signal_times).isoformat(timespec="seconds")
+            if signal_times
+            else None
         )
         broker = getattr(self.scanner, "broker", None) if self.scanner else None
         connected_value = getattr(broker, "is_connected", False)
@@ -473,31 +487,56 @@ class TelegramCommandHandler:
         pairs = len(getattr(self.scanner, "pairs", {})) if self.scanner else 0
         store = getattr(self.subscribers, "count", None)
         subscriber_count = store() if callable(store) else 0
-        records = getattr(self.tracker, "records", {}) if self.tracker else {}
-        shortest_expiry = min(config.PAPER_EXPIRIES_SECONDS)
-        settled = [
-            record.outcomes[shortest_expiry].result
-            for record in records.values()
-            if shortest_expiry in record.outcomes
-            and record.outcomes[shortest_expiry].result is not None
-        ][-100:]
-        win_rate = (
-            sum(result == "WIN" for result in settled) / len(settled) * 100
-            if settled
-            else 0.0
+        funnel_reader = getattr(self.decision_store, "last_hour_funnel", None)
+        funnel = funnel_reader() if callable(funnel_reader) else {}
+        return {
+            "feed_status": "connected" if connected else "disconnected",
+            "last_tick_age_seconds": age,
+            "pairs_streaming": pairs,
+            "subscriber_count": subscriber_count,
+            "signals_today": today,
+            "last_signal_time": last_signal_time,
+            "last_hour_setup_funnel": funnel,
+            "tick_to_signal_latency_ms": scan_latency,
+            "signal_to_telegram_latency_ms": delivery_latency,
+            "uptime_seconds": max(0, int(time.monotonic() - self.started_at)),
+        }
+
+    def _admin_report(self) -> str:
+        metrics = self.admin_metrics()
+        age = metrics["last_tick_age_seconds"]
+        age_text = "n/a" if age is None else f"{age:.1f}s"
+        scan_latency = metrics["tick_to_signal_latency_ms"]
+        scan_latency_text = "n/a" if scan_latency is None else f"{scan_latency:.1f}ms"
+        delivery_latency = metrics["signal_to_telegram_latency_ms"]
+        delivery_latency_text = (
+            "n/a" if delivery_latency is None else f"{delivery_latency:.1f}ms"
         )
-        uptime = max(0, int(time.monotonic() - self.started_at))
+        funnel = metrics["last_hour_setup_funnel"]
+        cancelled = funnel.get("cancelled_by_reason", {})
+        cancelled_text = (
+            ", ".join(
+                f"{reason}={count}" for reason, count in sorted(cancelled.items())
+            )
+            if cancelled
+            else "none"
+        )
+        last_signal_time = metrics["last_signal_time"] or "n/a"
         return (
-            f"Feed: {'connected' if connected else 'disconnected'}\n"
+            f"Feed: {metrics['feed_status']}\n"
             f"SSID: {'configured' if os.environ.get('PO_SSID', '').strip() else 'missing'}\n"
             f"Last tick age: {age_text}\n"
+            f"Pairs streaming: {metrics['pairs_streaming']}\n"
+            f"Subscribers: {metrics['subscriber_count']}\n"
+            f"Signals today: {metrics['signals_today']}\n"
+            f"Last signal time: {last_signal_time}\n"
+            f"Last-hour setups: armed={funnel.get('armed', 0)}, "
+            f"fired={funnel.get('fired', 0)}, "
+            f"cancelled by reason: {cancelled_text}, "
+            f"expired={funnel.get('expired', 0)}\n"
             f"Tick-to-signal latency: {scan_latency_text}\n"
             f"Signal-to-Telegram latency: {delivery_latency_text}\n"
-            f"Pairs streaming: {pairs}\n"
-            f"Subscribers: {subscriber_count}\n"
-            f"Signals today: {today}\n"
-            f"Paper win rate (last {len(settled)}): {win_rate:.1f}%\n"
-            f"Uptime: {uptime}s"
+            f"Uptime: {metrics['uptime_seconds']}s"
         )
 
 class SubscriberFanoutNotifier:
