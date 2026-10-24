@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger("gbot.assets")
@@ -15,6 +18,40 @@ class MarketAsset:
     display_name: str
     payout: float
     is_open: bool
+
+
+@dataclass(frozen=True)
+class MarketAssetSnapshot:
+    captured_at: datetime
+    otc_pair_count: int
+    assets: dict[str, MarketAsset]
+
+
+@dataclass(frozen=True)
+class LiveTestCandidate:
+    signal: Any
+    asset: MarketAsset
+    live_price: float
+
+
+async def read_market_asset_snapshot(
+    broker: Any, *, timeout_seconds: float = 15.0
+) -> MarketAssetSnapshot:
+    """Read current broker payouts and market status through one shared path."""
+    payouts = await asyncio.wait_for(broker.payouts(), timeout=timeout_seconds)
+    rows = await asyncio.wait_for(broker.active_assets(), timeout=timeout_seconds)
+    otc_pair_count = sum(
+        1
+        for row in rows
+        if isinstance(row, dict)
+        and isinstance(row.get("symbol"), str)
+        and row["symbol"].endswith("_otc")
+    )
+    return MarketAssetSnapshot(
+        captured_at=datetime.now(timezone.utc),
+        otc_pair_count=otc_pair_count,
+        assets=normalize_assets(rows, payouts),
+    )
 
 
 def normalize_assets(
@@ -33,11 +70,18 @@ def normalize_assets(
             continue
         if row.get("is_otc") is False:
             continue
-        raw_payout = payouts.get(symbol, row.get("payout"))
+        if symbol not in payouts:
+            logger.warning("Skipping OTC pair %s: current payout is unavailable.", symbol)
+            continue
+        raw_payout = payouts[symbol]
         try:
             payout = float(raw_payout)
         except (TypeError, ValueError, OverflowError):
-            payout = 0.0
+            logger.warning("Skipping OTC pair %s: current payout is invalid.", symbol)
+            continue
+        if not math.isfinite(payout) or not 0 <= payout <= 100:
+            logger.warning("Skipping OTC pair %s: current payout is invalid.", symbol)
+            continue
         result[symbol] = MarketAsset(
             symbol=symbol,
             display_name=name.strip(),

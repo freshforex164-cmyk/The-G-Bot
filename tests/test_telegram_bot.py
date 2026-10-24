@@ -229,6 +229,10 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("556", text)
 
     async def test_testsignal_goes_only_to_admin_chat_with_test_label(self) -> None:
+        async def provider():
+            return ["TEST - not a confirmed signal\nBUY Pair OTC"]
+
+        self.handler.test_signal_provider = provider
         await self.handler.handle_update(
             message_update("/testsignal", chat_id=101, sender_id=900)
         )
@@ -238,11 +242,8 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         chat_id, text, _markup, _mode = self.client.messages[-1]
         self.assertEqual(chat_id, -100900)
-        self.assertEqual(len(text.splitlines()), 6)
-        self.assertIn("<b>SELL</b>", text)
-        self.assertIn("Asset: EUR/GBP OTC", text)
-        self.assertIn("Expiration: <b>35s</b>", text)
-        self.assertEqual(text.splitlines()[-1], "<b>TEST</b>")
+        self.assertEqual(text, "TEST - not a confirmed signal\nBUY Pair OTC")
+        self.assertIsNone(self.client.messages[-1][3])
 
     async def test_callback_buttons_answer_query_and_change_subscription(self) -> None:
         await self.handler.handle_update(

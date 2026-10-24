@@ -75,80 +75,6 @@ class LiveCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("post in the channel or press Start", text)
         self.assertNotIn("private-token", text)
 
-    async def test_test_signals_sends_three_marked_messages_to_mock_telegram(self) -> None:
-        captured_messages: list[dict[str, object]] = []
-
-        def opener(request, timeout):
-            captured_messages.append(json.loads(request.data))
-            return FakeResponse()
-
-        class FakeBroker:
-            def __init__(self, _ssid: str) -> None:
-                self.closed = False
-
-            async def connect(self) -> None:
-                return None
-
-            async def payouts(self) -> dict[str, float]:
-                return {
-                    "PAIR1_otc": 92,
-                    "PAIR2_otc": 90,
-                    "PAIR3_otc": 88,
-                }
-
-            async def active_assets(self) -> list[dict[str, object]]:
-                return [
-                    {
-                        "symbol": f"PAIR{index}_otc",
-                        "name": f"Pair {index} OTC",
-                        "is_active": True,
-                        "is_otc": True,
-                    }
-                    for index in range(1, 4)
-                ]
-
-            async def candle_history(self, *_args):
-                return []
-
-            async def subscribe_ticks(self, _pair: str):
-                raw_timestamp = int(time.time()) + config.POCKET_OPTION_TIME_OFFSET_SECONDS
-                yield {"timestamp": raw_timestamp, "price": 100.0}
-                yield {"timestamp": raw_timestamp, "price": 100.1234}
-
-            async def close(self) -> None:
-                self.closed = True
-
-        notifier = TelegramNotifier("mock-token", "-10042", opener=opener)
-        output = io.StringIO()
-        with (
-            patch.object(main, "PocketOptionBroker", FakeBroker),
-            patch.object(main, "load_ssid", return_value="fake-session"),
-            patch.object(main, "build_notifier", return_value=notifier),
-            patch.object(config, "MAX_SCAN_PAIRS", 3),
-            redirect_stdout(output),
-        ):
-            result = await main.run_test_signals()
-
-        self.assertEqual(result, 0)
-        self.assertEqual(len(captured_messages), 3)
-        self.assertTrue(
-            all(str(message["text"]).startswith("🧪 TEST ") for message in captured_messages)
-        )
-        self.assertTrue(
-            all("Not a confirmed signal" in str(message["text"]) for message in captured_messages)
-        )
-        self.assertTrue(
-            all("@100.1234" in str(message["text"]) for message in captured_messages)
-        )
-        self.assertTrue(
-            all(
-                f"Pair {index} OTC" in str(message["text"])
-                for index, message in enumerate(captured_messages, start=1)
-            )
-        )
-        self.assertIn("TEST SIGNALS SENT: 3/3", output.getvalue())
-        self.assertNotIn("mock-token", output.getvalue())
-
     async def test_missing_telegram_configuration_stops_notify_test(self) -> None:
         output = io.StringIO()
         with (
@@ -180,8 +106,7 @@ class LiveCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(captured), 1)
         self.assertEqual(
             str(captured[0]["text"]),
-            "🔴 <b>SELL</b>\nAsset: Bitcoin OTC\nPayout: 92%\n"
-            "Strength: 84\nExpiration: <b>35s</b>",
+            "GBot notification test. No market signal was generated.",
         )
         self.assertIn("NOTIFY TEST OK", output.getvalue())
 

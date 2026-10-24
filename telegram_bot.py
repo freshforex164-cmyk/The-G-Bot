@@ -10,7 +10,7 @@ import os
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -202,6 +202,7 @@ class TelegramCommandHandler:
         scanner_running: Callable[[], bool] = lambda: False,
         admin_chat_id: int | str | None = None,
         started_at: float | None = None,
+        test_signal_provider: Callable[[], Awaitable[list[str]]] | None = None,
     ) -> None:
         self.client = client
         self.subscribers = subscribers
@@ -213,6 +214,7 @@ class TelegramCommandHandler:
         self.scanner_running = scanner_running
         self.admin_chat_id = admin_chat_id
         self.started_at = started_at or time.monotonic()
+        self.test_signal_provider = test_signal_provider
 
     @staticmethod
     def _valid_referral(link: str | None) -> str | None:
@@ -381,10 +383,16 @@ class TelegramCommandHandler:
                 if len(text) > 3900:
                     text = text[:3890] + "\n…"
                 await self.client.send_message(chat_id, text, parse_mode=None)
-            else:
-                await self.client.send_message(
-                    self.admin_chat_id, self._test_signal_message()
-                )
+            elif command == "testsignal":
+                if self.test_signal_provider is None:
+                    await self.client.send_message(
+                        chat_id, "Live test-signal pipeline is unavailable."
+                    )
+                    return
+                for message in await self.test_signal_provider():
+                    await self.client.send_message(
+                        self.admin_chat_id, message, parse_mode=None
+                    )
             return
 
         await self.client.send_message(chat_id, "Unknown command. Use /help.")
@@ -491,27 +499,6 @@ class TelegramCommandHandler:
             f"Paper win rate (last {len(settled)}): {win_rate:.1f}%\n"
             f"Uptime: {uptime}s"
         )
-
-    @staticmethod
-    def _test_signal_message() -> str:
-        now = datetime.now(timezone.utc)
-        signal = Signal(
-            pair="EURGBP_otc",
-            direction="SELL",
-            price=1.0,
-            time=now,
-            stochastic_k=70.0,
-            stochastic_d=65.0,
-            ma_slope=-0.01,
-            bollinger_middle=1.0,
-            payout=92.0,
-            strength=84,
-            recommended_expiry_seconds=config.EXPIRATION_SECONDS,
-            valid_until=now,
-            asset_name="EUR/GBP OTC",
-        )
-        return f"{format_signal_message(signal)}\n<b>TEST</b>"
-
 
 class SubscriberFanoutNotifier:
     """Deliver each signal to active subscriber chats with global throttling."""

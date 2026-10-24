@@ -13,7 +13,12 @@ from typing import Any
 import config
 from broker.pocket_option import CandleHistoryUnavailable, PocketOptionBroker
 from data.candles import Candle, CandleBuilder, CandleDataError, _normalize_broker_timestamp
-from market_assets import MarketAsset, eligible_assets, normalize_assets
+from market_assets import (
+    LiveTestCandidate,
+    MarketAsset,
+    eligible_assets,
+    read_market_asset_snapshot,
+)
 from strategy.close_engine import CloseOnlyStrategy
 from strategy.pullback_reversal import Signal
 
@@ -110,16 +115,13 @@ class SignalScanner:
         return f"STREAM HEALTH requested_pairs={requested} receiving_tick_pairs={receiving}"
 
     async def refresh_pairs(self) -> None:
-        payouts = await asyncio.wait_for(
-            self.broker.payouts(),
-            timeout=config.WATCHDOG_CALL_TIMEOUT_SECONDS,
+        snapshot = await read_market_asset_snapshot(
+            self.broker,
+            timeout_seconds=config.WATCHDOG_CALL_TIMEOUT_SECONDS,
         )
-        metadata = await asyncio.wait_for(
-            self.broker.active_assets(),
-            timeout=config.WATCHDOG_CALL_TIMEOUT_SECONDS,
+        selected = eligible_assets(
+            snapshot.assets, config.MIN_PAYOUT, config.MAX_SCAN_PAIRS
         )
-        assets = normalize_assets(metadata, payouts)
-        selected = eligible_assets(assets, config.MIN_PAYOUT, config.MAX_SCAN_PAIRS)
         desired = {asset.symbol: asset for asset in selected}
 
         removed = set(self.pairs) - set(desired)
@@ -181,6 +183,56 @@ class SignalScanner:
                     self._stream_pair(pair, state),
                     name=f"scanner-{pair}",
                 )
+
+    async def live_test_candidates(
+        self,
+    ) -> tuple[Any, list[LiveTestCandidate]]:
+        """Return current scanner signals that still pass a fresh market snapshot."""
+        snapshot = await read_market_asset_snapshot(
+            self.broker,
+            timeout_seconds=config.WATCHDOG_CALL_TIMEOUT_SECONDS,
+        )
+        now = datetime.now(timezone.utc)
+        now_monotonic = time.monotonic()
+        eligible = {
+            asset.symbol: asset
+            for asset in eligible_assets(
+                snapshot.assets, config.MIN_PAYOUT, config.MAX_SCAN_PAIRS
+            )
+        }
+        candidates: list[LiveTestCandidate] = []
+        seen_pairs: set[str] = set()
+        for signal in sorted(
+            self.signals.values(),
+            key=lambda item: (-item.strength, item.time, item.id),
+        ):
+            asset = eligible.get(signal.pair)
+            state = self.pairs.get(signal.pair)
+            received_at = self._last_tick_received.get(signal.pair)
+            if (
+                asset is None
+                or state is None
+                or received_at is None
+                or now_monotonic - received_at > 5.0
+                or signal.status != "ACTIVE"
+                or (signal.valid_until is not None and signal.valid_until <= now)
+                or signal.pair in seen_pairs
+                or not state.candles.closed
+                or int(signal.time.timestamp()) != state.candles.closed[-1].time
+                or state.candles.forming_candle is None
+            ):
+                continue
+            candidates.append(
+                LiveTestCandidate(
+                    signal=signal,
+                    asset=asset,
+                    live_price=float(state.candles.forming_candle.close),
+                )
+            )
+            seen_pairs.add(signal.pair)
+            if len(candidates) == 3:
+                break
+        return snapshot, candidates
 
     async def _stream_pair(self, pair: str, state: PairScanState) -> None:
         while not self._stopping and self.pairs.get(pair) is state:

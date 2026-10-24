@@ -606,6 +606,10 @@ async def run_serve() -> None:
         on_decision=decision_store.record_candle,
         on_watchdog_event=admin_alert,
     )
+
+    async def test_signal_provider() -> list[str]:
+        return await _live_test_signal_messages(scanner)
+
     handler = TelegramCommandHandler(
         bot,
         subscribers,
@@ -616,6 +620,7 @@ async def run_serve() -> None:
         fanout=fanout,
         scanner_running=lambda: service_state["scanner_running"],
         admin_chat_id=admin_chat_id,
+        test_signal_provider=test_signal_provider,
     )
     polling = TelegramPollingService(bot, handler)
     stop_event = asyncio.Event()
@@ -698,38 +703,22 @@ async def run_serve() -> None:
 
 
 async def run_notify_test() -> bool:
-    now = datetime.now(timezone.utc)
-    sample = Signal(
-        pair="BITB_otc",
-        direction="SELL",
-        price=24.0017,
-        time=now,
-        stochastic_k=80.0,
-        stochastic_d=75.0,
-        ma_slope=-0.01,
-        bollinger_middle=24.0,
-        payout=92.0,
-        strength=84,
-        strength_components={
-            "stochastic": 26,
-            "moving_average": 21,
-            "bollinger": 20,
-            "middle_band_touch": 17,
-        },
-        recommended_expiry_seconds=config.EXPIRATION_SECONDS,
-        asset_name="Bitcoin OTC",
-        valid_until=now + timedelta(seconds=config.SIGNAL_VALID_SECONDS),
-    )
     notifier = build_notifier()
     if not isinstance(notifier, TelegramNotifier):
         print("NOTIFY TEST FAILED: Telegram is disabled because its secrets are missing.")
         return False
     try:
-        result = await notifier.send(sample)
+        await notifier.send_text(
+            "GBot notification test. No market signal was generated."
+        )
     except TelegramSendError as exc:
-        print(f"NOTIFY TEST FAILED: {exc}", flush=True)
+        print(
+            "NOTIFY TEST FAILED: "
+            f"{exc.status_code or type(exc).__name__}",
+            flush=True,
+        )
         return False
-    print(f"NOTIFY TEST OK: {result}", flush=True)
+    print("NOTIFY TEST OK", flush=True)
     return True
 
 
@@ -929,230 +918,78 @@ async def run_explain(*, pair: str | None = None, seconds: int = 30) -> bool:
         await broker.close()
 
 
-def _test_signal_score(evaluation: DirectionEvaluation) -> int:
-    score, _components = score_strength(
-        stochastic_extremity=evaluation.stochastic_extremity,
-        stochastic_turn=evaluation.stochastic_turn,
-        moving_average_turn=evaluation.ma_turn_percent,
-        bollinger_slope=evaluation.middle_slope_percent,
-        bollinger_curvature=evaluation.band_curvature_percent,
-        touch_cleanliness=0.5,
-    )
-    return score
-
-
-def _test_signal_evaluations(
-    pair: str,
-    payout: float,
-    builder: CandleBuilder,
-    tick: dict[str, Any],
-) -> list[dict[str, Any]]:
-    try:
-        price = float(tick.get("close", tick.get("price")))
-        timestamp = datetime.fromtimestamp(
-            _normalize_broker_timestamp(tick.get("timestamp", tick.get("time"))),
-            timezone.utc,
-        )
-    except (TypeError, ValueError, OverflowError, OSError, CandleDataError):
-        return []
-    evaluations: list[dict[str, Any]] = []
-    closed = tuple(builder.closed)
-    for direction in ("SELL", "BUY"):
-        if config.TRIGGER_VARIANT == "B":
-            if len(closed) < 2:
-                continue
-            evaluation = evaluate_direction(closed[:-1], direction)
-            triggered, trigger_detail = trigger_b(evaluation, closed[-1])
-        else:
-            evaluation = evaluate_direction(closed, direction)
-            triggered, trigger_detail = trigger_a(
-                evaluation, price, builder.forming_candle
-            )
-        matched = sum(condition.eligible for condition in evaluation.conditions)
-        matched += int(triggered)
-        evaluations.append(
-            {
-                "pair": pair,
-                "payout": payout,
-                "direction": direction,
-                "evaluation": evaluation,
-                "triggered": triggered,
-                "trigger_detail": trigger_detail,
-                "match": matched,
-                "strength": _test_signal_score(evaluation),
-                "price": price,
-                "timestamp": timestamp,
-                "conditions": evaluation.conditions,
-            }
-        )
-    return evaluations
-
-
-def _format_test_signal(candidate: dict[str, Any]) -> str:
-    timestamp: datetime = candidate["timestamp"]
-    expiry = config.RECOMMENDED_EXPIRY_SECONDS
-    expiry_label = f"{expiry // 60}m" if expiry % 60 == 0 else f"{expiry}s"
-    condition_parts = [
-        f"{condition.key} {'✅' if condition.eligible else '❌'}"
-        for condition in candidate["conditions"]
-    ]
-    condition_parts.append(
-        f"TRIGGER {'✅' if candidate['triggered'] else '❌'}"
-    )
-    line_one = (
-        f"🧪 TEST {candidate['direction']} {candidate['asset_name']} "
-        f"@{candidate['price']:.4f} | Payout {candidate['payout']:g}% | "
-        f"Match {candidate['match']}/5 | "
-        f"Expiry {expiry_label} | "
-        f"{timestamp.strftime('%H:%M:%S')} UTC"
-    )
+def _format_live_test_signal(candidate: Any, snapshot_time: datetime) -> str:
+    signal = candidate.signal
     return (
-        f"{line_one}\n{' | '.join(condition_parts)}\n"
-        "Not a confirmed signal"
+        "TEST - not a confirmed signal\n"
+        f"{signal.direction} {candidate.asset.display_name}\n"
+        f"Live price at send time: {candidate.live_price:.10g}\n"
+        f"Payout: {candidate.asset.payout:g}% | Open: yes\n"
+        f"Strength: {signal.strength} | "
+        f"Expiry: {signal.recommended_expiry_seconds}s\n"
+        f"Snapshot: {snapshot_time.strftime('%H:%M:%S')} UTC"
     )
+
+
+async def _live_test_signal_messages(scanner: SignalScanner) -> list[str]:
+    snapshot, candidates = await scanner.live_test_candidates()
+    if not candidates:
+        return [
+            "No live setup right now. "
+            f"Checked {snapshot.otc_pair_count} OTC pairs at "
+            f"{snapshot.captured_at.strftime('%H:%M:%S')} UTC."
+        ]
+    return [
+        _format_live_test_signal(candidate, snapshot.captured_at)
+        for candidate in candidates[:3]
+    ]
 
 
 async def run_test_signals() -> int:
-    """Send up to three explicitly marked diagnostic messages, never orders."""
+    """Run the read-only scanner briefly and send live setups, never orders."""
     notifier = build_notifier()
     if not isinstance(notifier, TelegramNotifier):
         print("TEST SIGNALS FAILED: Telegram is disabled because its secrets are missing.")
         return 1
     broker = PocketOptionBroker(load_ssid())
-    streams: dict[str, AsyncGenerator[dict[str, Any], None]] = {}
-    builders: dict[str, CandleBuilder] = {}
-    payouts: dict[str, float] = {}
-    initial_ticks: dict[str, dict[str, Any]] = {}
+    scanner = SignalScanner(broker)
+    scan_task = asyncio.create_task(
+        scanner.run(minutes=1), name="gbot-test-signal-scan"
+    )
     try:
-        await broker.connect()
-        live_payouts = await broker.payouts()
-        assets = normalize_assets(await broker.active_assets(), live_payouts)
-        eligible = eligible_assets(
-            assets, MIN_PAYOUT, config.MAX_SCAN_PAIRS
-        )
-        selected = sorted(
-            (
-                (asset.symbol, asset.payout)
-                for asset in eligible
-            ),
-            key=lambda item: (-item[1], item[0]),
-        )
-        if not selected:
-            print("TEST SIGNALS FAILED: no open, named OTC pair meets the minimum payout.")
-            return 1
-
-        async def prepare_history(symbol: str, payout: float) -> None:
-            builder = CandleBuilder(
-                period_seconds=CANDLE_INTERVAL_SECONDS,
-                max_candles=MAX_CANDLES_PER_PAIR,
-            )
-            try:
-                history = await broker.candle_history(
-                    symbol,
-                    CANDLE_INTERVAL_SECONDS,
-                    HISTORY_LOOKBACK_SECONDS,
+        deadline = asyncio.get_running_loop().time() + 3 * config.CANDLE_INTERVAL_SECONDS
+        while (
+            asyncio.get_running_loop().time() < deadline
+            and not scan_task.done()
+        ):
+            await asyncio.sleep(0.1)
+        if scan_task.done() and not scan_task.cancelled():
+            error = scan_task.exception()
+            if error is not None:
+                print(
+                    f"TEST SIGNALS FAILED: scanner stopped ({type(error).__name__}).",
+                    flush=True,
                 )
-                builder.seed(history)
-            except (CandleHistoryUnavailable, CandleDataError) as exc:
-                logger.warning("History for %s unavailable (%s).", symbol, type(exc).__name__)
-            builders[symbol] = builder
-            payouts[symbol] = payout
-
-        # The library shares one websocket client; seed histories one at a time
-        # before opening the simultaneous live tick subscriptions.
-        for symbol, payout in selected:
-            await prepare_history(symbol, payout)
-            streams[symbol] = broker.subscribe_ticks(symbol)
-
-        async def read_initial_tick(symbol: str) -> None:
-            stream = streams[symbol]
-            try:
-                tick = await asyncio.wait_for(anext(stream), timeout=15.0)
-                builders[symbol].update(tick)
-                initial_ticks[symbol] = tick
-            except (TimeoutError, StopAsyncIteration):
-                logger.warning("No live price arrived for %s.", symbol)
-
-        await asyncio.gather(*(read_initial_tick(symbol) for symbol, _ in selected))
-        candidates = [
-            item
-            for symbol, _ in selected
-            if symbol in initial_ticks
-            for item in _test_signal_evaluations(
-                symbol,
-                payouts[symbol],
-                builders[symbol],
-                initial_ticks[symbol],
-            )
-        ]
-        for candidate in candidates:
-            candidate["asset_name"] = assets[candidate["pair"]].display_name
-        best_by_pair: dict[str, dict[str, Any]] = {}
-        for candidate in candidates:
-            current = best_by_pair.get(candidate["pair"])
-            if current is None or (
-                candidate["match"], candidate["strength"]
-            ) > (current["match"], current["strength"]):
-                best_by_pair[candidate["pair"]] = candidate
-        best = sorted(
-            best_by_pair.values(),
-            key=lambda item: (-item["match"], -item["strength"], -item["payout"]),
-        )[:3]
-        if not best:
-            print("TEST SIGNALS FAILED: no pair produced a live price and candle history.")
-            return 1
-
+                return 1
+        messages = await _live_test_signal_messages(scanner)
         sent = 0
-        for candidate in best:
-            symbol = candidate["pair"]
-            stream = streams[symbol]
-            try:
-                tick = await asyncio.wait_for(anext(stream), timeout=10.0)
-                builders[symbol].update(tick)
-                latest_payouts = await broker.payouts()
-                latest_assets = normalize_assets(
-                    await broker.active_assets(), latest_payouts
-                )
-                asset = latest_assets.get(symbol)
-                if (
-                    asset is None
-                    or not asset.is_open
-                    or asset.payout < MIN_PAYOUT
-                ):
-                    logger.info(
-                        "Test signal for %s was skipped after send-time asset validation.",
-                        symbol,
-                    )
-                    continue
-                refreshed = _test_signal_evaluations(
-                    symbol, asset.payout, builders[symbol], tick
-                )
-                match = next(
-                    (item for item in refreshed if item["direction"] == candidate["direction"]),
-                    None,
-                )
-                if match is not None:
-                    candidate = match
-                candidate["asset_name"] = asset.display_name
-            except (TimeoutError, StopAsyncIteration):
-                logger.warning("No fresh send-time price arrived for %s.", symbol)
-                continue
-            text = _format_test_signal(candidate)
+        for text in messages:
             print(text, flush=True)
             try:
                 await notifier.send_text(text)
                 sent += 1
             except TelegramSendError as exc:
-                print(f"TEST SIGNAL SEND FAILED for {symbol}: {exc}", flush=True)
-        print(f"TEST SIGNALS SENT: {sent}/{len(best)}")
-        return 0 if sent == len(best) else 1
+                print(
+                    "TEST SIGNAL SEND FAILED: "
+                    f"{exc.status_code or type(exc).__name__}",
+                    flush=True,
+                )
+        print(f"TEST SIGNALS SENT: {sent}/{len(messages)}")
+        return 0 if sent == len(messages) else 1
     finally:
-        for stream in streams.values():
-            try:
-                await stream.aclose()
-            except Exception:
-                pass
-        await broker.close()
+        if not scan_task.done():
+            scan_task.cancel()
+        await asyncio.gather(scan_task, return_exceptions=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
