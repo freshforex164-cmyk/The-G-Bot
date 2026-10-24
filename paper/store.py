@@ -70,7 +70,7 @@ CSV_FIELDS = (
 
 
 class CsvSignalStore:
-    def __init__(self, path: str | Path = "signals.csv") -> None:
+    def __init__(self, path: str | Path = "data/signals.csv") -> None:
         self.path = Path(path)
         self._rows: dict[str, dict[str, str]] = {}
         if self.path.exists():
@@ -81,6 +81,8 @@ class CsvSignalStore:
                         self._rows[signal_id] = {
                             key: value or "" for key, value in row.items()
                         }
+        if not self.path.exists() or not self.path.stat().st_size:
+            self._write()
 
     def save(self, record: SignalRecord) -> None:
         signal = record.signal

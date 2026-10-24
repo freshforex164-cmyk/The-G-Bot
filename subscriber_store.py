@@ -44,6 +44,8 @@ class SubscriberStore:
         self._sleep = sleep
         self._use_database = bool(self.database_url)
         self.subscribers: dict[int, Subscriber] = {}
+        if not self.file_path.exists():
+            self._write_file()
         self.load()
 
     @property
@@ -134,6 +136,7 @@ class SubscriberStore:
             }
         except FileNotFoundError:
             self.subscribers = {}
+            self._write_file()
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             logger.warning(
                 "Subscriber JSON file could not be read (%s); starting empty.",

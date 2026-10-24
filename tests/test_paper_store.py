@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from paper.store import CsvSignalStore, InMemorySignalStore
+from paper.store import CSV_FIELDS, CsvSignalStore, InMemorySignalStore
 from paper.tracker import PaperTracker
 from strategy.pullback_reversal import Signal
 
@@ -49,6 +49,10 @@ class SignalStoreTests(unittest.TestCase):
             tracker = PaperTracker(
                 store=CsvSignalStore(path),
                 output=lambda _: None,
+            )
+            self.assertEqual(
+                path.read_text(encoding="utf-8").splitlines()[0],
+                ",".join(CSV_FIELDS),
             )
             at = datetime(2026, 1, 1, tzinfo=timezone.utc)
             signal = make_signal(at)

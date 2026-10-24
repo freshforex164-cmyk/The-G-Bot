@@ -576,6 +576,8 @@ async def run_serve() -> None:
     subscribers = await asyncio.to_thread(SubscriberStore)
     tracker = PaperTracker(store=CsvSignalStore(config.SIGNALS_CSV_PATH))
     decision_store = DecisionStore()
+    # Ensure the candle CSV and header exist even before optional recording starts.
+    CsvCandleStore(config.DATA_CANDLES_CSV_PATH)
     fanout = SubscriberFanoutNotifier(bot, subscribers)
     queue = NotificationQueue(
         fanout,

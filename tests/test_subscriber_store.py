@@ -119,11 +119,23 @@ class SubscriberStoreTests(unittest.TestCase):
     def test_missing_database_uses_json_storage(self) -> None:
         with TemporaryDirectory() as temp_dir:
             with self.assertLogs("gbot.subscribers", level="WARNING"):
+                path = Path(temp_dir) / "subscribers.json"
                 store = SubscriberStore(
                     database_url="",
-                    file_path=Path(temp_dir) / "subscribers.json",
+                    file_path=path,
                 )
             self.assertEqual(store.backend, "json")
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), [])
+
+    def test_existing_json_fallback_is_not_overwritten_at_startup(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "subscribers.json"
+            expected = [{"chat_id": 77, "subscribed": True, "plan": "free"}]
+            path.write_text(json.dumps(expected), encoding="utf-8")
+            with self.assertLogs("gbot.subscribers", level="WARNING"):
+                store = SubscriberStore(database_url="", file_path=path)
+            self.assertEqual(store.subscribed_chat_ids(), [77])
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), expected)
 
 
 if __name__ == "__main__":

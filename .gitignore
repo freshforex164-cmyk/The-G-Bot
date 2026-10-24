@@ -13,7 +13,18 @@ node_modules
 .pythonlibs/
 .venv/
 __pycache__/
-signals.csv
+/data/
+!/data/
+/data/*
+!/data/.gitkeep
+!/data/*.py
+!/data/**/*.py
+/logs/
+!/logs/
+/logs/*
+!/logs/.gitkeep
+*.log
+.env
 
 # IDEs and editors
 /.idea

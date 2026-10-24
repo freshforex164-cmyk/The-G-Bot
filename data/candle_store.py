@@ -17,6 +17,14 @@ class CsvCandleStore:
         self.path = Path(path)
         self._seen: set[tuple[str, int]] = set()
         self._loaded_existing = False
+        self._ensure_header()
+
+    def _ensure_header(self) -> None:
+        if self.path.exists() and self.path.stat().st_size:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("w", newline="", encoding="utf-8") as stream:
+            csv.DictWriter(stream, fieldnames=FIELDS).writeheader()
 
     def _load_seen(self) -> None:
         if self._loaded_existing:

@@ -139,6 +139,10 @@ class CandleCsvTests(unittest.TestCase):
         with TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "data" / "candles.csv"
             store = CsvCandleStore(path)
+            self.assertEqual(
+                path.read_text(encoding="utf-8").splitlines()[0],
+                "pair,time,open,high,low,close",
+            )
             candle = Candle(100, 1.0, 1.2, 0.9, 1.1)
             store.append("PAIR", candle)
             store.append("PAIR", candle)
