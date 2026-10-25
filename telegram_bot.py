@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Mapping
 from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import config
 from notifications import TelegramNotifier, TelegramSendError, format_signal_message
@@ -21,6 +22,15 @@ from strategy.pullback_reversal import Signal
 from subscriber_store import SubscriberStore
 
 logger = logging.getLogger("gbot.telegram")
+
+def configured_timezone() -> ZoneInfo:
+    name = os.environ.get("TIMEZONE", "Africa/Lagos").strip() or "Africa/Lagos"
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        logger.warning("TIMEZONE is invalid; using Africa/Lagos.")
+        return ZoneInfo("Africa/Lagos")
+
 
 PUBLIC_COMMANDS = [
     {"command": "start", "description": "Start receiving signals"},
@@ -45,6 +55,7 @@ ADMIN_ONLY_COMMANDS = {
     "subscribers",
     "testsignal",
 }
+COMMAND_REPLY_COOLDOWN_SECONDS = 20.0
 
 
 class TelegramBotClient:
@@ -204,6 +215,7 @@ class TelegramCommandHandler:
         admin_chat_id: int | str | None = None,
         started_at: float | None = None,
         test_signal_provider: Callable[[], Awaitable[list[str]]] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.client = client
         self.subscribers = subscribers
@@ -217,6 +229,48 @@ class TelegramCommandHandler:
         self.admin_chat_id = admin_chat_id
         self.started_at = started_at or time.monotonic()
         self.test_signal_provider = test_signal_provider
+        self._clock = clock
+        self._last_command_reply_at: dict[tuple[str, str], float] = {}
+        self._last_reply_text: dict[str, str] = {}
+
+    async def _send_command_reply(
+        self,
+        chat_id: int | str,
+        text: str,
+        *,
+        command: str,
+        reply_markup: Mapping[str, Any] | None = None,
+        parse_mode: str | None = "HTML",
+    ) -> bool:
+        chat_key = str(chat_id)
+        command_key = (chat_key, command)
+        now = self._clock()
+        last_sent = self._last_command_reply_at.get(command_key)
+        if last_sent is not None and now - last_sent < COMMAND_REPLY_COOLDOWN_SECONDS:
+            return False
+        if self._last_reply_text.get(chat_key) == text:
+            return False
+        await self.client.send_message(
+            chat_id,
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
+        self._last_command_reply_at[command_key] = now
+        self._last_reply_text[chat_key] = text
+        return True
+
+    @staticmethod
+    def _update_command(update: Mapping[str, Any]) -> str:
+        callback = update.get("callback_query")
+        if isinstance(callback, Mapping):
+            return str(callback.get("data", "command")).removeprefix("signals:")
+        message = update.get("message")
+        if isinstance(message, Mapping):
+            text = message.get("text")
+            if isinstance(text, str) and text.startswith("/"):
+                return text.split(maxsplit=1)[0][1:].split("@", 1)[0].lower()
+        return "command"
 
     @staticmethod
     def _valid_referral(link: str | None) -> str | None:
@@ -240,8 +294,10 @@ class TelegramCommandHandler:
             chat_id = self._update_chat_id(update)
             if chat_id is not None:
                 try:
-                    await self.client.send_message(
-                        chat_id, "Sorry, that request could not be completed. Try again."
+                    await self._send_command_reply(
+                        chat_id,
+                        "Sorry, that request could not be completed. Try again.",
+                        command=self._update_command(update),
                     )
                 except TelegramSendError:
                     logger.warning("Could not send a Telegram command error response.")
@@ -310,28 +366,30 @@ class TelegramCommandHandler:
                 changed = await asyncio.to_thread(
                     self.subscribers.set_subscribed, chat_id, True
                 )
-                await self.client.send_message(
+                await self._send_command_reply(
                     chat_id,
                     "Signals are on for this chat"
                     if changed
                     else "Signals are already on",
+                    command="start",
                     reply_markup=self._keyboard(chat_id),
                 )
             elif command == "stop":
                 changed = await asyncio.to_thread(
                     self.subscribers.set_subscribed, chat_id, False
                 )
-                await self.client.send_message(
+                await self._send_command_reply(
                     chat_id,
                     "Signals are off"
                     if changed
                     else "Signals are already off",
+                    command="stop",
                     reply_markup=self._keyboard(chat_id),
                 )
             elif command == "status":
                 await self._status_reply(chat_id)
             elif command == "help":
-                await self.client.send_message(
+                await self._send_command_reply(
                     chat_id,
                     "How GBot works. /start begins your signals, /stop pauses them. "
                     "Each signal shows the asset (named as in Pocket Option), "
@@ -339,6 +397,7 @@ class TelegramCommandHandler:
                     "Pocket Option and place the trade quickly. Strength shows how "
                     "strong the setup is; it is not a guarantee. Signals are not "
                     "financial advice. Trading is risky.",
+                    command="help",
                 )
             else:
                 await self._register_reply(chat_id)
@@ -353,7 +412,9 @@ class TelegramCommandHandler:
             ):
                 return
             if command in {"admin", "health"}:
-                await self.client.send_message(chat_id, self._admin_report())
+                await self._send_command_reply(
+                    chat_id, self._admin_report(), command=command
+                )
             elif command == "pause":
                 pause = getattr(self.scanner, "pause", None)
                 if callable(pause):
@@ -361,7 +422,7 @@ class TelegramCommandHandler:
                     text = "Signal scanning is paused."
                 else:
                     text = "Signal scanning is unavailable."
-                await self.client.send_message(chat_id, text)
+                await self._send_command_reply(chat_id, text, command="pause")
             elif command == "resume":
                 resume = getattr(self.scanner, "resume", None)
                 if callable(resume):
@@ -369,7 +430,7 @@ class TelegramCommandHandler:
                     text = "Signal scanning has resumed."
                 else:
                     text = "Signal scanning is unavailable."
-                await self.client.send_message(chat_id, text)
+                await self._send_command_reply(chat_id, text, command="resume")
             elif command == "subscribers":
                 chat_ids = await asyncio.to_thread(
                     self.subscribers.subscribed_chat_ids
@@ -384,20 +445,30 @@ class TelegramCommandHandler:
                 )
                 if len(text) > 3900:
                     text = text[:3890] + "\n…"
-                await self.client.send_message(chat_id, text, parse_mode=None)
+                await self._send_command_reply(
+                    chat_id, text, command="subscribers", parse_mode=None
+                )
             elif command == "testsignal":
                 if self.test_signal_provider is None:
-                    await self.client.send_message(
-                        chat_id, "Live test-signal pipeline is unavailable."
+                    await self._send_command_reply(
+                        chat_id,
+                        "Live test-signal pipeline is unavailable.",
+                        command="testsignal",
                     )
                     return
-                for message in await self.test_signal_provider():
-                    await self.client.send_message(
-                        self.admin_chat_id, message, parse_mode=None
+                messages = await self.test_signal_provider()
+                if messages:
+                    await self._send_command_reply(
+                        self.admin_chat_id,
+                        "\n\n".join(messages),
+                        command="testsignal",
+                        parse_mode=None,
                     )
             return
 
-        await self.client.send_message(chat_id, "Unknown command. Use /help.")
+        await self._send_command_reply(
+            chat_id, "Unknown command. Use /help.", command=command
+        )
 
     def _keyboard(self, chat_id: int) -> dict[str, Any]:
         rows: list[list[dict[str, str]]] = []
@@ -429,30 +500,40 @@ class TelegramCommandHandler:
                 "The Pocket Option account link is not configured. "
                 "Already have an account? Tap Start signals."
             )
-        await self.client.send_message(
+        await self._send_command_reply(
             chat_id,
             text,
+            command="register",
             reply_markup=self._keyboard(chat_id),
         )
 
     async def _status_reply(self, chat_id: int) -> None:
         subscriber = self.subscribers.subscribers.get(chat_id)
         subscribed = bool(subscriber and subscriber.subscribed)
-        if bool(getattr(self.scanner, "is_paused", False)):
-            scanner_status = "paused"
-        else:
-            scanner_status = "running" if self.scanner_running() else "stopped"
-        age = getattr(self.scanner, "last_tick_age_seconds", None)
-        age_text = "n/a" if age is None else f"{age:.1f}s"
-        pair_count = len(getattr(self.scanner, "pairs", {}))
-        await self.client.send_message(
+        scanner_status = self._scanner_status()
+        await self._send_command_reply(
             chat_id,
-            f"Subscribed: {'yes' if subscribed else 'no'}\n"
-            f"Scanner: {scanner_status} (last tick age: {age_text})\n"
-            f"Minimum payout: {config.MIN_PAYOUT}%\n"
-            f"OTC pairs scanned: {pair_count}",
+            f"Signals: {'on' if subscribed else 'off'}\n"
+            f"Scanner: {scanner_status}\n"
+            f"Minimum payout: {config.MIN_PAYOUT}%",
+            command="status",
             reply_markup=self._keyboard(chat_id),
         )
+
+    def _scanner_status(self) -> str:
+        if bool(getattr(self.scanner, "is_paused", False)):
+            return "Starting, waiting for first prices"
+        age = getattr(self.scanner, "last_tick_age_seconds", None)
+        broker = getattr(self.scanner, "broker", None)
+        connected_value = getattr(broker, "is_connected", False)
+        connected = bool(
+            connected_value() if callable(connected_value) else connected_value
+        )
+        if connected and age is not None and age <= config.WATCHDOG_TICK_MAX_AGE_SECONDS:
+            return "Live"
+        if age is None:
+            return "Starting, waiting for first prices"
+        return "Reconnecting"
 
     def admin_metrics(self) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
@@ -521,7 +602,14 @@ class TelegramCommandHandler:
             if cancelled
             else "none"
         )
-        last_signal_time = metrics["last_signal_time"] or "n/a"
+        last_signal_time = metrics["last_signal_time"]
+        if last_signal_time:
+            parsed_time = datetime.fromisoformat(last_signal_time).astimezone(
+                configured_timezone()
+            )
+            last_signal_time = parsed_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+        else:
+            last_signal_time = "n/a"
         return (
             f"Feed: {metrics['feed_status']}\n"
             f"SSID: {'configured' if os.environ.get('PO_SSID', '').strip() else 'missing'}\n"

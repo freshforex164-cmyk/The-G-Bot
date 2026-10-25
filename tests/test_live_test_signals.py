@@ -95,11 +95,14 @@ class LiveTestSignalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Payout: 92% | Open: yes", message)
         self.assertIn("Expiry: 35s", message)
         self.assertIn(
-            f"Snapshot: {snapshot.captured_at.strftime('%H:%M:%S')} UTC",
+            "Snapshot: "
+            + snapshot.captured_at.astimezone(
+                main.configured_timezone()
+            ).strftime("%H:%M:%S %Z"),
             message,
         )
 
-    async def test_no_match_message_includes_count_and_utc_snapshot_time(self):
+    async def test_no_match_returns_no_user_facing_message(self):
         snapshot = SimpleNamespace(
             otc_pair_count=5,
             captured_at=datetime(2026, 10, 24, 12, 34, 56, tzinfo=timezone.utc),
@@ -111,10 +114,7 @@ class LiveTestSignalTests(unittest.IsolatedAsyncioTestCase):
 
         messages = await main._live_test_signal_messages(NoMatchScanner())
 
-        self.assertEqual(
-            messages,
-            ["No live setup right now. Checked 5 OTC pairs at 12:34:56 UTC."],
-        )
+        self.assertEqual(messages, [])
 
 
 if __name__ == "__main__":

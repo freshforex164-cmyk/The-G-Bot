@@ -68,6 +68,7 @@ from telegram_bot import (
     TelegramBotClient,
     TelegramCommandHandler,
     TelegramPollingService,
+    configured_timezone,
 )
 
 logger = logging.getLogger("gbot")
@@ -954,6 +955,9 @@ async def run_explain(*, pair: str | None = None, seconds: int = 30) -> bool:
 
 def _format_live_test_signal(candidate: Any, snapshot_time: datetime) -> str:
     signal = candidate.signal
+    if snapshot_time.tzinfo is None:
+        snapshot_time = snapshot_time.replace(tzinfo=timezone.utc)
+    local_snapshot = snapshot_time.astimezone(configured_timezone())
     return (
         "TEST - not a confirmed signal\n"
         f"{signal.direction} {candidate.asset.display_name}\n"
@@ -961,20 +965,16 @@ def _format_live_test_signal(candidate: Any, snapshot_time: datetime) -> str:
         f"Payout: {candidate.asset.payout:g}% | Open: yes\n"
         f"Strength: {signal.strength} | "
         f"Expiry: {signal.recommended_expiry_seconds}s\n"
-        f"Snapshot: {snapshot_time.strftime('%H:%M:%S')} UTC"
+        f"Snapshot: {local_snapshot.strftime('%H:%M:%S %Z')}"
     )
 
 
 async def _live_test_signal_messages(scanner: SignalScanner) -> list[str]:
-    snapshot, candidates = await scanner.live_test_candidates()
+    _snapshot, candidates = await scanner.live_test_candidates()
     if not candidates:
-        return [
-            "No live setup right now. "
-            f"Checked {snapshot.otc_pair_count} OTC pairs at "
-            f"{snapshot.captured_at.strftime('%H:%M:%S')} UTC."
-        ]
+        return []
     return [
-        _format_live_test_signal(candidate, snapshot.captured_at)
+        _format_live_test_signal(candidate, _snapshot.captured_at)
         for candidate in candidates[:3]
     ]
 

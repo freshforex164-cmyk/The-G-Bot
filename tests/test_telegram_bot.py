@@ -7,6 +7,7 @@ from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from tempfile import TemporaryDirectory
 from pathlib import Path
+from types import SimpleNamespace
 
 import config
 from notifications import TelegramSendError
@@ -66,6 +67,7 @@ def message_update(
 class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temp_dir = TemporaryDirectory()
+        self.now = 100.0
         self.store = SubscriberStore(
             database_url="",
             file_path=Path(self.temp_dir.name) / "subscribers.json",
@@ -78,6 +80,7 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
             admin_chat_id=-100900,
             referral_link="https://example.test/join?src=gbot&tag=one",
             scanner_running=lambda: True,
+            clock=lambda: self.now,
         )
 
     async def asyncTearDown(self) -> None:
@@ -96,6 +99,7 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_start_again_is_idempotent_and_does_not_repeat_welcome(self) -> None:
         await self.handler.handle_update(message_update("/start"))
+        self.now += 21
         await self.handler.handle_update(message_update("/start"))
         self.assertEqual(self.store.subscribed_chat_ids(), [101])
         self.assertEqual(self.client.messages[-1][1], "Signals are already on")
@@ -114,16 +118,47 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
             ["Start signals", "Register"],
         )
         await self.handler.handle_update(message_update("/status"))
-        self.assertIn("Signals: off", self.client.messages[-1][1])
-        self.assertIn("Scanner: running", self.client.messages[-1][1])
-        self.assertIn(f"Minimum payout: {config.MIN_PAYOUT}%", self.client.messages[-1][1])
+        text = self.client.messages[-1][1]
+        self.assertIn("Signals: off", text)
+        self.assertIn("Scanner: Starting, waiting for first prices", text)
+        self.assertIn(f"Minimum payout: {config.MIN_PAYOUT}%", text)
+        self.assertNotIn("n/a", text)
+        self.assertNotIn("UTC", text)
+        self.assertNotIn("OTC pairs", text)
+        self.assertNotIn("Subscribers:", text)
 
     async def test_stop_again_is_idempotent(self) -> None:
         await self.handler.handle_update(message_update("/stop"))
         self.assertEqual(self.client.messages[-1][1], "Signals are off")
+        self.now += 21
         await self.handler.handle_update(message_update("/stop"))
         self.assertEqual(self.client.messages[-1][1], "Signals are already off")
         self.assertEqual(self.store.subscribed_chat_ids(), [])
+
+    async def test_status_reports_live_when_connected_and_receiving_fresh_ticks(self):
+        self.handler.scanner = SimpleNamespace(
+            is_paused=False,
+            last_tick_age_seconds=0.5,
+            broker=SimpleNamespace(is_connected=True),
+        )
+        await self.handler.handle_update(message_update("/status"))
+        self.assertIn("Scanner: Live", self.client.messages[-1][1])
+
+    async def test_status_command_cooldown_and_duplicate_message_suppression(self):
+        await self.handler.handle_update(message_update("/status"))
+        self.assertEqual(len(self.client.messages), 1)
+        await self.handler.handle_update(message_update("/status"))
+        self.assertEqual(len(self.client.messages), 1)
+
+        self.now += 21
+        self.store.set_subscribed(101, True)
+        await self.handler.handle_update(message_update("/status"))
+        self.assertEqual(len(self.client.messages), 2)
+        self.assertIn("Signals: on", self.client.messages[-1][1])
+
+        self.now += 21
+        await self.handler.handle_update(message_update("/status"))
+        self.assertEqual(len(self.client.messages), 2)
 
     async def test_register_injects_referral_link_and_start_button(self) -> None:
         await self.handler.handle_update(message_update("/register"))
@@ -174,7 +209,7 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
         report = self.client.messages[-1][1]
         self.assertIn("Subscribers: 0", report)
         self.assertIn("Signals today: 0", report)
-        self.assertIn("Paper win rate", report)
+        self.assertIn("Pairs streaming: 0", report)
         self.assertIn("Tick-to-signal latency", report)
         self.assertIn("Signal-to-Telegram latency", report)
         self.assertIn("SSID:", report)
