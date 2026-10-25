@@ -198,11 +198,14 @@ class SignalScanner:
         )
         now = datetime.now(timezone.utc)
         now_monotonic = time.monotonic()
+        # The scanner's already-capped active pair map is the source of truth.
+        # Refresh metadata for those symbols without selecting a second list.
         eligible = {
-            asset.symbol: asset
-            for asset in eligible_assets(
-                snapshot.assets, config.MIN_PAYOUT, config.MAX_SCAN_PAIRS
-            )
+            pair: asset
+            for pair in self.pairs
+            if (asset := snapshot.assets.get(pair)) is not None
+            and asset.is_open
+            and asset.payout >= config.MIN_PAYOUT
         }
         candidates: list[LiveTestCandidate] = []
         seen_pairs: set[str] = set()

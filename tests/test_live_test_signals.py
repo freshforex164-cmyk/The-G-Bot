@@ -83,6 +83,15 @@ class LiveTestSignalTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(candidates[0].asset.is_open)
         self.assertEqual(candidates[0].live_price, 100.25)
 
+    async def test_test_signal_only_uses_the_scanners_selected_pair_list(self):
+        scanner = SignalScanner(SnapshotBroker(), output=lambda _line: None)
+        add_signal(scanner, "OPEN_otc")
+        scanner.pairs.clear()
+
+        _snapshot, candidates = await scanner.live_test_candidates()
+
+        self.assertEqual(candidates, [])
+
     async def test_test_message_uses_snapshot_payout_open_state_and_live_price(self):
         scanner = SignalScanner(SnapshotBroker(), output=lambda _line: None)
         add_signal(scanner, "OPEN_otc")

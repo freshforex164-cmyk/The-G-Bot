@@ -3,9 +3,21 @@
 import json
 import os
 
+
+def _positive_int_setting(name: str, default: int) -> int:
+    raw_value = os.environ.get(name, str(default)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError:
+        raise ValueError(f"{name} must be a positive integer.") from None
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer.")
+    return value
+
+
 MIN_PAYOUT_OPTIONS = (80, 85, 88, 92)
 MIN_PAYOUT = 80
-MAX_SCAN_PAIRS = 20
+MAX_SCAN_PAIRS = _positive_int_setting("MAX_SCAN_PAIRS", 20)
 PAYOUT_REFRESH_SECONDS = 60
 MAX_ACTIVE_SIGNALS = 5
 RECOMMENDED_EXPIRY_SECONDS = 35

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
+import config
 from market_assets import eligible_assets, normalize_assets
 
 
@@ -31,6 +33,18 @@ class MarketAssetTests(unittest.TestCase):
         )
         selected = eligible_assets(assets, 80, 20)
         self.assertEqual([item.symbol for item in selected], ["OPEN_otc"])
+
+    def test_scan_pair_cap_is_configurable_and_defaults_to_twenty(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(config._positive_int_setting("MAX_SCAN_PAIRS", 20), 20)
+        with patch.dict("os.environ", {"MAX_SCAN_PAIRS": "40"}, clear=True):
+            self.assertEqual(config._positive_int_setting("MAX_SCAN_PAIRS", 20), 40)
+        for invalid in ("0", "-1", "many"):
+            with self.subTest(invalid=invalid), patch.dict(
+                "os.environ", {"MAX_SCAN_PAIRS": invalid}, clear=True
+            ):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    config._positive_int_setting("MAX_SCAN_PAIRS", 20)
 
 
 if __name__ == "__main__":

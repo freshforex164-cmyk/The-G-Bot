@@ -645,6 +645,7 @@ async def run_serve() -> None:
             "ok": True,
             "scanner": scanner_status,
             "feed_connected": broker_connected(),
+            "pairs_scanning": len(scanner.pairs),
         }
 
     def admin_status() -> dict[str, Any]:

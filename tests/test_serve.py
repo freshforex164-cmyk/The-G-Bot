@@ -182,6 +182,7 @@ class ServeTests(unittest.IsolatedAsyncioTestCase):
             health = instances["http"].health_provider()
             admin_status = instances["http"].admin_provider()
             self.assertEqual(health["scanner"], "running")
+            self.assertEqual(health["pairs_scanning"], 0)
             self.assertEqual(instances["http"].admin_token, "mock-admin-token")
             self.assertEqual(admin_status["subscriber_count"], 0)
             self.assertEqual(instances["scanner"].assert_minutes, None)

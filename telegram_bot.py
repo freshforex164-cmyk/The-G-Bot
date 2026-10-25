@@ -523,6 +523,8 @@ class TelegramCommandHandler:
     def _scanner_status(self) -> str:
         if bool(getattr(self.scanner, "is_paused", False)):
             return "Starting, waiting for first prices"
+        if not getattr(self.scanner, "pairs", {}):
+            return "Starting, waiting for first prices"
         age = getattr(self.scanner, "last_tick_age_seconds", None)
         broker = getattr(self.scanner, "broker", None)
         connected_value = getattr(broker, "is_connected", False)
