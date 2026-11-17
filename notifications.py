@@ -7,36 +7,30 @@ import html
 import json
 import logging
 import os
-import time
 import urllib.error
 import urllib.request
-from collections import deque
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from typing import Protocol
 
-import config
-from strategy.pullback_reversal import Signal
+from strategy.model import Signal
+from strategy.price_action import SETUP_LABELS
 
 logger = logging.getLogger("gbot.notifications")
-
-
-def _expiry_label(seconds: int) -> str:
-    if seconds % 60 == 0:
-        return f"{seconds // 60}m"
-    return f"{seconds}s"
 
 
 def format_signal_message(signal: Signal) -> str:
     direction = html.escape(signal.direction.upper(), quote=False)
     icon = "🔴" if direction == "SELL" else "🟢"
-    asset_name = html.escape(signal.asset_name or "Unknown asset", quote=False)
+    asset_name = html.escape(signal.asset_name, quote=False)
+    setup = html.escape(SETUP_LABELS[signal.setup], quote=False)
+    payout = f"\nPayout: {signal.payout:g}%" if signal.payout is not None else ""
     return (
         f"{icon} <b>{direction}</b>\n"
         f"Asset: {asset_name}\n"
-        f"Payout: {signal.payout:g}%\n"
-        f"Strength: {signal.strength}\n"
-        f"Expiration: <b>{_expiry_label(signal.recommended_expiry_seconds)}</b>"
+        f"Setup: {setup}\n"
+        f"Expiry: 1 minute{payout}\n"
+        "Valid for: 10 seconds"
     )
 
 
@@ -260,28 +254,19 @@ def build_notifier(
 
 
 class NotificationQueue:
-    """Nonblocking scanner-facing queue with freshness and rate controls."""
+    """Nonblocking queue that drops signals after the 10-second send window."""
 
     def __init__(
         self,
         notifier: Notifier,
         *,
-        min_strength: int = config.MIN_NOTIFY_STRENGTH,
-        max_per_minute: int = config.MAX_NOTIFICATIONS_PER_MINUTE,
-        valid_seconds: int = config.SIGNAL_VALID_SECONDS,
-        batch_window_seconds: float = 0.05,
-        pre_send: Callable[[Signal], Awaitable[bool]] | None = None,
+        max_age_seconds: int = 10,
     ) -> None:
-        if max_per_minute <= 0 or valid_seconds <= 0:
-            raise ValueError("notification limits must be greater than zero")
+        if max_age_seconds <= 0:
+            raise ValueError("max_age_seconds must be greater than zero")
         self.notifier = notifier
-        self.min_strength = min_strength
-        self.max_per_minute = max_per_minute
-        self.valid_seconds = valid_seconds
-        self.batch_window_seconds = batch_window_seconds
-        self.pre_send = pre_send
+        self.max_age_seconds = max_age_seconds
         self._pending: list[Signal] = []
-        self._sent_at: deque[float] = deque()
         self._wake = asyncio.Event()
         self._worker: asyncio.Task[None] | None = None
         self._closing = False
@@ -293,47 +278,25 @@ class NotificationQueue:
             )
 
     def enqueue(self, signal: Signal) -> None:
-        if self._closing or signal.status != "ACTIVE":
-            return
-        if signal.strength < self.min_strength:
-            logger.info(
-                "Notification below minimum strength was dropped (strength=%d).",
-                signal.strength,
-            )
+        if self._closing:
             return
         if self._is_stale(signal, datetime.now(timezone.utc)):
             logger.info("Expired queued notification was dropped.")
             return
         self._pending.append(signal)
-        if len(self._pending) > self.max_per_minute:
-            self._pending.sort(key=lambda item: (-item.strength, item.time))
-            dropped = len(self._pending) - self.max_per_minute
-            self._pending = self._pending[: self.max_per_minute]
-            logger.info(
-                "Dropped %d lowest-strength queued notifications at the "
-                "per-minute limit.",
-                dropped,
-            )
         self._wake.set()
 
     def _is_stale(self, signal: Signal, now: datetime) -> bool:
-        if signal.valid_until is not None:
-            return signal.valid_until <= now
-        return (now - signal.time).total_seconds() > self.valid_seconds
-
-    def _prune_stale(self) -> None:
-        now = datetime.now(timezone.utc)
-        fresh = [
-            signal for signal in self._pending if not self._is_stale(signal, now)
-        ]
-        dropped = len(self._pending) - len(fresh)
-        self._pending = fresh
-        if dropped:
-            logger.info("Dropped %d stale queued notifications.", dropped)
-
-    def _prune_rate_window(self, now: float) -> None:
-        while self._sent_at and now - self._sent_at[0] >= 60.0:
-            self._sent_at.popleft()
+        signal_time = signal.time
+        if signal_time.tzinfo is None:
+            signal_time = signal_time.replace(tzinfo=timezone.utc)
+        return (
+            (now - signal_time).total_seconds() > self.max_age_seconds
+            or (
+                signal.valid_until is not None
+                and signal.valid_until <= now
+            )
+        )
 
     async def _wait_for_wake(self, timeout: float | None = None) -> None:
         self._wake.clear()
@@ -346,69 +309,20 @@ class NotificationQueue:
             pass
 
     async def _run(self) -> None:
-        while True:
+        while self._pending or not self._closing:
             if not self._pending:
-                if self._closing:
-                    return
                 await self._wait_for_wake()
                 continue
-
-            if self.batch_window_seconds:
-                await asyncio.sleep(self.batch_window_seconds)
-            self._prune_stale()
-            if not self._pending:
+            signal = self._pending.pop(0)
+            if self._is_stale(signal, datetime.now(timezone.utc)):
+                logger.info("Expired queued notification was dropped.")
                 continue
-
-            now = time.monotonic()
-            self._prune_rate_window(now)
-            available = self.max_per_minute - len(self._sent_at)
-            if available <= 0:
-                if self._closing:
-                    logger.info(
-                        "Dropped %d queued notifications during shutdown.",
-                        len(self._pending),
-                    )
-                    self._pending.clear()
-                    return
-                wait = self._sent_at[0] + 60.0 - now
-                await self._wait_for_wake(wait)
-                continue
-
-            self._pending.sort(key=lambda item: (-item.strength, item.time))
-            batch = self._pending[:available]
-            dropped = len(self._pending) - len(batch)
-            self._pending.clear()
-            if dropped:
-                logger.info(
-                    "Dropped %d lowest-strength notifications at the "
-                    "per-minute limit.",
-                    dropped,
-                )
-            for signal in batch:
-                if self._is_stale(signal, datetime.now(timezone.utc)):
-                    logger.info("Expired queued notification was dropped.")
-                    continue
-                if self.pre_send is not None:
-                    try:
-                        eligible = await self.pre_send(signal)
-                    except Exception as exc:
-                        logger.error(
-                            "Send-time signal validation failed (%s); signal dropped.",
-                            type(exc).__name__,
-                        )
-                        continue
-                    if not eligible:
-                        logger.info("Signal no longer meets send-time asset rules.")
-                        continue
-                self._sent_at.append(time.monotonic())
-                try:
-                    await self.notifier.send(signal)
-                except TelegramSendError as exc:
-                    logger.error("%s", exc)
-                except Exception as exc:
-                    logger.error(
-                        "Notification failed (%s).", type(exc).__name__
-                    )
+            try:
+                await self.notifier.send(signal)
+            except TelegramSendError as exc:
+                logger.error("%s", exc)
+            except Exception as exc:
+                logger.error("Notification failed (%s).", type(exc).__name__)
 
     async def close(self) -> None:
         self._closing = True

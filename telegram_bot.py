@@ -540,8 +540,8 @@ class TelegramCommandHandler:
         if asset is None:
             await self._show_categories(chat_id)
             return
-        activate = getattr(self.scanner, "activate_asset", None)
-        live = await activate(asset_id) if callable(activate) else None
+        select = getattr(self.scanner, "select_asset", None)
+        live = await select(chat_id, asset_id) if callable(select) else None
         if not live:
             await self._send_command_reply(
                 chat_id,
@@ -551,8 +551,6 @@ class TelegramCommandHandler:
             )
             await self._show_category(chat_id, str(CATEGORIES.index(asset.category)))
             return
-        selected_symbol = live.symbol
-        await asyncio.to_thread(self.subscribers.set_asset, chat_id, selected_symbol)
         payout = f"\nPayout: {live.payout:g}%" if live.payout is not None else ""
         await self._send_command_reply(
             chat_id,
@@ -783,12 +781,19 @@ class SubscriberFanoutNotifier:
 
     @staticmethod
     def _is_stale(signal: Signal) -> bool:
-        return signal.valid_until is not None and signal.valid_until <= datetime.now(
-            timezone.utc
+        signal_time = signal.time
+        if signal_time.tzinfo is None:
+            signal_time = signal_time.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return (
+            (now - signal_time).total_seconds() > 10
+            or (signal.valid_until is not None and signal.valid_until <= now)
         )
 
     async def send(self, signal: Signal) -> str:
-        chat_ids = await asyncio.to_thread(self.subscribers.subscribed_chat_ids)
+        chat_ids = await asyncio.to_thread(
+            self.subscribers.subscribed_chat_ids, signal.pair
+        )
         sent = 0
         text = format_signal_message(signal)
         for chat_id in chat_ids:
@@ -823,6 +828,17 @@ class SubscriberFanoutNotifier:
                     if exc.retry_after is not None:
                         if self._is_stale(signal):
                             logger.info("Signal expired while waiting for Telegram rate limit.")
+                            break
+                        signal_time = signal.time
+                        if signal_time.tzinfo is None:
+                            signal_time = signal_time.replace(tzinfo=timezone.utc)
+                        remaining = 10 - (
+                            datetime.now(timezone.utc) - signal_time
+                        ).total_seconds()
+                        if exc.retry_after >= remaining:
+                            logger.info(
+                                "Signal expired before Telegram's retry window."
+                            )
                             break
                         await self._sleep(max(0.1, float(exc.retry_after)))
                         failures += 1
