@@ -1,0 +1,64 @@
+{
+  "categories": [
+    {
+      "name": "Currencies",
+      "assets": [
+        {"id": "aed-cny", "name": "AED/CNY"},
+        {"id": "aud-cad", "name": "AUD/CAD"},
+        {"id": "aud-chf", "name": "AUD/CHF"},
+        {"id": "cad-chf", "name": "CAD/CHF"},
+        {"id": "cad-jpy", "name": "CAD/JPY"},
+        {"id": "chf-jpy", "name": "CHF/JPY"},
+        {"id": "eur-nzd", "name": "EUR/NZD"},
+        {"id": "gbp-usd", "name": "GBP/USD"},
+        {"id": "kes-usd", "name": "KES/USD"},
+        {"id": "mad-usd", "name": "MAD/USD"},
+        {"id": "ngn-usd", "name": "NGN/USD"},
+        {"id": "nzd-usd", "name": "NZD/USD"},
+        {"id": "qar-cny", "name": "QAR/CNY"},
+        {"id": "sar-cny", "name": "SAR/CNY"},
+        {"id": "usd-bdt", "name": "USD/BDT"},
+        {"id": "usd-clp", "name": "USD/CLP"},
+        {"id": "usd-inr", "name": "USD/INR"},
+        {"id": "usd-vnd", "name": "USD/VND"},
+        {"id": "yer-usd", "name": "YER/USD"},
+        {"id": "eur-usd", "name": "EUR/USD"},
+        {"id": "omr-cny", "name": "OMR/CNY"}
+      ]
+    },
+    {
+      "name": "Crypto",
+      "assets": [
+        {"id": "avalanche", "name": "Avalanche OTC", "aliases": ["Avalanche"]},
+        {"id": "dogecoin", "name": "Dogecoin OTC", "aliases": ["Dogecoin", "Doge"]},
+        {"id": "solana", "name": "Solana OTC"}
+      ]
+    },
+    {
+      "name": "Commodities",
+      "assets": [
+        {"id": "brent-oil", "name": "Brent Oil OTC", "aliases": ["Brent"]},
+        {"id": "wti-crude-oil", "name": "WTI Crude Oil OTC", "aliases": ["WTI", "Crude Oil"]},
+        {"id": "silver", "name": "Silver OTC"},
+        {"id": "gold", "name": "Gold OTC"}
+      ]
+    },
+    {
+      "name": "Stocks",
+      "assets": [
+        {"id": "american-express", "name": "American Express OTC", "aliases": ["American Express", "Amex"]},
+        {"id": "facebook-inc", "name": "Facebook Inc OTC", "aliases": ["Facebook", "Meta"]},
+        {"id": "johnson-johnson", "name": "Johnson & Johnson OTC", "aliases": ["Johnson Johnson", "J&J", "JNJ"]},
+        {"id": "mcdonalds", "name": "McDonald's OTC", "aliases": ["McDonald's", "McDonalds", "MCD"]}
+      ]
+    },
+    {
+      "name": "Indices",
+      "assets": [
+        {"id": "aus-200-otc", "name": "AUS 200 OTC", "aliases": ["AUS 200"]},
+        {"id": "100gbp", "name": "100GBP"},
+        {"id": "100gbp-otc", "name": "100GBP OTC"}
+      ]
+    }
+  ]
+}

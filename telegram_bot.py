@@ -17,8 +17,9 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import config
+from market_assets import CATALOG, CATALOG_BY_ID, CATEGORIES, CatalogAsset
 from notifications import TelegramNotifier, TelegramSendError, format_signal_message
-from strategy.pullback_reversal import Signal
+from strategy.model import Signal
 from subscriber_store import SubscriberStore
 
 logger = logging.getLogger("gbot.telegram")
@@ -33,11 +34,12 @@ def configured_timezone() -> ZoneInfo:
 
 
 PUBLIC_COMMANDS = [
-    {"command": "start", "description": "Start receiving signals"},
+    {"command": "start", "description": "Choose an asset"},
     {"command": "stop", "description": "Stop receiving signals"},
     {"command": "register", "description": "Pocket Option account information"},
     {"command": "status", "description": "Check your signal status"},
     {"command": "help", "description": "How GBot works"},
+    {"command": "pricecheck", "description": "Check your selected asset price"},
 ]
 ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     {"command": "admin", "description": "Check signal stats"},
@@ -241,14 +243,15 @@ class TelegramCommandHandler:
         command: str,
         reply_markup: Mapping[str, Any] | None = None,
         parse_mode: str | None = "HTML",
+        force: bool = False,
     ) -> bool:
         chat_key = str(chat_id)
         command_key = (chat_key, command)
         now = self._clock()
         last_sent = self._last_command_reply_at.get(command_key)
-        if last_sent is not None and now - last_sent < COMMAND_REPLY_COOLDOWN_SECONDS:
+        if not force and last_sent is not None and now - last_sent < COMMAND_REPLY_COOLDOWN_SECONDS:
             return False
-        if self._last_reply_text.get(chat_key) == text:
+        if not force and self._last_reply_text.get(chat_key) == text:
             return False
         await self.client.send_message(
             chat_id,
@@ -332,12 +335,16 @@ class TelegramCommandHandler:
             chat_id = self._update_chat_id(update)
             if callback_id is not None:
                 await self.client.answer_callback(str(callback_id))
-            if chat_id is not None and data in {
-                "signals:start",
-                "signals:stop",
-                "signals:status",
-                "signals:register",
-            }:
+            if chat_id is not None and data.startswith("assetcat:"):
+                await self._show_category(chat_id, data.split(":", 1)[1])
+                return
+            if chat_id is not None and data == "assetback":
+                await self._show_categories(chat_id)
+                return
+            if chat_id is not None and data.startswith("asset:"):
+                await self._select_asset(chat_id, data.split(":", 1)[1])
+                return
+            if chat_id is not None and data.startswith("signals:"):
                 await self._dispatch(data.removeprefix("signals:"), chat_id)
             return
 
@@ -361,19 +368,9 @@ class TelegramCommandHandler:
     async def _dispatch(
         self, command: str, chat_id: int, *, sender_id: int | None = None
     ) -> None:
-        if command in {"start", "stop", "status", "help", "register"}:
+        if command in {"start", "stop", "status", "help", "register", "pricecheck"}:
             if command == "start":
-                changed = await asyncio.to_thread(
-                    self.subscribers.set_subscribed, chat_id, True
-                )
-                await self._send_command_reply(
-                    chat_id,
-                    "Signals are on for this chat"
-                    if changed
-                    else "Signals are already on",
-                    command="start",
-                    reply_markup=self._keyboard(chat_id),
-                )
+                await self._show_categories(chat_id)
             elif command == "stop":
                 changed = await asyncio.to_thread(
                     self.subscribers.set_subscribed, chat_id, False
@@ -385,20 +382,22 @@ class TelegramCommandHandler:
                     else "Signals are already off",
                     command="stop",
                     reply_markup=self._keyboard(chat_id),
+                    force=True,
                 )
             elif command == "status":
                 await self._status_reply(chat_id)
             elif command == "help":
                 await self._send_command_reply(
                     chat_id,
-                    "How GBot works. /start begins your signals, /stop pauses them. "
-                    "Each signal shows the asset (named as in Pocket Option), "
-                    "direction, payout, strength and expiration. Open the asset in "
-                    "Pocket Option and place the trade quickly. Strength shows how "
-                    "strong the setup is; it is not a guarantee. Signals are not "
-                    "financial advice. Trading is risky.",
+                    "GBot reports informational price-action signals from closed "
+                    "1-minute candles. Use /start to choose one asset, /status to "
+                    "check your selection, /pricecheck for its latest price, and "
+                    "/stop to stop receiving signals. GBot never places trades.",
                     command="help",
+                    force=True,
                 )
+            elif command == "pricecheck":
+                await self._pricecheck_reply(chat_id)
             else:
                 await self._register_reply(chat_id)
             return
@@ -489,6 +488,116 @@ class TelegramCommandHandler:
             )
         return {"inline_keyboard": rows}
 
+    @staticmethod
+    def _categories_keyboard() -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [{"text": category, "callback_data": f"assetcat:{index}"}]
+                for index, category in enumerate(CATEGORIES)
+            ]
+        }
+
+    def _asset_matches(self) -> dict[str, Any]:
+        return getattr(self.scanner, "asset_matches", {}) if self.scanner else {}
+
+    async def _show_categories(self, chat_id: int) -> None:
+        await self._send_command_reply(
+            chat_id,
+            "Choose an asset category:",
+            command="start",
+            reply_markup=self._categories_keyboard(),
+            force=True,
+        )
+
+    async def _show_category(self, chat_id: int, index_text: str) -> None:
+        try:
+            category = CATEGORIES[int(index_text)]
+        except (ValueError, IndexError):
+            await self._show_categories(chat_id)
+            return
+        matches = self._asset_matches()
+        assets = [item for item in CATALOG if item.category == category]
+        buttons: list[dict[str, str]] = []
+        for item in assets:
+            live = matches.get(item.id)
+            label = item.name
+            payout = getattr(live, "payout", None)
+            if payout is not None:
+                label += f" · {payout:g}%"
+            buttons.append({"text": label, "callback_data": f"asset:{item.id}"})
+        rows = [buttons[offset : offset + 2] for offset in range(0, len(buttons), 2)]
+        rows.append([{"text": "Back", "callback_data": "assetback"}])
+        await self._send_command_reply(
+            chat_id,
+            f"{category} — choose an asset:",
+            command=f"category-{index_text}",
+            reply_markup={"inline_keyboard": rows},
+            force=True,
+        )
+
+    async def _select_asset(self, chat_id: int, asset_id: str) -> None:
+        asset = CATALOG_BY_ID.get(asset_id)
+        if asset is None:
+            await self._show_categories(chat_id)
+            return
+        activate = getattr(self.scanner, "activate_asset", None)
+        live = await activate(asset_id) if callable(activate) else None
+        if not live:
+            await self._send_command_reply(
+                chat_id,
+                f"{asset.name} isn't available right now. Pick another asset.",
+                command=f"asset-{asset_id}",
+                force=True,
+            )
+            await self._show_category(chat_id, str(CATEGORIES.index(asset.category)))
+            return
+        selected_symbol = live.symbol
+        await asyncio.to_thread(self.subscribers.set_asset, chat_id, selected_symbol)
+        payout = f"\nPayout: {live.payout:g}%" if live.payout is not None else ""
+        await self._send_command_reply(
+            chat_id,
+            f"Selected {asset.name}. Signals for this asset are on for this chat."
+            f"{payout}",
+            command=f"asset-{asset_id}",
+            reply_markup=self._keyboard(chat_id),
+            force=True,
+        )
+
+    async def _pricecheck_reply(self, chat_id: int) -> None:
+        subscriber = self.subscribers.subscribers.get(chat_id)
+        selected = getattr(subscriber, "selected_asset", None)
+        getter = getattr(self.scanner, "price_for_symbol", None)
+        price = getter(selected) if selected and callable(getter) else None
+        if price is None:
+            name = next(
+                (
+                    item.name
+                    for item in CATALOG
+                    if any(
+                        getattr(asset, "symbol", None) == selected
+                        for asset in self._asset_matches().values()
+                    )
+                    and selected
+                ),
+                "Your selected asset",
+            )
+            await self._send_command_reply(
+                chat_id,
+                f"{name} isn't available right now. Pick another asset.",
+                command="pricecheck",
+                reply_markup=self._categories_keyboard(),
+                force=True,
+            )
+            return
+        symbol, value, timestamp = price
+        await self._send_command_reply(
+            chat_id,
+            f"{html.escape(symbol)}: {value:g} at "
+            f"{timestamp.astimezone(configured_timezone()).strftime('%Y-%m-%d %H:%M:%S %Z')}",
+            command="pricecheck",
+            force=True,
+        )
+
     async def _register_reply(self, chat_id: int) -> None:
         if self.referral_link:
             text = (
@@ -515,9 +624,23 @@ class TelegramCommandHandler:
             chat_id,
             f"Signals: {'on' if subscribed else 'off'}\n"
             f"Scanner: {scanner_status}\n"
-            f"Minimum payout: {config.MIN_PAYOUT}%",
+            f"Asset: {self._asset_name(subscriber)}",
             command="status",
             reply_markup=self._keyboard(chat_id),
+            force=True,
+        )
+
+    def _asset_name(self, subscriber: Any) -> str:
+        symbol = getattr(subscriber, "selected_asset", None)
+        if not symbol:
+            return "not selected"
+        return next(
+            (
+                asset.display_name
+                for asset in self._asset_matches().values()
+                if asset.symbol == symbol
+            ),
+            symbol,
         )
 
     def _scanner_status(self) -> str:

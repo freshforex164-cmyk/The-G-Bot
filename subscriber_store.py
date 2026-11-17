@@ -23,6 +23,7 @@ class Subscriber:
     plan: str = "free"
     created_at: str = ""
     updated_at: str = ""
+    selected_asset: str | None = None
 
 
 class SubscriberStore:
@@ -80,13 +81,19 @@ class SubscriberStore:
                                 chat_id BIGINT PRIMARY KEY,
                                 subscribed BOOLEAN NOT NULL,
                                 plan TEXT NOT NULL DEFAULT 'free',
+                                selected_asset TEXT,
                                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                             )
                             """
                         )
+                        connection.execute(
+                            "ALTER TABLE subscribers ADD COLUMN IF NOT EXISTS "
+                            "selected_asset TEXT"
+                        )
                         cursor = connection.execute(
-                            "SELECT chat_id, subscribed, plan, created_at, updated_at "
+                            "SELECT chat_id, subscribed, plan, created_at, updated_at, "
+                            "selected_asset "
                             "FROM subscribers"
                         )
                         return cursor.fetchall()
@@ -99,6 +106,7 @@ class SubscriberStore:
                         plan=str(row[2] or "free"),
                         created_at=self._timestamp(row[3]),
                         updated_at=self._timestamp(row[4]),
+                        selected_asset=str(row[5]) if row[5] else None,
                     )
                     for row in rows
                 }
@@ -130,6 +138,11 @@ class SubscriberStore:
                     plan=str(row.get("plan", "free")),
                     created_at=str(row.get("created_at", "")),
                     updated_at=str(row.get("updated_at", "")),
+                    selected_asset=(
+                        str(row["selected_asset"])
+                        if row.get("selected_asset")
+                        else None
+                    ),
                 )
                 for row in rows
                 if isinstance(row, dict) and "chat_id" in row and "subscribed" in row
@@ -159,7 +172,41 @@ class SubscriberStore:
             plan=current.plan if current else "free",
             created_at=current.created_at if current and current.created_at else now,
             updated_at=now,
+            selected_asset=current.selected_asset if current else None,
         )
+        self.subscribers[chat_id] = record
+        if self._use_database:
+            try:
+                self._with_retry(lambda: self._upsert(record))
+                return True
+            except Exception as exc:
+                logger.warning(
+                    "Subscriber database write failed (%s); using JSON fallback.",
+                    type(exc).__name__,
+                )
+                self._use_database = False
+        self._write_file()
+        return True
+
+    def set_asset(self, chat_id: int, selected_asset: str) -> bool:
+        """Select one signal asset for a chat and enable its subscription."""
+        chat_id = int(chat_id)
+        current = self.subscribers.get(chat_id)
+        now = datetime.now(timezone.utc).isoformat()
+        record = Subscriber(
+            chat_id=chat_id,
+            subscribed=True,
+            plan=current.plan if current else "free",
+            created_at=current.created_at if current and current.created_at else now,
+            updated_at=now,
+            selected_asset=selected_asset,
+        )
+        if (
+            current is not None
+            and current.subscribed
+            and current.selected_asset == selected_asset
+        ):
+            return False
         self.subscribers[chat_id] = record
         if self._use_database:
             try:
@@ -178,14 +225,22 @@ class SubscriberStore:
         with self._connection() as connection:
             connection.execute(
                 """
-                INSERT INTO subscribers (chat_id, subscribed, plan, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, NOW())
+                INSERT INTO subscribers
+                    (chat_id, subscribed, plan, selected_asset, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
                 ON CONFLICT (chat_id) DO UPDATE SET
                     subscribed = EXCLUDED.subscribed,
                     plan = EXCLUDED.plan,
+                    selected_asset = EXCLUDED.selected_asset,
                     updated_at = NOW()
                 """,
-                (record.chat_id, record.subscribed, record.plan, record.created_at),
+                (
+                    record.chat_id,
+                    record.subscribed,
+                    record.plan,
+                    record.selected_asset,
+                    record.created_at,
+                ),
             )
 
     def _write_file(self) -> None:
@@ -208,11 +263,15 @@ class SubscriberStore:
                 type(exc).__name__,
             )
 
-    def subscribed_chat_ids(self) -> list[int]:
+    def subscribed_chat_ids(self, selected_asset: str | None = None) -> list[int]:
         return sorted(
             chat_id
             for chat_id, subscriber in self.subscribers.items()
             if subscriber.subscribed
+            and (
+                selected_asset is None
+                or subscriber.selected_asset == selected_asset
+            )
         )
 
     def count(self) -> int:

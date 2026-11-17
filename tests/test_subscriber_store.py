@@ -36,9 +36,7 @@ class FakeConnection:
 
 class SubscriberStoreTests(unittest.TestCase):
     def test_postgres_loads_table_and_persists_only_changed_subscription(self) -> None:
-        connection = FakeConnection(
-            [(123, True, "free", None, None)]
-        )
+        connection = FakeConnection([(123, True, "free", None, None, "eurusd")])
         calls: list[tuple[str, int]] = []
 
         def connect(url, *, connect_timeout):
@@ -52,6 +50,8 @@ class SubscriberStoreTests(unittest.TestCase):
         )
         self.assertEqual(store.backend, "postgres")
         self.assertEqual(store.subscribed_chat_ids(), [123])
+        self.assertEqual(store.subscribers[123].selected_asset, "eurusd")
+        self.assertEqual(store.subscribed_chat_ids("eurusd"), [123])
         self.assertFalse(store.set_subscribed(123, True))
         self.assertTrue(store.set_subscribed(123, False))
         self.assertEqual(store.subscribed_chat_ids(), [])
@@ -89,7 +89,7 @@ class SubscriberStoreTests(unittest.TestCase):
     def test_database_write_failure_falls_back_and_keeps_loaded_subscribers(self) -> None:
         with TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "subscribers.json"
-            connection = FakeConnection([(123, True, "free", None, None)])
+            connection = FakeConnection([(123, True, "free", None, None, None)])
             calls = 0
 
             def connect(_url, *, connect_timeout):
@@ -136,6 +136,20 @@ class SubscriberStoreTests(unittest.TestCase):
                 store = SubscriberStore(database_url="", file_path=path)
             self.assertEqual(store.subscribed_chat_ids(), [77])
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), expected)
+
+    def test_selecting_asset_subscribes_chat_and_keeps_one_asset(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "subscribers.json"
+            with self.assertLogs("gbot.subscribers", level="WARNING"):
+                store = SubscriberStore(database_url="", file_path=path)
+            self.assertTrue(store.set_asset(101, "EURUSD_otc"))
+            self.assertTrue(store.set_asset(102, "AEDCNY_otc"))
+            self.assertEqual(store.subscribed_chat_ids("EURUSD_otc"), [101])
+            self.assertEqual(store.subscribed_chat_ids("AEDCNY_otc"), [102])
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8"))[0]["selected_asset"],
+                "EURUSD_otc",
+            )
 
 
 if __name__ == "__main__":
