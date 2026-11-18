@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,8 +27,8 @@ class MarketAsset:
 
 
 def normalize_asset_name(value: str) -> str:
-    normalized = re.sub(r"[^a-z0-9]", "", value.casefold())
-    return normalized[:-3] if normalized.endswith("otc") else normalized
+    """Trim surrounding whitespace without changing spelling or OTC identity."""
+    return value.strip()
 
 
 def load_catalog(path: str | Path = "assets.json") -> tuple[CatalogAsset, ...]:
@@ -56,7 +55,7 @@ CATEGORIES = tuple(dict.fromkeys(asset.category for asset in CATALOG))
 def match_runtime_assets(
     rows: list[dict[str, Any]], payouts: dict[str, float] | None = None
 ) -> dict[str, MarketAsset]:
-    """Map exact catalogue names/aliases to live broker symbols without filtering."""
+    """Match exact display names/aliases to one live broker symbol each."""
     payouts = payouts or {}
     result: dict[str, MarketAsset] = {}
     for row in rows:
@@ -64,21 +63,29 @@ def match_runtime_assets(
         if not isinstance(symbol, str) or not symbol:
             continue
         provider_name = row.get("name")
-        candidates = {normalize_asset_name(symbol)}
-        if isinstance(provider_name, str) and provider_name:
-            candidates.add(normalize_asset_name(provider_name))
+        provider_names = (
+            [provider_name]
+            if isinstance(provider_name, str) and provider_name.strip()
+            else []
+        )
+        if not provider_names:
+            provider_names = [symbol]
         for asset in CATALOG:
             names = (asset.name, *asset.aliases)
-            if not candidates.intersection(map(normalize_asset_name, names)):
+            if not any(
+                normalize_asset_name(provider) == name
+                for provider in provider_names
+                for name in names
+            ):
                 continue
-            payout_value = payouts.get(symbol)
+            payout_value = row.get("payout", payouts.get(symbol))
             try:
                 payout = float(payout_value) if payout_value is not None else None
             except (TypeError, ValueError, OverflowError):
                 payout = None
             if payout is not None and not 0 <= payout <= 100:
                 payout = None
-            result[asset.id] = MarketAsset(
+            candidate = MarketAsset(
                 catalog_id=asset.id,
                 category=asset.category,
                 display_name=asset.name,
@@ -86,6 +93,9 @@ def match_runtime_assets(
                 payout=payout,
                 is_open=bool(row.get("is_active", row.get("is_open", False))),
             )
+            current = result.get(asset.id)
+            if current is None or (candidate.is_open and not current.is_open):
+                result[asset.id] = candidate
             break
     return result
 

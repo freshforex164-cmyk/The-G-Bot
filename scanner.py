@@ -21,7 +21,9 @@ from subscriber_store import SubscriberStore
 
 logger = logging.getLogger("gbot.scanner")
 ASSET_TICK_WAIT_SECONDS = 5.0
+ASSET_TICK_MAX_AGE_SECONDS = 5.0
 ASSET_REFRESH_SECONDS = 20.0
+ASSET_UNSUBSCRIBE_GRACE_SECONDS = 10 * 60
 
 
 @dataclass
@@ -58,8 +60,10 @@ class SignalScanner:
         self.asset_matches: dict[str, MarketAsset] = {}
         self.pairs: dict[str, PairScanState] = {}
         self.signals: dict[str, Signal] = {}
+        self.unmatched_catalog_names: list[str] = []
         self._tasks: dict[str, asyncio.Task[None]] = {}
-        self._provisional_symbols: set[str] = set()
+        self._preparation_tasks: set[asyncio.Task[None]] = set()
+        self._unselected_since: dict[str, float] = {}
         self._reconcile_lock = asyncio.Lock()
         self._stopping = False
         self._paused = False
@@ -109,9 +113,10 @@ class SignalScanner:
             state is None
             or state.latest_price is None
             or state.latest_tick_at is None
-            or (datetime.now(timezone.utc) - state.latest_tick_at).total_seconds()
-            > config.WATCHDOG_TICK_MAX_AGE_SECONDS
         ):
+            return None
+        age = (datetime.now(timezone.utc) - state.latest_tick_at).total_seconds()
+        if age < 0 or age >= ASSET_TICK_MAX_AGE_SECONDS:
             return None
         return symbol, state.latest_price, state.latest_tick_at
 
@@ -128,6 +133,11 @@ class SignalScanner:
             )
             payouts = {}
         self.asset_matches = match_runtime_assets(rows, payouts)
+        self.unmatched_catalog_names = [
+            asset.name
+            for asset in CATALOG_BY_ID.values()
+            if asset.id not in self.asset_matches
+        ]
         return self.asset_matches
 
     def _selected_symbols(self) -> set[str]:
@@ -136,7 +146,62 @@ class SignalScanner:
             for subscriber in self.subscribers.subscribers.values()
             if subscriber.subscribed and subscriber.selected_asset
         }
-        return {str(symbol) for symbol in selected} | self._provisional_symbols
+        return {str(symbol) for symbol in selected}
+
+    async def _probe_for_fresh_tick(self, symbol: str) -> bool:
+        """Open a short-lived stream immediately and require a fresh first tick."""
+        stream = self.broker.subscribe_ticks(symbol)
+        deadline = asyncio.get_running_loop().time() + ASSET_TICK_WAIT_SECONDS
+        try:
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return False
+                try:
+                    tick = await asyncio.wait_for(anext(stream), timeout=remaining)
+                except (StopAsyncIteration, TimeoutError):
+                    return False
+                try:
+                    timestamp = datetime.fromtimestamp(
+                        _normalize_broker_timestamp(
+                            tick.get("timestamp", tick.get("time"))
+                        ),
+                        timezone.utc,
+                    )
+                    float(tick.get("close", tick.get("price")))
+                except (TypeError, ValueError, OverflowError, OSError, CandleDataError):
+                    continue
+                age = (datetime.now(timezone.utc) - timestamp).total_seconds()
+                if 0 <= age < ASSET_TICK_MAX_AGE_SECONDS:
+                    return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Asset availability probe failed (%s).", type(exc).__name__)
+            return False
+        finally:
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
+
+    async def _prepare_selected_stream(self) -> None:
+        try:
+            await self._reconcile_selected()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Selected asset stream setup failed (%s).", type(exc).__name__
+            )
+
+    def _schedule_selected_stream_setup(self) -> None:
+        task = asyncio.create_task(
+            self._prepare_selected_stream(),
+            name="prepare-selected-asset-stream",
+        )
+        self._preparation_tasks.add(task)
+        task.add_done_callback(self._preparation_tasks.discard)
 
     async def _seed_asset(self, asset: MarketAsset) -> PairScanState:
         builder = CandleBuilder(
@@ -163,11 +228,29 @@ class SignalScanner:
 
     async def _reconcile_selected(self) -> None:
         async with self._reconcile_lock:
+            now = time.monotonic()
             desired_symbols = self._selected_symbols()
-            available = {
+            open_assets = {
                 asset.symbol: asset
                 for asset in self.asset_matches.values()
-                if asset.is_open and asset.symbol in desired_symbols
+                if asset.is_open
+            }
+            for symbol in desired_symbols:
+                self._unselected_since.pop(symbol, None)
+
+            retained_symbols = set(desired_symbols)
+            for symbol in set(self.pairs) - desired_symbols:
+                if symbol not in open_assets:
+                    self._unselected_since.pop(symbol, None)
+                    continue
+                since = self._unselected_since.setdefault(symbol, now)
+                if now - since < ASSET_UNSUBSCRIBE_GRACE_SECONDS:
+                    retained_symbols.add(symbol)
+
+            available = {
+                symbol: open_assets[symbol]
+                for symbol in retained_symbols
+                if symbol in open_assets
             }
             for symbol in set(self.pairs) - set(available):
                 task = self._tasks.pop(symbol, None)
@@ -175,6 +258,7 @@ class SignalScanner:
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
                 self.pairs.pop(symbol, None)
+                self._unselected_since.pop(symbol, None)
             # Fetch each newly selected history sequentially on the shared client.
             for symbol, asset in available.items():
                 if symbol in self.pairs:
@@ -200,27 +284,25 @@ class SignalScanner:
         asset = self.asset_matches.get(asset_id)
         if asset is None or not asset.is_open:
             return None
-        self._provisional_symbols.add(asset.symbol)
-        await self._reconcile_selected()
         state = self.pairs.get(asset.symbol)
         if state is None:
-            self._provisional_symbols.discard(asset.symbol)
-            return None
-        if (
-            state.first_tick.is_set()
-            and self.price_for_symbol(asset.symbol) is None
-        ):
+            if not await self._probe_for_fresh_tick(asset.symbol):
+                return None
+            await asyncio.to_thread(self.subscribers.set_asset, chat_id, asset.symbol)
+            self._schedule_selected_stream_setup()
+            return asset
+        if state.first_tick.is_set() and self.price_for_symbol(asset.symbol) is None:
             state.first_tick.clear()
-        try:
-            await asyncio.wait_for(
-                state.first_tick.wait(), timeout=ASSET_TICK_WAIT_SECONDS
-            )
-        except TimeoutError:
-            self._provisional_symbols.discard(asset.symbol)
-            await self._reconcile_selected()
-            return None
+        if self.price_for_symbol(asset.symbol) is None:
+            try:
+                await asyncio.wait_for(
+                    state.first_tick.wait(), timeout=ASSET_TICK_WAIT_SECONDS
+                )
+            except TimeoutError:
+                return None
+            if self.price_for_symbol(asset.symbol) is None:
+                return None
         await asyncio.to_thread(self.subscribers.set_asset, chat_id, asset.symbol)
-        self._provisional_symbols.discard(asset.symbol)
         await self._reconcile_selected()
         return asset
 
@@ -256,7 +338,8 @@ class SignalScanner:
             price = float(tick.get("close", tick.get("price")))
         except (TypeError, ValueError, OverflowError, OSError, CandleDataError):
             return
-        if (datetime.now(timezone.utc) - timestamp).total_seconds() > config.WATCHDOG_TICK_MAX_AGE_SECONDS:
+        tick_age = (datetime.now(timezone.utc) - timestamp).total_seconds()
+        if tick_age < 0 or tick_age >= ASSET_TICK_MAX_AGE_SECONDS:
             return
         state.latest_price = price
         state.latest_tick_at = timestamp
@@ -363,13 +446,28 @@ class SignalScanner:
         finally:
             self._stopping = True
             stop_event.set()
-            for task in (monitor, refresher, *self._tasks.values()):
+            for task in (
+                monitor,
+                refresher,
+                *self._preparation_tasks,
+                *self._tasks.values(),
+            ):
                 if task is not None and not task.done():
                     task.cancel()
             await asyncio.gather(
-                *(task for task in (monitor, refresher, *self._tasks.values()) if task),
+                *(
+                    task
+                    for task in (
+                        monitor,
+                        refresher,
+                        *self._preparation_tasks,
+                        *self._tasks.values(),
+                    )
+                    if task
+                ),
                 return_exceptions=True,
             )
+            self._preparation_tasks.clear()
             self._tasks.clear()
             self.output(self.stream_health_line())
             await self.broker.close()

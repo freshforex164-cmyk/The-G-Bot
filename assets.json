@@ -23,22 +23,43 @@
         {"id": "usd-vnd", "name": "USD/VND"},
         {"id": "yer-usd", "name": "YER/USD"},
         {"id": "eur-usd", "name": "EUR/USD"},
-        {"id": "omr-cny", "name": "OMR/CNY"}
+        {"id": "omr-cny", "name": "OMR/CNY"},
+        {"id": "aed-cny-otc", "name": "AED/CNY OTC"},
+        {"id": "aud-cad-otc", "name": "AUD/CAD OTC"},
+        {"id": "aud-chf-otc", "name": "AUD/CHF OTC"},
+        {"id": "cad-chf-otc", "name": "CAD/CHF OTC"},
+        {"id": "cad-jpy-otc", "name": "CAD/JPY OTC"},
+        {"id": "chf-jpy-otc", "name": "CHF/JPY OTC"},
+        {"id": "eur-nzd-otc", "name": "EUR/NZD OTC"},
+        {"id": "gbp-usd-otc", "name": "GBP/USD OTC"},
+        {"id": "kes-usd-otc", "name": "KES/USD OTC"},
+        {"id": "mad-usd-otc", "name": "MAD/USD OTC"},
+        {"id": "ngn-usd-otc", "name": "NGN/USD OTC"},
+        {"id": "nzd-usd-otc", "name": "NZD/USD OTC"},
+        {"id": "qar-cny-otc", "name": "QAR/CNY OTC"},
+        {"id": "sar-cny-otc", "name": "SAR/CNY OTC"},
+        {"id": "usd-bdt-otc", "name": "USD/BDT OTC"},
+        {"id": "usd-clp-otc", "name": "USD/CLP OTC"},
+        {"id": "usd-inr-otc", "name": "USD/INR OTC"},
+        {"id": "usd-vnd-otc", "name": "USD/VND OTC"},
+        {"id": "yer-usd-otc", "name": "YER/USD OTC"},
+        {"id": "eur-usd-otc", "name": "EUR/USD OTC"},
+        {"id": "omr-cny-otc", "name": "OMR/CNY OTC"}
       ]
     },
     {
       "name": "Crypto",
       "assets": [
-        {"id": "avalanche", "name": "Avalanche OTC", "aliases": ["Avalanche"]},
-        {"id": "dogecoin", "name": "Dogecoin OTC", "aliases": ["Dogecoin", "Doge"]},
+        {"id": "avalanche", "name": "Avalanche OTC"},
+        {"id": "dogecoin", "name": "Dogecoin OTC"},
         {"id": "solana", "name": "Solana OTC"}
       ]
     },
     {
       "name": "Commodities",
       "assets": [
-        {"id": "brent-oil", "name": "Brent Oil OTC", "aliases": ["Brent"]},
-        {"id": "wti-crude-oil", "name": "WTI Crude Oil OTC", "aliases": ["WTI", "Crude Oil"]},
+        {"id": "brent-oil", "name": "Brent Oil OTC"},
+        {"id": "wti-crude-oil", "name": "WTI Crude Oil OTC"},
         {"id": "silver", "name": "Silver OTC"},
         {"id": "gold", "name": "Gold OTC"}
       ]
@@ -46,16 +67,16 @@
     {
       "name": "Stocks",
       "assets": [
-        {"id": "american-express", "name": "American Express OTC", "aliases": ["American Express", "Amex"]},
-        {"id": "facebook-inc", "name": "Facebook Inc OTC", "aliases": ["Facebook", "Meta"]},
-        {"id": "johnson-johnson", "name": "Johnson & Johnson OTC", "aliases": ["Johnson Johnson", "J&J", "JNJ"]},
-        {"id": "mcdonalds", "name": "McDonald's OTC", "aliases": ["McDonald's", "McDonalds", "MCD"]}
+        {"id": "american-express", "name": "American Express OTC"},
+        {"id": "facebook-inc", "name": "FACEBOOK INC OTC"},
+        {"id": "johnson-johnson", "name": "Johnson & Johnson OTC"},
+        {"id": "mcdonalds", "name": "McDonald's OTC"}
       ]
     },
     {
       "name": "Indices",
       "assets": [
-        {"id": "aus-200-otc", "name": "AUS 200 OTC", "aliases": ["AUS 200"]},
+        {"id": "aus-200-otc", "name": "AUS 200 OTC"},
         {"id": "100gbp", "name": "100GBP"},
         {"id": "100gbp-otc", "name": "100GBP OTC"}
       ]
