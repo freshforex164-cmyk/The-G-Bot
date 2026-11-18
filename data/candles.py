@@ -77,6 +77,7 @@ class CandleBuilder:
         """Seed from broker-compiled history, ignoring the current open time bucket."""
         current_bucket = int(time.time()) // self.period_seconds * self.period_seconds
         by_time: dict[int, Candle] = {}
+        normalized_rows: list[tuple[int, Candle]] = []
 
         for row in history:
             if not isinstance(row, Mapping):
@@ -86,13 +87,24 @@ class CandleBuilder:
             bucket_time = timestamp // self.period_seconds * self.period_seconds
             if bucket_time >= current_bucket:
                 continue
-            by_time[bucket_time] = Candle(
+            candle = Candle(
                 time=bucket_time,
                 open=_number(row.get("open"), "open"),
                 high=_number(row.get("high"), "high"),
                 low=_number(row.get("low"), "low"),
                 close=_number(row.get("close"), "close"),
             )
+            normalized_rows.append((timestamp, candle))
+
+        for timestamp, candle in sorted(normalized_rows, key=lambda item: item[0]):
+            bucket_time = timestamp // self.period_seconds * self.period_seconds
+            existing = by_time.get(bucket_time)
+            if existing is None:
+                by_time[bucket_time] = candle
+            else:
+                existing.high = max(existing.high, candle.high)
+                existing.low = min(existing.low, candle.low)
+                existing.close = candle.close
 
         for candle in sorted(by_time.values(), key=lambda item: item.time)[
             -self.max_candles :

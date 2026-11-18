@@ -5,11 +5,15 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 
+from data.candles import CandleBuilder
 from market_assets import MarketAsset
 from notifications import NotificationQueue, TelegramNotifier, format_signal_message
 from strategy.model import Signal
+from strategy.price_action import PriceActionStrategy
 from subscriber_store import SubscriberStore
+from scanner import PairScanState, SignalScanner
 from telegram_bot import (
     SubscriberFanoutNotifier,
     TelegramCommandHandler,
@@ -196,6 +200,26 @@ class PriceActionDeliveryTests(unittest.IsolatedAsyncioTestCase):
             fanout = SubscriberFanoutNotifier(client, store, max_messages_per_second=1000)
             await fanout.send(self.signal())
             self.assertEqual([message[0] for message in client.messages], [1])
+
+    async def test_unselected_asset_signal_is_not_published(self):
+        with TemporaryDirectory() as temp_dir:
+            store = SubscriberStore(
+                database_url="",
+                file_path=Path(temp_dir) / "subscribers.json",
+            )
+            sent = []
+            scanner = SignalScanner(object(), store, on_signal=sent.append)
+            asset = MarketAsset(
+                "aed-cny", "Currencies", "AED/CNY", "AEDCNY_otc", None, True
+            )
+            state = PairScanState(asset, CandleBuilder(), PriceActionStrategy())
+            state.latest_price = 1.23
+            state.latest_tick_at = datetime.now(timezone.utc)
+            scanner.pairs[asset.symbol] = state
+            scanner._last_any_tick_at = time.monotonic()
+            scanner._publish_signal(self.signal())
+            self.assertEqual(sent, [])
+            self.assertEqual(scanner.signals, {})
 
     async def test_queue_drops_signals_older_than_ten_seconds(self):
         queue = NotificationQueue(FakeClient(), max_age_seconds=10)

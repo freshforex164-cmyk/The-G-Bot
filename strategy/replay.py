@@ -1,258 +1,195 @@
-"""Candle-only approximate replay and strategy-variant comparison."""
+"""Single-configuration, approximate 1-minute price-action replay."""
 
 from __future__ import annotations
 
+import asyncio
+import math
 from collections import Counter
-from dataclasses import dataclass, field
-from itertools import product
-from typing import Iterable, Mapping
+from dataclasses import dataclass
+from typing import Iterable
 
 import config
-from data.candles import Candle
-from strategy.rules import (
-    DirectionEvaluation,
-    IndicatorSet,
-    evaluate_direction,
-    prepare_indicators,
-    trigger_a,
-    trigger_b,
-)
-from strategy.strength import score_strength
-
-REPLAY_HORIZONS = (config.EXPIRATION_SECONDS,)
+from broker.pocket_option import CandleHistoryUnavailable, PocketOptionBroker
+from data.candles import Candle, CandleBuilder, CandleDataError, _normalize_broker_timestamp
+from market_assets import CATALOG, MarketAsset, match_runtime_assets
+from strategy.model import Signal
+from strategy.price_action import PriceActionStrategy, SETUP_LABELS
+from strategy.settings import STRATEGY_SETTINGS
 
 
 @dataclass(frozen=True)
-class ReplaySignal:
-    pair: str
-    direction: str
-    candle_index: int
-    entry_price: float
-    strength: int
-    outcomes: dict[int, str] = field(default_factory=dict)
+class ReplayOutcome:
+    signal: Signal
+    expiry_price: float
+    result: str
+    outcome_type: str = "PROXY"
 
 
 @dataclass
 class ReplaySummary:
-    pair: str
-    signals: list[ReplaySignal]
-    directions: Counter[str] = field(default_factory=Counter)
-    strength_buckets: Counter[str] = field(default_factory=Counter)
-    outcomes: dict[int, Counter[str]] = field(
-        default_factory=lambda: {horizon: Counter() for horizon in REPLAY_HORIZONS}
-    )
-
-    @property
-    def signal_count(self) -> int:
-        return len(self.signals)
+    asset: MarketAsset
+    candles: list[Candle]
+    outcomes: list[ReplayOutcome]
+    resampled: bool = False
 
 
-@dataclass(frozen=True)
-class ReplayVariant:
-    name: str
-    trigger: str
-    s2_enabled: bool
-    s4_enabled: bool
-    stochastic_lookback: int
-
-
-def strategy_variants() -> list[ReplayVariant]:
-    return [
-        ReplayVariant(
-            name=f"T{trigger}-S2{'on' if s2 else 'off'}-S4{'on' if s4 else 'off'}-K{lookback}",
-            trigger=trigger,
-            s2_enabled=s2,
-            s4_enabled=s4,
-            stochastic_lookback=lookback,
-        )
-        for trigger, s2, s4, lookback in product(
-            ("A", "B"),
-            (True, False),
-            (True, False),
-            config.STOCHASTIC_LOOKBACK_OPTIONS,
-        )
-    ]
-
-
-def _approximate_trigger(
-    evaluation: DirectionEvaluation, candle: Candle, trigger: str
-) -> tuple[bool, float]:
-    if evaluation.middle is None:
-        return False, float(candle.close)
-    if trigger == "B":
-        matched, _ = trigger_b(evaluation, candle)
-        return matched, float(candle.close)
-
-    # OHLC replay cannot know the exact tick path; use the first plausible
-    # in-zone price reached after the candle open and label results approximate.
-    epsilon = max(abs(evaluation.middle) * 1e-10, 1e-10)
-    if evaluation.direction == "SELL":
-        price = max(evaluation.middle, float(candle.open) + epsilon)
-        possible = candle.high >= price and price <= (evaluation.upper or price)
-    else:
-        price = min(evaluation.middle, float(candle.open) - epsilon)
-        possible = candle.low <= price and price >= (evaluation.lower or price)
-    if not possible:
-        return False, price
-    matched, _ = trigger_a(evaluation, price, candle)
-    return matched, price
-
-
-def _strength(evaluation: DirectionEvaluation, price: float) -> int:
-    distance = abs(price - (evaluation.middle or price))
-    reference = max(abs(evaluation.middle or price) * 0.001, 1e-12)
-    touch_cleanliness = max(0.0, 1.0 - distance / reference)
-    score, _ = score_strength(
-        stochastic_extremity=evaluation.stochastic_extremity,
-        stochastic_turn=evaluation.stochastic_turn,
-        moving_average_turn=evaluation.ma_turn_percent,
-        bollinger_slope=evaluation.middle_slope_percent,
-        bollinger_curvature=evaluation.band_curvature_percent,
-        touch_cleanliness=touch_cleanliness,
-    )
-    return score
-
-
-def replay_variant(
-    pair: str,
-    candles: Iterable[Candle],
-    variant: ReplayVariant,
-    *,
-    indicators: IndicatorSet | None = None,
+def replay_candles(
+    asset: MarketAsset, candles: Iterable[Candle]
 ) -> ReplaySummary:
-    """Replay one strategy configuration over a shared closed-candle series."""
     series = list(candles)
-    summary = ReplaySummary(pair=pair, signals=[])
-    prepared = indicators or prepare_indicators(series)
-    enabled = {
-        "S1": config.S1_ENABLED,
-        "S2": variant.s2_enabled,
-        "S3": config.S3_ENABLED,
-        "S4": variant.s4_enabled,
-    }
-    last_signal_index = -config.SIGNAL_COOLDOWN_CANDLES - 1
-
-    for current_index in range(1, len(series)):
-        if current_index - last_signal_index <= config.SIGNAL_COOLDOWN_CANDLES:
+    strategy = PriceActionStrategy()
+    outcomes: list[ReplayOutcome] = []
+    for index, candle in enumerate(series):
+        signal = strategy.on_closed_candles(
+            asset.symbol,
+            series[: index + 1],
+            asset_name=asset.display_name,
+            payout=asset.payout,
+        )
+        if signal is None:
             continue
-        setup_index = current_index - 1
-        candidates: list[tuple[DirectionEvaluation, float]] = []
-        for direction in ("SELL", "BUY"):
-            evaluation = evaluate_direction(
-                series,
-                direction,
-                stochastic_lookback=variant.stochastic_lookback,
-                enabled=enabled,
-                index=setup_index,
-                indicators=prepared,
-            )
-            if not evaluation.setup_passes:
-                continue
-            triggered, entry = _approximate_trigger(
-                evaluation, series[current_index], variant.trigger
-            )
-            if triggered:
-                candidates.append((evaluation, entry))
-        if not candidates:
+        due_at = int(signal.time.timestamp()) + signal.expiry_seconds
+        expiry_index = next(
+            (
+                future_index
+                for future_index in range(index + 1, len(series))
+                if series[future_index].time + STRATEGY_SETTINGS.timeframe_seconds
+                >= due_at
+            ),
+            None,
+        )
+        if expiry_index is None:
             continue
-
-        evaluation, entry_price = max(
-            candidates, key=lambda item: _strength(item[0], item[1])
+        expiry_price = float(series[expiry_index].close)
+        won = (
+            expiry_price < signal.price
+            if signal.direction == "SELL"
+            else expiry_price > signal.price
         )
-        outcomes: dict[int, str] = {}
-        for horizon in REPLAY_HORIZONS:
-            due_time = series[current_index].time + horizon
-            exit_index = next(
-                (
-                    index
-                    for index in range(current_index + 1, len(series))
-                    if series[index].time >= due_time
-                ),
-                None,
+        outcomes.append(
+            ReplayOutcome(
+                signal,
+                expiry_price,
+                "WIN" if won else "LOSS",
+                "PROXY",
             )
-            if exit_index is not None:
-                exit_price = float(series[exit_index].close)
-                favorable = (
-                    exit_price < entry_price
-                    if evaluation.direction == "SELL"
-                    else exit_price > entry_price
-                )
-                outcomes[horizon] = "WIN" if favorable else "LOSS"
-        signal = ReplaySignal(
-            pair=pair,
-            direction=evaluation.direction,
-            candle_index=current_index,
-            entry_price=entry_price,
-            strength=_strength(evaluation, entry_price),
-            outcomes=outcomes,
         )
-        summary.signals.append(signal)
-        summary.directions[evaluation.direction] += 1
-        bucket = (
-            "0-59" if signal.strength < 60 else "60-79" if signal.strength < 80 else "80-100"
-        )
-        summary.strength_buckets[bucket] += 1
-        for horizon, result in outcomes.items():
-            summary.outcomes[horizon][result] += 1
-        last_signal_index = current_index
-    return summary
+    return ReplaySummary(asset, series, outcomes)
 
 
-def replay_candles(pair: str, candles: Iterable[Candle]) -> ReplaySummary:
-    """Backwards-compatible default replay summary, with approximate OHLC fills."""
-    variant = next(
-        variant
-        for variant in strategy_variants()
-        if variant.trigger == config.TRIGGER_VARIANT
-        and variant.s2_enabled == config.S2_ENABLED
-        and variant.s4_enabled == config.S4_ENABLED
-        and variant.stochastic_lookback == config.STOCHASTIC_LOOKBACK_CANDLES
-    )
-    return replay_variant(pair, candles, variant)
-
-
-def run_strategy_lab(
-    candles_by_pair: Mapping[str, Iterable[Candle]],
-) -> dict[str, ReplaySummary]:
-    """Compare all requested rule variants against the same candle histories."""
-    variants = strategy_variants()
-    results = {variant.name: ReplaySummary("TOTAL", []) for variant in variants}
-    for pair, candles in candles_by_pair.items():
-        series = list(candles)
-        prepared = prepare_indicators(series)
-        for variant in variants:
-            item = replay_variant(pair, series, variant, indicators=prepared)
-            total = results[variant.name]
-            total.signals.extend(item.signals)
-            total.directions.update(item.directions)
-            total.strength_buckets.update(item.strength_buckets)
-            for horizon in REPLAY_HORIZONS:
-                total.outcomes[horizon].update(item.outcomes[horizon])
-    return results
-
-
-def win_rate(summary: ReplaySummary, horizon: int) -> float | None:
-    outcomes = summary.outcomes[horizon]
-    count = outcomes["WIN"] + outcomes["LOSS"]
-    return outcomes["WIN"] / count * 100.0 if count else None
-
-
-def strength_percentiles(summaries: Iterable[ReplaySummary]) -> dict[int, float] | None:
-    values = sorted(
-        signal.strength
-        for summary in summaries
-        for signal in summary.signals
-    )
-    if not values:
+def wilson_interval(wins: int, count: int) -> tuple[float, float] | None:
+    if count <= 0:
         return None
+    z = 1.96
+    p = wins / count
+    denominator = 1 + z * z / count
+    center = (p + z * z / (2 * count)) / denominator
+    margin = z * math.sqrt(p * (1 - p) / count + z * z / (4 * count * count))
+    margin /= denominator
+    return max(0.0, center - margin) * 100, min(1.0, center + margin) * 100
 
-    def percentile(p: int) -> float:
-        if len(values) == 1:
-            return float(values[0])
-        position = (len(values) - 1) * p / 100
-        lower = int(position)
-        upper = min(lower + 1, len(values) - 1)
-        fraction = position - lower
-        return values[lower] * (1 - fraction) + values[upper] * fraction
 
-    return {p: percentile(p) for p in (10, 50, 90)}
+def _print_summaries(summaries: list[ReplaySummary]) -> None:
+    by_setup: dict[str, Counter[str]] = {}
+    setup_counts: Counter[str] = Counter()
+    observed_hours = 0.0
+    assets_with_history = 0
+    for summary in summaries:
+        if len(summary.candles) > 1:
+            span = (
+                summary.candles[-1].time
+                + STRATEGY_SETTINGS.timeframe_seconds
+                - summary.candles[0].time
+            )
+            observed_hours += max(0.0, span / 3600)
+            assets_with_history += 1
+        for outcome in summary.outcomes:
+            by_setup.setdefault(outcome.signal.setup, Counter())[outcome.result] += 1
+            setup_counts[outcome.signal.setup] += 1
+    if not assets_with_history:
+        print("REPLAY no catalogue assets returned usable candle history.")
+        return
+    for setup in SETUP_LABELS:
+        counts = by_setup.get(setup, Counter())
+        total = counts["WIN"] + counts["LOSS"]
+        if not total:
+            rate_text, interval_text = "n/a", "n/a"
+        else:
+            rate_text = f"{counts['WIN'] / total * 100:.1f}%"
+            interval = wilson_interval(counts["WIN"], total)
+            assert interval is not None
+            interval_text = f"{interval[0]:.1f}–{interval[1]:.1f}%"
+        per_asset_hour = (
+            setup_counts[setup] / observed_hours if observed_hours > 0 else 0.0
+        )
+        print(
+            f"REPLAY setup={setup} ({SETUP_LABELS[setup]}) count={total} "
+            f"win_rate={rate_text} 95%_Wilson_CI={interval_text} "
+            f"signals_per_asset_hour={per_asset_hour:.3f}"
+        )
+    for summary in summaries:
+        status = "resampled_finer_history_to_1m" if summary.resampled else "1m_history"
+        print(
+            f"REPLAY_ASSET asset={summary.asset.display_name} "
+            f"candles={len(summary.candles)} signals={len(summary.outcomes)} "
+            f"source={status}"
+        )
+    print("REPLAY outcomes are approximate candle-close proxies; no parameter tuning was run.")
+    print("BREAK-EVEN at 92% payout: 52.1%")
+
+
+async def run_catalog_replay(
+    broker: PocketOptionBroker | None = None,
+) -> int:
+    market = broker or PocketOptionBroker(config.load_ssid())
+    summaries: list[ReplaySummary] = []
+    try:
+        await market.connect()
+        rows = await market.active_assets()
+        try:
+            payouts = await market.payouts()
+        except Exception:
+            payouts = {}
+        assets = match_runtime_assets(rows, payouts)
+        for catalog_asset in CATALOG:
+            asset = assets.get(catalog_asset.id)
+            if asset is None:
+                continue
+            builder = CandleBuilder(
+                period_seconds=STRATEGY_SETTINGS.timeframe_seconds,
+                max_candles=config.REPLAY_MAX_CANDLES_PER_PAIR,
+            )
+            try:
+                history = await market.candle_history(
+                    asset.symbol,
+                    STRATEGY_SETTINGS.timeframe_seconds,
+                    config.REPLAY_MAX_CANDLES_PER_PAIR
+                    * STRATEGY_SETTINGS.timeframe_seconds,
+                )
+                times = sorted(
+                    {
+                        _normalize_broker_timestamp(
+                            row.get("timestamp", row.get("time"))
+                        )
+                        for row in history
+                        if isinstance(row, dict)
+                    }
+                )
+                was_finer = any(
+                    0 < right - left < STRATEGY_SETTINGS.timeframe_seconds
+                    for left, right in zip(times, times[1:])
+                )
+                builder.seed(history)
+                summary = replay_candles(asset, builder.closed)
+                summary.resampled = was_finer
+                if summary.candles:
+                    summaries.append(summary)
+            except (CandleHistoryUnavailable, CandleDataError, TimeoutError) as exc:
+                print(
+                    f"REPLAY_ASSET asset={asset.display_name} NOT RUN "
+                    f"history_unavailable={type(exc).__name__}"
+                )
+        _print_summaries(summaries)
+        return 0
+    finally:
+        await market.close()
