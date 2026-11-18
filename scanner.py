@@ -43,12 +43,16 @@ class SignalScanner:
         subscribers: SubscriberStore,
         *,
         on_signal: Callable[[Signal], Any] | None = None,
+        on_tick: Callable[[str, float, datetime], Any] | None = None,
+        on_candle: Callable[[str, Candle], Any] | None = None,
         on_watchdog_event: Callable[[str], Any] | None = None,
         output: Callable[[str], None] = print,
     ) -> None:
         self.broker = broker
         self.subscribers = subscribers
         self.on_signal = on_signal
+        self.on_tick = on_tick
+        self.on_candle = on_candle
         self.on_watchdog_event = on_watchdog_event
         self.output = output
         self.asset_matches: dict[str, MarketAsset] = {}
@@ -256,7 +260,21 @@ class SignalScanner:
         state.latest_tick_at = timestamp
         state.first_tick.set()
         self._last_any_tick_at = time.monotonic()
+        if self.on_tick is not None:
+            try:
+                self.on_tick(symbol, price, timestamp)
+            except Exception as exc:
+                logger.error(
+                    "Signal outcome tick update failed (%s).", type(exc).__name__
+                )
         closed = state.candles.update(tick)
+        if closed is not None and self.on_candle is not None:
+            try:
+                self.on_candle(symbol, closed)
+            except Exception as exc:
+                logger.error(
+                    "Signal outcome candle update failed (%s).", type(exc).__name__
+                )
         if closed is not None and not self._paused:
             signal = state.strategy.on_closed_candles(
                 symbol,

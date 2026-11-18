@@ -18,6 +18,7 @@ from broker.pocket_option import (
     PocketOptionConnectionError,
 )
 from data.candles import Candle, CandleBuilder, CandleDataError, _normalize_broker_timestamp
+from data.signals import SignalOutcomeTracker
 from market_assets import CATALOG, CATALOG_BY_ID, match_runtime_assets
 from notifications import (
     NotificationQueue,
@@ -26,6 +27,7 @@ from notifications import (
     build_notifier,
 )
 from scanner import SignalScanner
+from strategy.model import Signal
 from strategy.settings import STRATEGY_SETTINGS
 from subscriber_store import SubscriberStore
 from telegram_bot import (
@@ -289,10 +291,26 @@ async def run_serve() -> None:
     subscribers = await asyncio.to_thread(SubscriberStore)
     fanout = SubscriberFanoutNotifier(bot, subscribers)
     queue = NotificationQueue(fanout, max_age_seconds=10)
+    outcomes = SignalOutcomeTracker("data/signals.csv")
+
+    def record_signal(signal: Signal) -> None:
+        outcomes.record_signal(signal)
+        print(
+            f"{signal.time.astimezone(timezone.utc).isoformat(timespec='seconds')} "
+            f"{signal.asset_name} {signal.setup} {signal.direction} "
+            f"entry={signal.price:g}",
+            flush=True,
+        )
+        queue.enqueue(signal)
+
     scanner = SignalScanner(
         PocketOptionBroker(config.load_ssid()),
         subscribers,
-        on_signal=queue.enqueue,
+        on_signal=record_signal,
+        on_tick=outcomes.on_live_tick,
+        on_candle=lambda pair, candle: outcomes.on_closed_candle(
+            pair, candle, STRATEGY_SETTINGS.timeframe_seconds
+        ),
     )
     handler = TelegramCommandHandler(
         bot,
@@ -385,6 +403,7 @@ async def run_serve() -> None:
         await asyncio.gather(scan_task, poll_task, http_task, return_exceptions=True)
         await status_server.close()
         await queue.close()
+        outcomes.print_summary()
 
 
 async def run_replay() -> int:
