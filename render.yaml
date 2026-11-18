@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: gbot
+    runtime: python
+    buildCommand: pip install uv && uv sync --locked
+    startCommand: .venv/bin/python main.py --run serve
+    healthCheckPath: /health

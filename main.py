@@ -248,10 +248,7 @@ async def run_serve() -> None:
         raise config.ConfigurationError(
             "Missing required secret TELEGRAM_BOT_TOKEN for --run serve."
         )
-    admin_value = (
-        os.environ.get("TELEGRAM_ADMIN_ID")
-        or os.environ.get("TELEGRAM_USER_ID", "")
-    ).strip()
+    admin_value = os.environ.get("TELEGRAM_ADMIN_ID", "").strip()
     if not admin_value:
         raise config.ConfigurationError(
             "Missing required secret TELEGRAM_ADMIN_ID for admin commands."
@@ -353,6 +350,7 @@ async def run_serve() -> None:
         health_provider=public_health,
         admin_provider=admin_status,
         admin_token=os.environ.get("ADMIN_TOKEN"),
+        host="0.0.0.0",
         port=port,
     )
     await status_server.start()

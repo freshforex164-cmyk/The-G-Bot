@@ -39,7 +39,6 @@ PUBLIC_COMMANDS = [
     {"command": "register", "description": "Pocket Option account information"},
     {"command": "status", "description": "Check your signal status"},
     {"command": "help", "description": "How GBot works"},
-    {"command": "pricecheck", "description": "Check your selected asset price"},
 ]
 ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     {"command": "admin", "description": "Check signal stats"},
