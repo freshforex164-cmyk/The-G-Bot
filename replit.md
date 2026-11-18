@@ -14,6 +14,8 @@ or referral links.
   and HTTP health endpoints together.
 - `uv run --locked python main.py --run watch` — view live candles.
 - `uv run --locked python main.py --run feed-check` — inspect the live feed.
+- `uv run --locked python main.py --run strategy-debug --pair aed-cny` — print
+  the current regime and active price levels for one catalogue asset.
 - `uv run --locked python main.py --run replay` — approximate candle replay.
 - `uv run --locked python main.py --run notify-test` — send a sample notification.
 - `uv run --locked python main.py --run scanner --minutes 3` — scan for signals.

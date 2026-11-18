@@ -412,6 +412,47 @@ async def run_replay() -> int:
     return await run_catalog_replay()
 
 
+async def run_strategy_debug(asset_id: str) -> bool:
+    """Print safe strategy state from the latest closed history for one catalogue asset."""
+    catalog_asset = CATALOG_BY_ID.get(asset_id)
+    if catalog_asset is None:
+        print("Unknown catalogue asset ID.")
+        return False
+
+    broker = PocketOptionBroker(config.load_ssid())
+    try:
+        await broker.connect()
+        matches = match_runtime_assets(await broker.active_assets())
+        asset = matches.get(asset_id)
+        if asset is None or not asset.is_open:
+            print(f"STRATEGY DEBUG asset={catalog_asset.name} unavailable")
+            return False
+
+        history = await broker.candle_history(
+            asset.symbol,
+            STRATEGY_SETTINGS.timeframe_seconds,
+            60 * STRATEGY_SETTINGS.timeframe_seconds,
+        )
+        builder = CandleBuilder(
+            period_seconds=STRATEGY_SETTINGS.timeframe_seconds,
+            max_candles=60,
+        )
+        builder.seed(history)
+        from strategy.price_action import PriceActionStrategy
+
+        strategy = PriceActionStrategy()
+        strategy.bootstrap(tuple(builder.closed))
+        print(strategy.format_debug_state(asset.display_name), flush=True)
+        return len(builder.closed) > 0
+    except Exception as exc:
+        # Provider exception text can contain request details; diagnostics need only its type.
+        logger.warning("Strategy debug failed (%s).", type(exc).__name__)
+        print(f"STRATEGY DEBUG unavailable ({type(exc).__name__})")
+        return False
+    finally:
+        await broker.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Read-only Pocket Option price-action scanner."
@@ -421,6 +462,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=(
             "serve",
             "pricecheck",
+            "strategy-debug",
             "replay",
             "watch",
             "feed-check",
@@ -430,7 +472,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         default="watch",
     )
-    parser.add_argument("--pair", action="append", help="Catalogue asset ID for pricecheck.")
+    parser.add_argument(
+        "--pair",
+        action="append",
+        help="Catalogue asset ID for pricecheck or strategy-debug.",
+    )
     parser.add_argument("--seconds", type=int, default=30)
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -442,6 +488,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             asyncio.run(run_serve())
         elif args.run == "pricecheck":
             return 0 if asyncio.run(run_pricecheck(args.pair)) else 1
+        elif args.run == "strategy-debug":
+            if not args.pair or len(args.pair) != 1:
+                parser.error("--run strategy-debug requires one --pair catalogue asset ID.")
+            return 0 if asyncio.run(run_strategy_debug(args.pair[0])) else 1
         elif args.run == "replay":
             return asyncio.run(run_replay())
         elif args.run == "watch":

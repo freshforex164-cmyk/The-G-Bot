@@ -1,11 +1,12 @@
 {
   "timeframe_seconds": 60,
   "expiry_seconds": 60,
-  "swing_side": 2,
-  "trend_swings": 2,
-  "range_candles": 20,
-  "zone_fraction": 0.25,
-  "range_min_height_atr": 1.0,
+  "min_regime_candles": 30,
+  "swing_lag": 1,
+  "regime_lookback": 20,
+  "min_range_atr_mult": 1.5,
+  "consolidation_zone_width_pct": 0.25,
+  "pullback_window_candles": 1,
   "atr_period": 14,
   "signal_valid_seconds": 15
 }

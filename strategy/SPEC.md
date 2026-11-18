@@ -1,78 +1,39 @@
-# GBot pullback-reversal strategy specification
+# GBot pure price-action strategy specification
 
-## Candle and index convention
+## Candle and regime rules
 
-- Strategy inputs are completed 15-second OHLC candles only.
-- Storage and indicator functions keep candles oldest-to-newest.
-- In this specification, index `0` is the latest completed candle, index `1`
-  is the candle before it, and increasing indexes mean older candles.
-- Trigger A may read the live price and current forming candle. The forming
-  candle is never used to calculate S1–S4.
-- Trigger B tests the newest completed candle against a setup evaluated on the
-  completed candle immediately before it.
+- Inputs are completed one-minute OHLC candles, oldest-to-newest. Forming
+  candles and intrabar ticks never create strategy signals.
+- A signal has a one-minute expiry.
+- Regime classification waits for 30 candles and inspects the latest 20.
+- A one-candle-lag confirmed swing sequence with rising highs and lows is an
+  uptrend; falling highs and lows are a downtrend.
+- If neither trend structure is confirmed, consolidation is valid when the
+  rolling high-low range is at least 1.5 times the 14-candle average true range.
+- Consolidation zones are the outer 25% of that rolling range. An upper-zone
+  touch that closes below its high can SELL once per upper structural level;
+  a lower-zone touch that closes above its low can BUY once per lower level.
 
-## Indicators
+## Trend state machine
 
-- Bollinger Bands use the last 20 closes: `mid = SMA20(close)`,
-  `sd = population standard deviation`, `up = mid + 2*sd`,
-  `lo = mid - 2*sd`, and `width = (up-lo)/mid`.
-- Stochastic uses 14 candles for raw `%K`:
-  `raw = 100*(close-LL14)/(HH14-LL14)`, then `K = SMA3(raw)` and
-  `D = SMA3(K)`. A zero-range stochastic window is neutral at 50.
-- Moving average is `EMA10(close)`.
-- `slope(n) = (MA[0]-MA[n])/MA[0]`. The prior MA move is
-  `(MA[3]-MA[6])/MA[3]`.
+- A newly established structural high H in an uptrend can produce one SELL
+  pullback on the following candle if that candle fails to break H, or breaks H
+  and closes red.
+- The pullback candle starts a tracked low L. A later candle that remains at or
+  above L produces one BUY continuation; a lower low updates L and delays it.
+- Downtrend behavior mirrors this: pullback BUY from structural low L, then
+  continuation SELL once a candle remains at or below the tracked pullback high.
+- Trend signals strictly alternate Pullback → Continuation → Pullback.
+  Regime changes clear the trend phase and fired-level suppression state.
+- Startup replays up to 60 historical closed candles to initialize regime,
+  structural levels, and alternation state without sending historical signals.
+- All notifications are informational. No trade is submitted.
 
-## Setup conditions
+## Debugging and replay
 
-Each condition has a config switch (`S1_ENABLED` through `S4_ENABLED`). A
-disabled condition is shown as not applicable and does not block a setup.
-
-### SELL
-
-- **S1 Stochastic:** `max(K[0..STOCHASTIC_LOOKBACK_CANDLES-1]) >= 80` and
-  `K[0] < D[0]`.
-- **S2 MA turn:** `(MA[3]-MA[6])/MA[3] >= MA_RISE_MIN` and
-  `slope(3) <= MA_FLAT_TOL`.
-- **S3 Bollinger structure:** `(mid[0]-mid[3])/mid[0] <= MID_FLAT_TOL`,
-  `up[0] < up[1]`, and `close[0] < mid[0]`.
-- **S4 Range filter:** `width[0] / mean(width[0..49]) <= RANGE_MAX_RATIO`.
-- SELL's entry zone is between `mid[0]` and `up[0]`.
-
-### BUY (mirror)
-
-- **S1 Stochastic:** `min(K[0..STOCHASTIC_LOOKBACK_CANDLES-1]) <= 20` and
-  `K[0] > D[0]`.
-- **S2 MA turn:** `(MA[3]-MA[6])/MA[3] <= -MA_RISE_MIN` and
-  `slope(3) >= -MA_FLAT_TOL`.
-- **S3 Bollinger structure:** `(mid[0]-mid[3])/mid[0] >= -MID_FLAT_TOL`,
-  `lo[0] > lo[1]`, and `close[0] > mid[0]`.
-- **S4** is the same width ratio filter as SELL.
-- BUY's entry zone is between `lo[0]` and `mid[0]`.
-
-## Trigger variants
-
-`TRIGGER_VARIANT` is `A` or `B`.
-
-- **A — live touch:** SELL triggers when live price is in the SELL zone, at or
-  above `mid[0]`, and above the forming candle's open while `close[0] < mid[0]`.
-  BUY mirrors this: price is in the BUY zone, at or below `mid[0]`, below the
-  forming open, while `close[0] > mid[0]`.
-- **B — closed rejection:** SELL triggers when a completed candle has
-  `high >= mid` and `close < mid`; BUY mirrors this with `low <= mid` and
-  `close > mid`. S1–S4 must have held on the immediately prior completed candle.
-- Every emitted item is an informational signal only. No trade is submitted.
-
-## Replay and strength
-
-- `--run replay` / `--run strategy-lab` compares all 24 combinations of A/B,
-  S2 on/off, S4 on/off, and stochastic lookbacks 3, 5, and 8 on the same data.
-- Replay reads `data/candles.csv` when it exists; otherwise it asks the broker
-  for up to 3,000 closed 15-second candles per eligible pair. OHLC trigger paths
-  and 35-second expiry estimates are approximate.
-- The lab reports the configured 35-second win rate and the 52.1% break-even
-  rate at 92% payout. Candle-only replay uses the first close at or after expiry;
-  this is approximate. Payout is not an input to the strength score.
-- The target replay strength distribution is approximately p10=20, p50=50,
-  p90=85. Actual percentiles are printed with replay output; references in
-  `config.py` should be calibrated against recorded replay data, not guessed.
+- `uv run --locked python main.py --run strategy-debug --pair <catalogue-id>`
+  prints the latest closed-candle regime and active structural levels for one
+  allowlisted catalogue asset. It reads market history only and never prints
+  credentials.
+- `--run replay` uses one-minute historical candles and the configured
+  one-minute expiry. Replay outcomes remain approximate candle-close proxies.

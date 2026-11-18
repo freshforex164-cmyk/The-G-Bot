@@ -52,6 +52,18 @@ class CliTests(unittest.TestCase):
             )
         explain.assert_awaited_once_with(pair="BITB_otc", seconds=30)
 
+    def test_strategy_debug_requires_and_forwards_one_catalogue_asset(self) -> None:
+        with patch.object(
+            main, "run_strategy_debug", new_callable=AsyncMock, return_value=True
+        ) as debug:
+            self.assertEqual(
+                main.main(
+                    ["--run", "strategy-debug", "--pair", "aed-cny"]
+                ),
+                0,
+            )
+        debug.assert_awaited_once_with("aed-cny")
+
     def test_strategy_lab_alias_runs_replay_command(self) -> None:
         with patch.object(main, "run_replay", new_callable=AsyncMock) as replay:
             self.assertEqual(main.main(["--run", "strategy-lab"]), 0)

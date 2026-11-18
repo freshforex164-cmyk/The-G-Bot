@@ -157,7 +157,9 @@ class SignalScanner:
                 asset.display_name,
                 type(exc).__name__,
             )
-        return PairScanState(asset, builder, PriceActionStrategy())
+        strategy = PriceActionStrategy()
+        strategy.bootstrap(tuple(builder.closed))
+        return PairScanState(asset, builder, strategy)
 
     async def _reconcile_selected(self) -> None:
         async with self._reconcile_lock:
