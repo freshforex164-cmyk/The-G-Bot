@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import config
-from market_assets import CATALOG, CATALOG_BY_ID, CATEGORIES, CatalogAsset
+from market_assets import CATALOG, CATALOG_BY_ID, CATEGORIES
 from notifications import TelegramNotifier, TelegramSendError, format_signal_message
 from strategy.model import Signal
 from subscriber_store import SubscriberStore
@@ -541,7 +541,13 @@ class TelegramCommandHandler:
             await self._show_categories(chat_id)
             return
         select = getattr(self.scanner, "select_asset", None)
-        live = await select(chat_id, asset_id) if callable(select) else None
+        try:
+            live = await select(chat_id, asset_id) if callable(select) else None
+        except Exception as exc:
+            logger.warning(
+                "Asset selection failed (%s).", type(exc).__name__
+            )
+            live = None
         if not live:
             await self._send_command_reply(
                 chat_id,
@@ -567,25 +573,36 @@ class TelegramCommandHandler:
         getter = getattr(self.scanner, "price_for_symbol", None)
         price = getter(selected) if selected and callable(getter) else None
         if price is None:
-            name = next(
+            if not selected:
+                await self._send_command_reply(
+                    chat_id,
+                    "No asset selected. Use /start to choose one.",
+                    command="pricecheck",
+                    force=True,
+                )
+                return
+            market_asset = next(
                 (
-                    item.name
-                    for item in CATALOG
-                    if any(
-                        getattr(asset, "symbol", None) == selected
-                        for asset in self._asset_matches().values()
-                    )
-                    and selected
+                    asset
+                    for asset in self._asset_matches().values()
+                    if asset.symbol == selected
                 ),
-                "Your selected asset",
+                None,
             )
+            catalog_asset = CATALOG_BY_ID.get(market_asset.catalog_id) if market_asset else None
+            name = catalog_asset.name if catalog_asset else "Your selected asset"
             await self._send_command_reply(
                 chat_id,
                 f"{name} isn't available right now. Pick another asset.",
                 command="pricecheck",
-                reply_markup=self._categories_keyboard(),
                 force=True,
             )
+            if market_asset:
+                await self._show_category(
+                    chat_id, str(CATEGORIES.index(market_asset.category))
+                )
+            else:
+                await self._show_categories(chat_id)
             return
         symbol, value, timestamp = price
         await self._send_command_reply(
@@ -691,16 +708,13 @@ class TelegramCommandHandler:
         pairs = len(getattr(self.scanner, "pairs", {})) if self.scanner else 0
         store = getattr(self.subscribers, "count", None)
         subscriber_count = store() if callable(store) else 0
-        funnel_reader = getattr(self.decision_store, "last_hour_funnel", None)
-        funnel = funnel_reader() if callable(funnel_reader) else {}
         return {
             "feed_status": "connected" if connected else "disconnected",
             "last_tick_age_seconds": age,
-            "pairs_streaming": pairs,
+            "selected_assets_streaming": pairs,
             "subscriber_count": subscriber_count,
             "signals_today": today,
             "last_signal_time": last_signal_time,
-            "last_hour_setup_funnel": funnel,
             "tick_to_signal_latency_ms": scan_latency,
             "signal_to_telegram_latency_ms": delivery_latency,
             "uptime_seconds": max(0, int(time.monotonic() - self.started_at)),
@@ -716,15 +730,6 @@ class TelegramCommandHandler:
         delivery_latency_text = (
             "n/a" if delivery_latency is None else f"{delivery_latency:.1f}ms"
         )
-        funnel = metrics["last_hour_setup_funnel"]
-        cancelled = funnel.get("cancelled_by_reason", {})
-        cancelled_text = (
-            ", ".join(
-                f"{reason}={count}" for reason, count in sorted(cancelled.items())
-            )
-            if cancelled
-            else "none"
-        )
         last_signal_time = metrics["last_signal_time"]
         if last_signal_time:
             parsed_time = datetime.fromisoformat(last_signal_time).astimezone(
@@ -737,14 +742,10 @@ class TelegramCommandHandler:
             f"Feed: {metrics['feed_status']}\n"
             f"SSID: {'configured' if os.environ.get('PO_SSID', '').strip() else 'missing'}\n"
             f"Last tick age: {age_text}\n"
-            f"Pairs streaming: {metrics['pairs_streaming']}\n"
+            f"Selected assets streaming: {metrics['selected_assets_streaming']}\n"
             f"Subscribers: {metrics['subscriber_count']}\n"
             f"Signals today: {metrics['signals_today']}\n"
             f"Last signal time: {last_signal_time}\n"
-            f"Last-hour setups: armed={funnel.get('armed', 0)}, "
-            f"fired={funnel.get('fired', 0)}, "
-            f"cancelled by reason: {cancelled_text}, "
-            f"expired={funnel.get('expired', 0)}\n"
             f"Tick-to-signal latency: {scan_latency_text}\n"
             f"Signal-to-Telegram latency: {delivery_latency_text}\n"
             f"Uptime: {metrics['uptime_seconds']}s"

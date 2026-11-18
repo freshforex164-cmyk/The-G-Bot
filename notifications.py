@@ -19,6 +19,13 @@ from strategy.price_action import SETUP_LABELS
 logger = logging.getLogger("gbot.notifications")
 
 
+def _expiry_label(seconds: int) -> str:
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return "1 minute" if minutes == 1 else f"{minutes} minutes"
+    return f"{seconds} seconds"
+
+
 def format_signal_message(signal: Signal) -> str:
     direction = html.escape(signal.direction.upper(), quote=False)
     icon = "🔴" if direction == "SELL" else "🟢"
@@ -29,7 +36,7 @@ def format_signal_message(signal: Signal) -> str:
         f"{icon} <b>{direction}</b>\n"
         f"Asset: {asset_name}\n"
         f"Setup: {setup}\n"
-        f"Expiry: 1 minute{payout}\n"
+        f"Expiry: {_expiry_label(signal.expiry_seconds)}{payout}\n"
         "Valid for: 10 seconds"
     )
 
