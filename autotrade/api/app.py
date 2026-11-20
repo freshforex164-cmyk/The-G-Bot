@@ -79,6 +79,13 @@ class SettingsPatch(BaseModel):
     max_tick_age_seconds: float | None = None
 
 
+class HandshakeStart(BaseModel):
+    """The phone's own screen size (CSS px), so the site is rendered to fit it."""
+    model_config = ConfigDict(extra="forbid")
+    width: int | None = Field(None, ge=200, le=4000)
+    height: int | None = Field(None, ge=200, le=4000)
+
+
 class StopBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     drain: bool = True
@@ -86,10 +93,11 @@ class StopBody(BaseModel):
 
 class InputEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    type: Literal["click", "text", "key", "scroll"]
+    type: Literal["click", "value", "text", "key", "scroll"]
     x: int | None = Field(None, ge=0, le=4000)
     y: int | None = Field(None, ge=0, le=4000)
     text: str | None = Field(None, max_length=256)
+    value: str | None = Field(None, max_length=256)   # "value": whole text of the focused field (may be "")
     key: str | None = Field(None, max_length=16)
     dy: int | None = Field(None, ge=-5000, le=5000)
 
@@ -158,7 +166,8 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
 
     @app.get("/login", response_class=HTMLResponse)
     async def login_page() -> HTMLResponse:
-        """Remote-browser login page (opened from the Telegram bot or your frontend). The token
+        """Phone login page (opened from the Telegram bot or your frontend): shows the real Pocket Option
+        mobile site edge to edge and puts a native input over the focused field. The token
         travels in the URL fragment (#t=...), so it never reaches server or proxy logs."""
         nonce = secrets.token_urlsafe(16)
         html = LOGIN_PAGE.read_text(encoding="utf-8").replace("{{NONCE}}", nonce)
@@ -203,9 +212,10 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
         return await rt.vault.status(p.user_id)
 
     @app.post("/auth/handshake", status_code=201)
-    async def handshake_start(p: Principal = Depends(auth)):
+    async def handshake_start(body: HandshakeStart | None = None, p: Principal = Depends(auth)):
+        vp = (body.width, body.height) if body and body.width and body.height else None
         try:
-            s = await rt.handshakes.start(p.user_id)
+            s = await rt.handshakes.start(p.user_id, vp)
         except RuntimeError as exc:
             raise HTTPException(503, str(exc)) from None
         return {"session_id": s.id, "state": s.state}
@@ -229,11 +239,21 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
         except RuntimeError as exc:
             raise HTTPException(409, str(exc)) from None
 
+    @app.get("/auth/handshake/{session_id}/view")
+    async def handshake_view(session_id: str, p: Principal = Depends(auth)):
+        """Phone viewport size + the focused input's position/type, so the page can place a native
+        input over it. Password values are never returned."""
+        _get(session_id, p)
+        try:
+            return await rt.handshakes.view(session_id, p.user_id)
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from None
+
     @app.post("/auth/handshake/{session_id}/input", status_code=204)
     async def handshake_input(session_id: str, ev: InputEvent, p: Principal = Depends(auth)):
         _get(session_id, p)
         if (ev.type == "click" and (ev.x is None or ev.y is None)) or (ev.type == "text" and not ev.text) \
-                or (ev.type == "key" and not ev.key):
+                or (ev.type == "key" and not ev.key) or (ev.type == "value" and ev.value is None):
             raise HTTPException(422, "missing fields for this input type")
         try:
             await rt.handshakes.interact(session_id, p.user_id, ev.model_dump(exclude_none=True))

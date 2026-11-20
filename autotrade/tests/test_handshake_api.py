@@ -15,12 +15,21 @@ class FakeBackend:
         self.tokens, self.error, self.wait = tokens, error, wait
         self.opened = self.closed = False
         self.events = []
+        self.viewport = (390, 844)
 
     async def open(self):
         self.opened = True
 
     async def screenshot(self):
         return b"\xff\xd8fakejpeg"
+
+    async def view(self):
+        return {"width": self.viewport[0], "height": self.viewport[1], "host": "pocketoption.com",
+                "field": {"x": 20, "y": 300, "w": 350, "h": 44, "type": "password", "name": "password", "value": ""},
+                "inputs": []}
+
+    def set_viewport(self, width, height):
+        self.viewport = (width, height)
 
     async def interact(self, event):
         self.events.append(event)
@@ -292,3 +301,76 @@ class ApiTests(unittest.TestCase):
         self.assertIn(f'nonce="{nonce}"', a.text)
         self.assertNotIn(nonce, b.text)
         self.assertEqual(a.headers["referrer-policy"], "no-referrer")
+
+    def test_phone_login_uses_the_phone_screen_size_and_native_field_input(self):
+        backend = FakeBackend(good_tokens("u1"), wait=5)
+        self.env.rt.handshakes._factory = lambda: backend
+        other = {"Authorization": f"Bearer {token(self.env.cfg.jwt_secret, sub='u2')}"}
+        with TestClient(self.app) as c:
+            r = c.post("/auth/handshake", headers=self.h, json={"width": 412, "height": 780})
+            self.assertEqual(r.status_code, 201)
+            sid = r.json()["session_id"]
+            self.assertEqual(backend.viewport, (412, 780))
+            v = c.get(f"/auth/handshake/{sid}/view", headers=self.h)
+            self.assertEqual(v.status_code, 200)
+            self.assertEqual((v.json()["width"], v.json()["field"]["type"]), (412, "password"))
+            self.assertEqual(c.get(f"/auth/handshake/{sid}/view", headers=other).status_code, 404)
+            # the native input sends the whole field text; an empty string clears the field
+            for val in ("me@example.com", ""):
+                self.assertEqual(c.post(f"/auth/handshake/{sid}/input", headers=self.h,
+                                        json={"type": "value", "value": val}).status_code, 204)
+            self.assertEqual(c.post(f"/auth/handshake/{sid}/input", headers=self.h, json={"type": "value"}).status_code, 422)
+            self.assertEqual(c.post(f"/auth/handshake/{sid}/input", headers=self.h,
+                                    json={"type": "value", "value": "x" * 257}).status_code, 422)
+            self.assertEqual([e.get("value") for e in backend.events], ["me@example.com", ""])
+            c.delete(f"/auth/handshake/{sid}", headers=self.h)
+
+
+FAKE_LOGIN = """data:text/html,<html><head><meta name=viewport content='width=device-width'></head><body style='margin:0'>
+<form style='padding:20px'><input id=email name=email type=email style='display:block;width:300px;height:40px;margin-top:100px'>
+<input id=pw name=password type=password style='display:block;width:300px;height:40px;margin-top:20px'>
+<button type=button id=g style='display:block;width:300px;height:40px;margin-top:20px'>Log in with Google</button></form>
+<script>document.getElementById('g').onclick=()=>document.title='google:'+innerWidth</script></body></html>"""
+
+
+class RealBrowserPhoneViewTests(unittest.IsolatedAsyncioTestCase):
+    """Drives a real headless Chromium against a fake login page (never the real site)."""
+
+    async def test_phone_view_taps_fill_native_fields_and_never_returns_the_password(self):
+        from ..auth.handshake import PlaywrightBackend
+        b = PlaywrightBackend(headless=True, login_url=FAKE_LOGIN.replace("\n", "").replace("#", "%23"))
+        b.set_viewport(1000, 100)                                   # clamped to a phone size
+        self.assertEqual(b._vp, {"width": 520, "height": 480})
+        b.set_viewport(375, 700)
+        try:
+            await b.open()
+        except Exception as exc:                                    # no Chromium installed here
+            await b.close()
+            self.skipTest(f"chromium unavailable: {type(exc).__name__}")
+        try:
+            page = b._page
+            self.assertEqual(await page.evaluate("innerWidth"), 375)
+            self.assertTrue(await page.evaluate("navigator.maxTouchPoints > 0"))
+            v = await b.view()
+            self.assertEqual([i["type"] for i in v["inputs"]], ["email", "password"])
+            self.assertIsNone(v["field"])
+            email, pw = v["inputs"]
+            await b.interact({"type": "click", "x": int(email["x"] + 10), "y": int(email["y"] + 10)})
+            await b.interact({"type": "value", "value": "me@example.com"})
+            await b.interact({"type": "value", "value": "me@example.org"})     # whole value replaced
+            self.assertEqual(await page.evaluate("document.getElementById('email').value"), "me@example.org")
+            self.assertEqual((await b.view())["field"]["value"], "me@example.org")
+            await b.interact({"type": "click", "x": int(pw["x"] + 10), "y": int(pw["y"] + 10)})
+            await b.interact({"type": "value", "value": "s3cret!"})
+            self.assertEqual(await page.evaluate("document.getElementById('pw').value"), "s3cret!")
+            f = (await b.view())["field"]
+            self.assertEqual((f["type"], f["value"]), ("password", ""))      # password never sent back
+            self.assertNotIn("s3cret", repr(await b.view()))
+            await b.interact({"type": "value", "value": ""})
+            self.assertEqual(await page.evaluate("document.getElementById('pw').value"), "")
+            await b.interact({"type": "click", "x": 30, "y": int(pw["y"] + pw["h"] + 30)})   # the Google button
+            await asyncio.sleep(0.2)
+            self.assertEqual(await page.title(), "google:375")
+            self.assertGreater(len(await b.screenshot()), 1000)
+        finally:
+            await b.close()

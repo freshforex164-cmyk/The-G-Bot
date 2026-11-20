@@ -27,7 +27,10 @@
   /at_stop, /at_stats, /at_set, /at_live confirm, /at_demo, /at_logout; admin /at_halt, /at_resume.
   Private chat only; slow calls run in the background — autotrade_client.py, autotrade_commands.py.
 - Login page served by the service at /login (token in URL fragment, login token can't trade) —
-  autotrade/api/login_page.html.
+  autotrade/api/login_page.html. Shows Pocket Option's own mobile login page full screen, rendered at
+  the user's phone size; tapping the site's email/password field opens the phone's own keyboard
+  (native input over the field, autofill works); Google button tappable; drag to scroll. No separate
+  "type here" box any more.
 
 ## Verified live (DEMO SSID, read-only, 2026-11-20 07:05–07:20 UTC)
 - availability: 40/56 catalogue assets ticking within 10 s (was 3/56 on 0.2.15).
@@ -39,10 +42,12 @@
 
 ## Mock-only / offline
 - Full suite: 187 tests, 144 pass, 43 skipped as OBSOLETE, 0 fail (17 new auto-trading command tests).
-- autotrade suite: 72 pass, 3 skipped (Postgres tests need AUTOTRADE_TEST_DATABASE_URL), incl. GBot's
+- autotrade suite: 77 tests, 74 pass, 3 skipped (Postgres tests need AUTOTRADE_TEST_DATABASE_URL), incl. GBot's
   client against the real API app and login-token limits.
-- Login page in headless Chromium at phone size against a fake login screen: tap position mapped
-  correctly, typed text and Enter delivered, "Connected" shown, token removed from the address bar.
+- Login page in headless Chromium at phone size against a fake login screen: tapping the email and
+  password fields focused a native input, typing filled the site's fields, Google button tap reached
+  the page, password never returned by /view. NOT VERIFIED on the real Pocket Option page (not
+  reachable from the test machine on 2026-11-20), Google pop-up, real Telegram client.
 - Skipped tests were already failing before today and test removed features (old CLI,
   15 s candles, paper tracker, strength ranking, /start-subscribes flow); reason is on each.
 - Strategy engine unchanged; 27 strategy tests pass, incl. new-high -> pullback SELL ->

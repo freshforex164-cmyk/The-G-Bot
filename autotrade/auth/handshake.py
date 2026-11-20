@@ -1,8 +1,10 @@
 """Automated session handshake.
 
-The user logs in themselves (email/password, Google, CAPTCHA, 2FA) inside an isolated browser
-that runs on the server; the frontend shows it through ``screen`` + ``input`` endpoints. We never
-read the password field: we only watch the WebSocket auth frame the Pocket Option page sends
+The user logs in themselves (email/password, Google, CAPTCHA, 2FA) on the real Pocket Option site,
+rendered as a phone-sized page by an isolated browser on the server. The frontend shows it edge to
+edge through ``screen`` (picture) + ``view`` (where the focused input is) + ``input`` endpoints, and
+puts a real native <input> over whichever field is focused, so the phone's own keyboard, autofill and
+password manager work directly in the site's email/password fields. We never read the password field: we only watch the WebSocket auth frame the Pocket Option page sends
 after login (``42["auth",{...}]``), extract the Demo and Real SSIDs, close the browser, and hand
 the tokens to the vault.
 
@@ -33,13 +35,55 @@ CABINET_URL = {  # which page makes the web app connect as that account type (ad
 }
 ALLOWED_HOSTS = ("pocketoption.com", "po.market", "po.cash", "google.com", "gstatic.com", "recaptcha.net",
                  "googleusercontent.com", "youtube.com")
-VIEWPORT = {"width": 1100, "height": 760}
+VIEWPORT = {"width": 390, "height": 844}     # a phone: the site serves its mobile login layout
+DEVICE_SCALE = 2
+MIN_VIEW, MAX_VIEW = (320, 480), (520, 1100)   # accepted phone screen sizes (CSS px)
+MOBILE_UA = ("Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) "
+             "Chrome/130.0.0.0 Mobile Safari/537.36")
+MAX_VALUE_LEN = 256
+# Describes the focused editable element (position in CSS px of the phone viewport). The value is only
+# returned for non-password fields so the phone-side input can continue where the text left off.
+FOCUS_JS = """() => {
+  let el = document.activeElement;
+  while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+  if (!el) return null;
+  const tag = el.tagName;
+  const editable = el.isContentEditable || tag === 'TEXTAREA' ||
+    (tag === 'INPUT' && !['button','submit','checkbox','radio','file','image','reset','range','color'].includes((el.type || 'text').toLowerCase()));
+  if (!editable) return null;
+  const r = el.getBoundingClientRect();
+  if (r.width < 2 || r.height < 2) return null;
+  const type = tag === 'INPUT' ? (el.type || 'text').toLowerCase() : 'text';
+  return { x: r.left, y: r.top, w: r.width, h: r.height, type,
+           name: String(el.name || el.id || '').slice(0, 40),
+           value: type === 'password' ? '' : String(el.value || el.textContent || '').slice(0, 256),
+           filled: !!(el.value || el.textContent) };
+}"""
+# Visible text boxes on the page, so a tap on one can open the phone keyboard immediately. No values.
+INPUTS_JS = """() => {
+  const out = [];
+  const skip = ['button','submit','checkbox','radio','file','image','reset','range','color','hidden'];
+  for (const el of document.querySelectorAll('input, textarea, [contenteditable=""], [contenteditable="true"]')) {
+    if (el.tagName === 'INPUT' && skip.includes((el.type || 'text').toLowerCase())) continue;
+    if (el.disabled || el.readOnly) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8 || r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) continue;
+    const st = getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.display === 'none' || Number(st.opacity) === 0) continue;
+    out.push({ x: r.left, y: r.top, w: r.width, h: r.height,
+               type: el.tagName === 'INPUT' ? (el.type || 'text').toLowerCase() : 'text',
+               name: String(el.name || el.id || el.getAttribute('autocomplete') || '').slice(0, 40) });
+    if (out.length >= 12) break;
+  }
+  return out;
+}"""
 ALLOWED_KEYS = {"Enter", "Tab", "Backspace", "Delete", "Escape", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Space"}
 
 
 class CaptureBackend(Protocol):
     async def open(self) -> None: ...
     async def screenshot(self) -> bytes: ...
+    async def view(self) -> dict[str, Any]: ...
     async def interact(self, event: dict[str, Any]) -> None: ...
     async def capture_tokens(self, timeout: float, on_status: Callable[[str], None]) -> tuple[dict[str, str], dict[str, Any]]: ...
     async def close(self) -> None: ...
@@ -68,24 +112,34 @@ def host_allowed(url: str, *, navigation: bool, hosts: tuple[str, ...] = ALLOWED
 
 
 class PlaywrightBackend:
-    def __init__(self, headless: bool = True, hosts: tuple[str, ...] = ALLOWED_HOSTS):
-        self._headless, self._hosts = headless, hosts
+    def __init__(self, headless: bool = True, hosts: tuple[str, ...] = ALLOWED_HOSTS, login_url: str = LOGIN_URL):
+        self._headless, self._hosts, self._login_url = headless, hosts, login_url
+        self._vp = dict(VIEWPORT)
         self._pw = self._browser = self._context = None
         self._pages: list[Any] = []
         self._frames: dict[str, str] = {}
         self._event = asyncio.Event()
 
+    def set_viewport(self, width: int, height: int) -> None:
+        """Match the user's own screen so the site fills the phone edge to edge. Before open()."""
+        self._vp = {"width": min(max(int(width), MIN_VIEW[0]), MAX_VIEW[0]),
+                    "height": min(max(int(height), MIN_VIEW[1]), MAX_VIEW[1])}
+
     async def open(self) -> None:
         from playwright.async_api import async_playwright
 
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(headless=self._headless)
+        self._browser = await self._pw.chromium.launch(
+            headless=self._headless, args=["--disable-blink-features=AutomationControlled"])
         # A fresh, non-persistent context per handshake: no shared cookies, nothing written to disk.
-        self._context = await self._browser.new_context(viewport=VIEWPORT, locale="en-US", accept_downloads=False)
+        # Phone emulation (touch, mobile user agent) makes the site serve its standard mobile web layout.
+        self._context = await self._browser.new_context(
+            viewport=self._vp, device_scale_factor=DEVICE_SCALE, is_mobile=True, has_touch=True,
+            user_agent=MOBILE_UA, locale="en-US", accept_downloads=False)
         await self._context.route("**/*", self._route)
         self._context.on("page", self._attach)
         page = await self._context.new_page()
-        await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
+        await page.goto(self._login_url, wait_until="domcontentloaded", timeout=45000)
 
     async def _route(self, route, request) -> None:
         nav = request.is_navigation_request()
@@ -124,20 +178,48 @@ class PlaywrightBackend:
             raise RuntimeError("browser is not open")
         return await page.screenshot(type="jpeg", quality=60)
 
+    async def view(self) -> dict[str, Any]:
+        """Phone viewport size, the focused input (if any) and which site is showing. Never a password."""
+        page = self._page
+        if page is None:
+            raise RuntimeError("browser is not open")
+        try:
+            field = await page.evaluate(FOCUS_JS)
+            inputs = await page.evaluate(INPUTS_JS)
+        except Exception:      # page is navigating
+            field, inputs = None, []
+        host = (urlparse(page.url).hostname or "") if page.url else ""
+        return {"width": self._vp["width"], "height": self._vp["height"], "field": field,
+                "inputs": inputs, "host": host}
+
     async def interact(self, event: dict[str, Any]) -> None:
         page = self._page
         if page is None:
             return
         kind = event.get("type")
         if kind == "click":
-            x = min(max(int(event["x"]), 0), VIEWPORT["width"] - 1)
-            y = min(max(int(event["y"]), 0), VIEWPORT["height"] - 1)
-            await page.mouse.click(x, y)
+            x = min(max(int(event["x"]), 0), self._vp["width"] - 1)
+            y = min(max(int(event["y"]), 0), self._vp["height"] - 1)
+            await page.touchscreen.tap(x, y)
+        elif kind == "value":
+            # The phone-side input holds the whole text: replace the focused field's content with it.
+            # Typed text goes straight to the site's own field and is never logged or stored.
+            if await page.evaluate(FOCUS_JS) is None:
+                return
+            text = str(event.get("value", ""))[:MAX_VALUE_LEN]
+            await page.keyboard.press("Control+A")
+            if text:
+                await page.keyboard.insert_text(text)
+            else:
+                await page.keyboard.press("Backspace")
         elif kind == "text":
-            await page.keyboard.insert_text(str(event["text"])[:256])   # never logged
+            await page.keyboard.insert_text(str(event["text"])[:MAX_VALUE_LEN])
         elif kind == "key" and event.get("key") in ALLOWED_KEYS:
             await page.keyboard.press(str(event["key"]))
         elif kind == "scroll":
+            x = min(max(int(event.get("x", self._vp["width"] // 2)), 0), self._vp["width"] - 1)
+            y = min(max(int(event.get("y", self._vp["height"] // 2)), 0), self._vp["height"] - 1)
+            await page.mouse.move(x, y)
             await page.mouse.wheel(0, max(-2000, min(2000, int(event.get("dy", 0)))))
 
     async def capture_tokens(self, timeout, on_status):
@@ -228,7 +310,7 @@ class HandshakeManager:
             if not s.active and s.created_at and (now - s.created_at).total_seconds() > 900:
                 del self._sessions[sid]
 
-    async def start(self, user_id: str) -> HandshakeSession:
+    async def start(self, user_id: str, viewport: tuple[int, int] | None = None) -> HandshakeSession:
         self._prune()
         for s in list(self._sessions.values()):
             if s.user_id == user_id and s.active:
@@ -236,6 +318,8 @@ class HandshakeManager:
         if sum(1 for s in self._sessions.values() if s.active) >= self._cfg.max_handshakes:
             raise RuntimeError("too many logins in progress, try again shortly")
         session = HandshakeSession(secrets.token_urlsafe(24), user_id, created_at=self._clock.utcnow(), backend=self._factory())
+        if viewport and hasattr(session.backend, "set_viewport"):
+            session.backend.set_viewport(*viewport)
         self._sessions[session.id] = session
         session.task = asyncio.create_task(self._run(session), name=f"handshake:{session.id[:6]}")
         return session
@@ -251,6 +335,12 @@ class HandshakeManager:
         if not s.active or s.backend is None:
             raise RuntimeError("login session is not active")
         return await s.backend.screenshot()
+
+    async def view(self, session_id: str, user_id: str) -> dict[str, Any]:
+        s = self.get(session_id, user_id)
+        if not s.active or s.backend is None:
+            raise RuntimeError("login session is not active")
+        return await s.backend.view()
 
     async def interact(self, session_id: str, user_id: str, event: dict[str, Any]) -> None:
         s = self.get(session_id, user_id)

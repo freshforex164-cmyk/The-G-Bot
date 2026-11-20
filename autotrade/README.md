@@ -27,9 +27,13 @@ repo root (GBot side, standard library only, no new GBot dependencies)
 ```
 
 ## How it fits together
-1. `POST /auth/handshake` starts an isolated Chromium on the server at the Pocket Option login page.
-   The frontend shows it with `GET .../screen` (JPEG, poll ~2/s) and sends clicks/typing to `POST .../input`.
-   The user completes login, CAPTCHA and 2FA there. We read only the WebSocket `42["auth",{...}]` frame,
+1. `POST /auth/handshake` (body `{"width","height"}` = the phone's screen in CSS px) starts an isolated
+   Chromium on the server that emulates that phone (touch, mobile user agent), so Pocket Option serves its
+   standard mobile login page with its own email/password fields and "Log in with Google" button.
+   `/login` shows that page edge to edge (`GET .../screen`). `GET .../view` says where the site's text
+   boxes are and which one is focused; the page puts a real native `<input>` over it, so the phone's own
+   keyboard, autofill and password manager type straight into the site's field (`POST .../input`
+   `{"type":"value"}`). Taps are taps, drags scroll. The user completes login, CAPTCHA and 2FA there. We read only the WebSocket `42["auth",{...}]` frame,
    take the Demo and Real SSIDs, **close the browser**, then hand both to the vault.
 2. Vault: each SSID is AES-256-GCM encrypted; the user id and account kind are bound as associated data.
    Key ring supports rotation (`TokenVault.rewrap`).
@@ -99,13 +103,19 @@ The commands are registered in Telegram's menu only when these are set.
 ## Integrating with your codebase
 - Auth: set the same JWT secret, or pass your own dependency: `create_app(rt, auth=your_dependency)`
   returning `Principal(user_id, is_admin)`.
-- Frontend: call `/auth/handshake`, draw the JPEG from `/screen`, forward clicks/keys to `/input`, poll
-  the handshake state until `done`; then show Demo/Live, settings and `/trading/stats`.
+- Frontend: easiest is to open `/login#t=<login token>` (phone web view / Telegram Mini App). Own UI:
+  `POST /auth/handshake` with the screen size, draw `/screen`, place a native input over `view.field`,
+  send taps (`click`), whole field text (`value`), `Enter` (`key`) and drags (`scroll`) to `/input`,
+  poll the handshake state until `done`; then show Demo/Live, settings and `/trading/stats`.
+- Why not load pocketoption.com directly in our page: the site cannot be embedded in another site, and
+  its login cookies and WebSocket belong to its own domain, so no page of ours could read the session.
+  The phone view above is the closest to "direct" that still lets us capture the SSID automatically.
 - Database: your own Postgres; run `schema.sql`. On Supabase, the script already revokes `anon`/`authenticated`.
 - New strategy: add a class with `required_symbols` and `on_tick` to `trading/strategy.py` and register it in `STRATEGIES`.
 
 ## Security notes
 - Typed login text passes through the server to the isolated browser; it is never logged or stored.
+  `/view` never returns the value of a password field.
   Tokens are redacted from logs (`logging_utils`). Do not enable library debug logging.
 - The capture browser blocks private/local addresses and limits top-level navigation to login hosts.
   Also run it with no access to your internal network.
@@ -117,7 +127,8 @@ The commands are registered in Telegram's menu only when these are set.
 ## Verified vs not verified
 Verified offline: encryption, risk rules, workers, isolation, reconnect, API, handshake logic with a fake
 browser, Postgres schema/queries, GBot's client against the real API app, the Telegram commands, and the
-login page in a real Chromium (phone size) against a fake login screen. NOT VERIFIED: the Docker image
-build, the real login flow (URLs, allowed hosts, account switching in `auth/handshake.py`), the Telegram
+phone login page in a real Chromium (phone size: native keyboard fills the site's email/password
+fields, taps reach the Google button) against a fake login screen. NOT VERIFIED: the Docker image
+build, the real Pocket Option mobile login page (its layout, the Google pop-up, CAPTCHA), the real login flow (URLs, allowed hosts, account switching in `auth/handshake.py`), the Telegram
 Mini App inside a real Telegram client, Google sign-in (Google may refuse automated browsers), real order placement,
 and the error-text matching in `trading/broker.py::map_exception`.
