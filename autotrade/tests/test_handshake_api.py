@@ -267,3 +267,28 @@ class ApiTests(unittest.TestCase):
             self.assertTrue(c.get("/healthz").json()["halted"])
             c.post("/admin/resume", headers=admin)
             self.assertFalse(c.get("/healthz").json()["halted"])
+
+    def test_login_link_token_can_only_drive_the_handshake(self):
+        login = {"Authorization": f"Bearer {token(self.env.cfg.jwt_secret, scope='login', role='admin')}"}
+        with TestClient(self.app) as c:
+            self.assertEqual(c.post("/auth/handshake", headers=login).status_code, 201)
+            for method, path in (("post", "/trading/start"), ("post", "/trading/stop"), ("get", "/trading/stats"),
+                                 ("get", "/trading/settings"), ("get", "/auth/status"), ("delete", "/auth/sessions"),
+                                 ("post", "/admin/halt")):
+                self.assertEqual(getattr(c, method)(path, headers=login).status_code, 403, path)
+            self.assertEqual(c.patch("/trading/settings", headers=login, json={"stake": 2}).status_code, 403)
+            self.assertFalse(c.get("/healthz").json()["halted"])
+            odd = {"Authorization": f"Bearer {token(self.env.cfg.jwt_secret, scope='root')}"}
+            self.assertEqual(c.get("/trading/stats", headers=odd).status_code, 401)
+
+    def test_login_page_is_served_with_a_fresh_script_nonce(self):
+        import re
+        with TestClient(self.app) as c:
+            a, b = c.get("/login"), c.get("/login")
+        self.assertEqual(a.status_code, 200)
+        self.assertIn("text/html", a.headers["content-type"])
+        self.assertNotIn("{{NONCE}}", a.text)
+        nonce = re.search(r"'nonce-([^']+)'", a.headers["content-security-policy"]).group(1)
+        self.assertIn(f'nonce="{nonce}"', a.text)
+        self.assertNotIn(nonce, b.text)
+        self.assertEqual(a.headers["referrer-policy"], "no-referrer")

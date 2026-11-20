@@ -11,6 +11,8 @@ from typing import Sequence
 
 import config
 from admin_http import AdminHttpServer
+from autotrade_client import AutotradeClient
+from autotrade_commands import AUTOTRADE_ADMIN_COMMANDS, AUTOTRADE_COMMANDS
 from broker.pocket_option import (
     PocketOptionAuthenticationError,
     PocketOptionBroker,
@@ -587,7 +589,19 @@ async def run_serve() -> None:
 
     bot = TelegramBotClient(token)
     try:
-        await bot.register_commands(admin_id)
+        # None unless AUTOTRADE_API_URL and AUTOTRADE_JWT_SECRET are set.
+        autotrade = AutotradeClient.from_env()
+    except ValueError as exc:
+        raise config.ConfigurationError(str(exc)) from None
+    try:
+        if autotrade is None:
+            await bot.register_commands(admin_id)
+        else:
+            await bot.register_commands(
+                admin_id,
+                extra_public=AUTOTRADE_COMMANDS,
+                extra_admin=AUTOTRADE_ADMIN_COMMANDS,
+            )
     except TelegramSendError as exc:
         logger.warning(
             "Telegram command registration failed (%s); polling will still start.",
@@ -627,6 +641,7 @@ async def run_serve() -> None:
         admin_chat_id=admin_chat_id,
         test_signal_provider=_test_signal_messages,
         background_selection=True,
+        autotrade=autotrade,
     )
     polling = TelegramPollingService(bot, handler)
     stop_event = asyncio.Event()

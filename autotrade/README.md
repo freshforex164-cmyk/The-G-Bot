@@ -1,7 +1,9 @@
 # autotrade - multi-user auto-trading module
 
-Separate service. It is **not** imported by the GBot Telegram bot, is not in `render.yaml`, and the
-bot itself still never trades. Everything here is off until you deploy and call it.
+Separate service. It is not in `render.yaml`, and GBot's signal scanner still never trades. GBot only
+*controls* this service through the optional `/autotrade` Telegram commands (`autotrade_client.py`,
+`autotrade_commands.py` at the repo root), which stay "not set up" until you deploy the service and
+set `AUTOTRADE_API_URL` + `AUTOTRADE_JWT_SECRET` on GBot.
 
 ## Layout
 ```text
@@ -14,8 +16,14 @@ autotrade/
   trading/   models.py (settings) | strategy.py (plug-ins) | risk.py | broker.py (BinaryOptionsTools-v2 adapter)
              worker.py (one task + one WebSocket per user) | manager.py (supervisor)
   storage/   repo.py (interface + in-memory) | postgres.py
-  api/       app.py (FastAPI)
-  tests/     69 offline tests (+3 Postgres tests when AUTOTRADE_TEST_DATABASE_URL is set)
+  api/       app.py (FastAPI) | login_page.html (remote-browser login page, opened from Telegram)
+  tests/     72 offline tests (+3 Postgres tests when AUTOTRADE_TEST_DATABASE_URL is set)
+  Dockerfile                 image with Chromium (build from repo root)
+
+repo root (GBot side, standard library only, no new GBot dependencies)
+  autotrade_client.py        signs short-lived tokens for tg:<telegram user id> and calls the service
+  autotrade_commands.py      /autotrade, /at_* Telegram commands
+  tests/test_autotrade_commands.py
 ```
 
 ## How it fits together
@@ -41,6 +49,25 @@ autotrade/
 | GET/POST/DELETE | /auth/status, /auth/handshake[...] | Login capture; `DELETE /auth/sessions` revokes tokens and stops the bot |
 | POST | /admin/halt, /admin/resume | Operator kill switch (JWT claim `role=admin`) |
 | GET | /healthz | Feed state |
+| GET | /login | Login page. Token in the URL fragment `#t=...`; a `scope=login` token works only on `/auth/handshake*` |
+
+## Telegram commands (GBot)
+Private chat with the bot only. Each Telegram user is service user `tg:<telegram user id>`.
+
+| Command | What it does |
+|---|---|
+| /autotrade | Overview: mode, bot status, Demo/Real session status, today's P/L, settings |
+| /at_login | Sends a "Log in to Pocket Option" button (Telegram Mini App) with a 15-minute login-only link |
+| /at_start, /at_stop | Start; stop (waits for open trades to finish) |
+| /at_stats | Today + all-time results and the last 5 trades |
+| /at_set name value | `stake`, `expiry`, `max_trades`, `stop_loss`, `take_profit`, `cooldown`, `min_payout`, `gap`; no arguments shows current values |
+| /at_live confirm | Switch to Live (without `confirm` it only shows the warning) |
+| /at_demo | Back to Demo |
+| /at_logout | Stop the bot and delete the stored sessions |
+| /at_halt, /at_resume | Admin, in the admin chat only: global kill switch |
+
+Expired session -> the bot answers "send /at_login". Service down -> "can't be reached"; other users
+are not affected, and slow calls run in the background so the signal menu never freezes.
 
 ## Risk controls (per user)
 stake, expiry, max concurrent, daily stop-loss and take-profit (both mandatory, UTC day, realized P/L
@@ -51,6 +78,8 @@ A new login resets the user to Demo. Orders are never retried; an order that fai
 as `unknown` for review. Errors in one worker never reach another.
 
 ## Setup
+Deploy as its own service from the repo root with `autotrade/Dockerfile` (e.g. a Render *Docker* web
+service, Dockerfile path `./autotrade/Dockerfile`, context `.`), plus a Postgres database. Without Docker:
 ```bash
 pip install -r autotrade/requirements.txt && playwright install --with-deps chromium
 python -c "from autotrade.vault.crypto import KeyRing; print(KeyRing.generate_key())"   # -> AUTOTRADE_VAULT_KEY
@@ -61,6 +90,11 @@ optional `AUTOTRADE_ALLOW_LIVE`, `AUTOTRADE_MAX_STAKE`, `AUTOTRADE_MAX_WORKERS`,
 Run `AUTOTRADE_APPLY_SCHEMA=1 python -m autotrade.main` once (applies `schema.sql`), then without the flag.
 Keep the vault key out of the database and out of git. Run as its own service (needs Chromium and a
 long-lived process, so not a serverless function and not the Render GBot service).
+
+GBot (the existing Render service) gets three variables and no new packages:
+`AUTOTRADE_API_URL` (URL GBot calls), `AUTOTRADE_PUBLIC_URL` (HTTPS URL users open for login; defaults to the
+API URL; must be HTTPS for the in-Telegram button) and `AUTOTRADE_JWT_SECRET` (same value as the service).
+The commands are registered in Telegram's menu only when these are set.
 
 ## Integrating with your codebase
 - Auth: set the same JWT secret, or pass your own dependency: `create_app(rt, auth=your_dependency)`
@@ -82,6 +116,8 @@ long-lived process, so not a serverless function and not the Render GBot service
 
 ## Verified vs not verified
 Verified offline: encryption, risk rules, workers, isolation, reconnect, API, handshake logic with a fake
-browser, Postgres schema/queries. NOT VERIFIED: the real login flow (URLs, allowed hosts, account switching
-in `auth/handshake.py`), Google sign-in (Google may refuse automated browsers), real order placement,
+browser, Postgres schema/queries, GBot's client against the real API app, the Telegram commands, and the
+login page in a real Chromium (phone size) against a fake login screen. NOT VERIFIED: the Docker image
+build, the real login flow (URLs, allowed hosts, account switching in `auth/handshake.py`), the Telegram
+Mini App inside a real Telegram client, Google sign-in (Google may refuse automated browsers), real order placement,
 and the error-text matching in `trading/broker.py::map_exception`.

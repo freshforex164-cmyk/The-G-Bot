@@ -17,6 +17,8 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import config
+from autotrade_commands import ALL_COMMANDS as AUTOTRADE_COMMAND_NAMES
+from autotrade_commands import AutotradeCommands
 from market_assets import CATALOG, CATALOG_BY_ID, CATEGORIES
 from notifications import TelegramNotifier, TelegramSendError, format_signal_message
 from strategy.model import Signal
@@ -195,16 +197,25 @@ class TelegramBotClient:
     async def answer_callback(self, callback_id: str) -> None:
         await self.call("answerCallbackQuery", {"callback_query_id": callback_id})
 
-    async def register_commands(self, admin_id: int | str) -> None:
+    async def register_commands(
+        self,
+        admin_id: int | str,
+        *,
+        extra_public: list[dict[str, str]] | None = None,
+        extra_admin: list[dict[str, str]] | None = None,
+    ) -> None:
+        """extra_* add optional command groups (the auto-trading commands when configured)."""
         default_scope = {"type": "default"}
         admin_scope = {"type": "chat", "chat_id": admin_id}
+        public = PUBLIC_COMMANDS + list(extra_public or [])
+        admin = public + ADMIN_COMMANDS[len(PUBLIC_COMMANDS):] + list(extra_admin or [])
         await self.call(
             "setMyCommands",
-            {"commands": PUBLIC_COMMANDS, "scope": default_scope},
+            {"commands": public, "scope": default_scope},
         )
         await self.call(
             "setMyCommands",
-            {"commands": ADMIN_COMMANDS, "scope": admin_scope},
+            {"commands": admin, "scope": admin_scope},
         )
         for label, scope in (("default", default_scope), ("admin", admin_scope)):
             commands = await self.call("getMyCommands", {"scope": scope})
@@ -241,8 +252,12 @@ class TelegramCommandHandler:
         test_signal_provider: Callable[[], Awaitable[list[str]]] | None = None,
         clock: Callable[[], float] = time.monotonic,
         background_selection: bool = False,
+        autotrade: Any = None,
     ) -> None:
         self.client = client
+        # Optional: AutotradeClient for the separate auto-trading service. None = commands say "not set up".
+        self.autotrade_enabled = autotrade is not None
+        self.autotrade = AutotradeCommands(autotrade, self._autotrade_send)
         self.subscribers = subscribers
         self.admin_id = admin_id
         self.referral_link = self._valid_referral(referral_link)
@@ -412,8 +427,10 @@ class TelegramCommandHandler:
         text = message.get("text")
         if chat_id is None or not isinstance(text, str) or not text.startswith("/"):
             return
-        command = text.split(maxsplit=1)[0][1:].split("@", 1)[0].lower()
-        await self._dispatch(command, chat_id, sender_id=sender_id)
+        parts = text.split(maxsplit=1)
+        command = parts[0][1:].split("@", 1)[0].lower()
+        args = parts[1] if len(parts) > 1 else ""
+        await self._dispatch(command, chat_id, sender_id=sender_id, args=args)
 
     async def _dispatch(
         self,
@@ -422,7 +439,26 @@ class TelegramCommandHandler:
         *,
         sender_id: int | None = None,
         from_menu: bool = False,
+        args: str = "",
     ) -> None:
+        if command in AUTOTRADE_COMMAND_NAMES:
+            if from_menu or sender_id is None:
+                return
+            is_admin = (
+                self.admin_id is not None
+                and sender_id == self.admin_id
+                and self.admin_chat_id is not None
+                and str(chat_id) == str(self.admin_chat_id)
+            )
+            work = self._autotrade_safe(command, chat_id, sender_id, args, is_admin)
+            if self.background_selection:
+                # Service calls can be slow (e.g. /at_stop waits for open trades): never block polling.
+                task = asyncio.create_task(work, name=f"autotrade-{command}-{chat_id}")
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+            else:
+                await work
+            return
         if command in {"start", "stop", "status", "help", "register", "pricecheck"}:
             if command == "start":
                 if from_menu:
@@ -451,7 +487,13 @@ class TelegramCommandHandler:
                     "GBot reports informational price-action signals from closed "
                     "1-minute candles. Use /start to choose one asset, /status to "
                     "check your selection, /pricecheck for its latest price, and "
-                    "/stop to stop receiving signals. GBot never places trades.\n\n"
+                    "/stop to stop receiving signals. Signals never place trades.\n\n"
+                    + (
+                        "Optional auto-trading runs on a separate service, starts in Demo "
+                        "and only works in a private chat: /autotrade.\n\n"
+                        if self.autotrade_enabled
+                        else ""
+                    )
                     + html.escape(config.PAYOUT_DISCLAIMER, quote=False),
                     command="help",
                     force=True,
@@ -530,6 +572,23 @@ class TelegramCommandHandler:
         await self._send_command_reply(
             chat_id, "Unknown command. Use /help.", command=command
         )
+
+    async def _autotrade_send(
+        self, chat_id: int, text: str, *, reply_markup: Mapping[str, Any] | None = None
+    ) -> None:
+        await self.client.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=None)
+
+    async def _autotrade_safe(
+        self, command: str, chat_id: int, sender_id: int, args: str, is_admin: bool
+    ) -> None:
+        try:
+            await self.autotrade.handle(command, chat_id, sender_id, args, is_admin=is_admin)
+        except Exception as exc:
+            logger.error("Auto-trading command failed (%s).", type(exc).__name__)
+            try:
+                await self._autotrade_send(chat_id, "Sorry, that didn't work. Try again in a minute.")
+            except Exception:
+                logger.warning("Could not send the auto-trading error reply.")
 
     def _keyboard(self, chat_id: int) -> dict[str, Any]:
         subscriber = self.subscribers.subscribers.get(chat_id)

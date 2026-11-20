@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Connect Pocket Option</title>
+<script nonce="{{NONCE}}" src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { color-scheme: light dark; --bg:#0f1720; --fg:#e8eef4; --muted:#93a4b5; --accent:#2fb37a; --bad:#e5604f; --card:#18232f; }
+  body { margin:0; font:15px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:1120px; margin:0 auto; padding:12px; }
+  h1 { font-size:18px; margin:4px 0 8px; }
+  p { margin:6px 0; color:var(--muted); }
+  #msg { padding:8px 10px; border-radius:8px; background:var(--card); margin:8px 0; }
+  #msg.bad { color:var(--bad); } #msg.good { color:var(--accent); }
+  #screen { width:100%; max-width:1100px; border-radius:6px; display:none; cursor:crosshair; background:#000; touch-action:manipulation; }
+  .row { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; align-items:center; }
+  input[type=password], input[type=text] { flex:1 1 220px; min-width:0; padding:9px; border-radius:6px; border:1px solid #33475b; background:var(--card); color:var(--fg); font-size:16px; }
+  button { padding:9px 12px; border-radius:6px; border:0; background:#2a3b4c; color:var(--fg); font-size:14px; }
+  button.primary { background:var(--accent); color:#06140d; font-weight:600; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Connect your Pocket Option account</h1>
+  <p>The login page below runs in a private browser on our server. Tap where you would click, and
+     type with the box under it. We never read your password: once you are logged in we keep only the
+     session for your Demo and Real accounts (encrypted) and close the browser.</p>
+  <div id="msg">Preparing…</div>
+  <div class="row" id="startRow" hidden><button class="primary" id="startBtn">Open Pocket Option login</button></div>
+  <img id="screen" alt="Pocket Option login page">
+  <div id="controls" hidden>
+    <div class="row">
+      <input id="text" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Tap a field above, then type here">
+      <button id="sendText" class="primary">Type</button>
+      <label><input type="checkbox" id="show"> show</label>
+    </div>
+    <div class="row">
+      <button data-key="Enter">Enter</button><button data-key="Tab">Tab</button>
+      <button data-key="Backspace">⌫</button><button data-scroll="-400">Scroll up</button>
+      <button data-scroll="400">Scroll down</button><button id="cancel">Cancel</button>
+    </div>
+  </div>
+</main>
+<script nonce="{{NONCE}}">
+(() => {
+  const tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
+  const token = new URLSearchParams(location.hash.slice(1)).get("t");
+  history.replaceState(null, "", location.pathname);           // drop the token from the address bar
+  const $ = (id) => document.getElementById(id);
+  const msg = (t, cls) => { $("msg").textContent = t; $("msg").className = cls || ""; };
+  const base = new URL(".", location.href);
+  const api = (path, opts = {}) => fetch(new URL(path, base), {
+    ...opts, cache: "no-store",
+    headers: { "Authorization": "Bearer " + token, ...(opts.body ? { "Content-Type": "application/json" } : {}) },
+  });
+  let sid = null, screenTimer = null, statusTimer = null, lastUrl = null, busy = false;
+
+  if (!token) { msg("This link is missing its login code. Send /at_login in Telegram to get a new one.", "bad"); return; }
+  $("startRow").hidden = false;
+  msg("Tap the button to open the Pocket Option login page.");
+
+  function stop() { clearInterval(screenTimer); clearInterval(statusTimer); screenTimer = statusTimer = null; }
+  function expired() { stop(); msg("This login link has expired. Send /at_login in Telegram to get a new one.", "bad"); }
+
+  $("startBtn").onclick = async () => {
+    $("startBtn").disabled = true; msg("Opening the login page… (this can take ~10 seconds)");
+    const r = await api("auth/handshake", { method: "POST" });
+    if (r.status === 401) return expired();
+    if (!r.ok) { $("startBtn").disabled = false; msg("Could not open the login page right now. Try again in a minute.", "bad"); return; }
+    sid = (await r.json()).session_id;
+    $("startRow").hidden = true; $("controls").hidden = false; $("screen").style.display = "block";
+    screenTimer = setInterval(refreshScreen, 700); statusTimer = setInterval(refreshStatus, 1500);
+  };
+
+  async function refreshScreen() {
+    if (busy || !sid) return; busy = true;
+    try {
+      const r = await api(`auth/handshake/${sid}/screen`);
+      if (r.status === 401) return expired();
+      if (r.status === 409) { refreshStatus(); return; }      // browser already closed
+      if (r.ok) { const url = URL.createObjectURL(await r.blob()); $("screen").src = url; if (lastUrl) URL.revokeObjectURL(lastUrl); lastUrl = url; }
+    } catch (e) {} finally { busy = false; }
+  }
+
+  async function refreshStatus() {
+    const r = await api(`auth/handshake/${sid}`);
+    if (r.status === 401) return expired();
+    if (!r.ok) return;
+    const s = await r.json();
+    if (s.state === "starting") msg("Opening the login page…");
+    else if (s.state === "waiting_for_login") msg("Log in as you normally would (email + password, Google, CAPTCHA or 2FA).");
+    else if (s.state === "capturing") msg("Logged in. Saving your Demo and Real sessions…");
+    else {
+      stop(); $("controls").hidden = true; $("screen").style.display = "none";
+      if (s.state === "done") { msg("Connected. Go back to Telegram and send /at_start (your bot starts in Demo mode).", "good"); if (tg) setTimeout(() => tg.close(), 2500); }
+      else if (s.state === "timeout") msg("The login took too long and was closed. Send /at_login for a new link.", "bad");
+      else if (s.state === "cancelled") msg("Login cancelled.", "bad");
+      else msg("The login could not be completed. Send /at_login to try again.", "bad");
+    }
+  }
+
+  const send = (ev) => api(`auth/handshake/${sid}/input`, { method: "POST", body: JSON.stringify(ev) }).then((r) => { if (r.status === 401) expired(); setTimeout(refreshScreen, 250); });
+
+  $("screen").addEventListener("click", (e) => {
+    const img = e.currentTarget, rect = img.getBoundingClientRect();
+    if (!img.naturalWidth) return;
+    send({ type: "click", x: Math.round((e.clientX - rect.left) * img.naturalWidth / rect.width),
+           y: Math.round((e.clientY - rect.top) * img.naturalHeight / rect.height) });
+  });
+  $("sendText").onclick = () => { const t = $("text").value; if (!t) return; $("text").value = ""; send({ type: "text", text: t.slice(0, 256) }); };
+  $("text").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("sendText").click(); } });
+  $("show").onchange = (e) => { $("text").type = e.target.checked ? "text" : "password"; };
+  document.querySelectorAll("[data-key]").forEach((b) => b.onclick = () => send({ type: "key", key: b.dataset.key }));
+  document.querySelectorAll("[data-scroll]").forEach((b) => b.onclick = () => send({ type: "scroll", dy: Number(b.dataset.scroll) }));
+  $("cancel").onclick = async () => { stop(); await api(`auth/handshake/${sid}`, { method: "DELETE" }); msg("Login cancelled. Send /at_login to start again.", "bad"); $("controls").hidden = true; $("screen").style.display = "none"; };
+})();
+</script>
+</body>
+</html>

@@ -2,7 +2,9 @@
 
 ## Goal
 - Read-only Pocket Option signals on Telegram: every listed asset selectable, payouts
-  read live from the feed, one menu message per chat. Bot never places trades.
+  read live from the feed, one menu message per chat. The signal scanner never places trades.
+- Optional multi-user auto-trading runs in the separate `autotrade/` service; GBot only controls it
+  with /autotrade commands, and only when AUTOTRADE_API_URL + AUTOTRADE_JWT_SECRET are set.
 
 ## Implemented
 - Pinned BinaryOptionsToolsV2 0.2.18 (multi-symbol streaming fix) — pyproject.toml, uv.lock.
@@ -18,6 +20,14 @@
 - Selection confirmation with Change asset / Stop; every callback answered first — telegram_bot.py.
 - Asset selection runs in the background so polling isn't blocked — telegram_bot.py, main.py.
 - CLI: --run availability, payouts, candles <asset>, asset-check <asset> — main.py.
+- autotrade service (separate, off until deployed): login capture in an isolated browser, AES-256-GCM
+  token vault + session health check, one shared price feed, one worker per user, risk limits,
+  Demo by default, FastAPI /trading/* endpoints — autotrade/ (see autotrade/README.md).
+- Telegram auto-trading commands: /autotrade, /at_login (15-min login-only Mini App link), /at_start,
+  /at_stop, /at_stats, /at_set, /at_live confirm, /at_demo, /at_logout; admin /at_halt, /at_resume.
+  Private chat only; slow calls run in the background — autotrade_client.py, autotrade_commands.py.
+- Login page served by the service at /login (token in URL fragment, login token can't trade) —
+  autotrade/api/login_page.html.
 
 ## Verified live (DEMO SSID, read-only, 2026-11-20 07:05–07:20 UTC)
 - availability: 40/56 catalogue assets ticking within 10 s (was 3/56 on 0.2.15).
@@ -28,7 +38,11 @@
 - serve 3 min (Telegram polling OFF, JSON storage): startup message sent, /health ok.
 
 ## Mock-only / offline
-- Full suite: 170 tests, 127 pass, 43 skipped as OBSOLETE, 0 fail.
+- Full suite: 187 tests, 144 pass, 43 skipped as OBSOLETE, 0 fail (17 new auto-trading command tests).
+- autotrade suite: 72 pass, 3 skipped (Postgres tests need AUTOTRADE_TEST_DATABASE_URL), incl. GBot's
+  client against the real API app and login-token limits.
+- Login page in headless Chromium at phone size against a fake login screen: tap position mapped
+  correctly, typed text and Enter delivered, "Connected" shown, token removed from the address bar.
 - Skipped tests were already failing before today and test removed features (old CLI,
   15 s candles, paper tracker, strength ranking, /start-subscribes flow); reason is on each.
 - Strategy engine unchanged; 27 strategy tests pass, incl. new-high -> pullback SELL ->
@@ -49,7 +63,13 @@
 - In-bot tap test (/start, Currencies, asset, Back) NOT RUN: needs a real Telegram user
   and the new code deployed; serve polling was kept off to avoid clashing with Render.
 
+- Auto-trading NOT VERIFIED live: real Pocket Option login and SSID capture, Google sign-in (Google may
+  block automated browsers), real orders, the Docker image build, and the Mini App in a real Telegram app.
+
 ## Needs your action
+- To use auto-trading: deploy autotrade/Dockerfile as its own service with Postgres and its env vars
+  (autotrade/README.md "Setup"), then set AUTOTRADE_API_URL, AUTOTRADE_PUBLIC_URL (HTTPS) and the same
+  AUTOTRADE_JWT_SECRET on the GBot Render service. Test with a Demo account first.
 Push this update to the GitHub repository Render deploys from (Render rebuilds with
 `uv sync --locked`); then in Telegram tap /start, Currencies, an asset, Back and confirm one menu.
 

@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Literal
 
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
@@ -23,6 +26,13 @@ log = logging.getLogger("autotrade.api")
 class Principal:
     user_id: str
     is_admin: bool = False
+    # "full" = normal API token. "login" = short-lived link token (e.g. sent by the Telegram bot)
+    # that may only drive /auth/handshake*; every other route rejects it.
+    scope: str = "full"
+
+
+SCOPES = ("full", "login")
+LOGIN_PAGE = Path(__file__).with_name("login_page.html")
 
 
 def jwt_principal(secret: str, audience: str | None = None) -> Callable[..., Principal]:
@@ -43,7 +53,10 @@ def jwt_principal(secret: str, audience: str | None = None) -> Callable[..., Pri
         sub = str(claims["sub"])
         if not (0 < len(sub) <= 128):
             raise HTTPException(401, "invalid token")
-        return Principal(sub, claims.get("role") == "admin")
+        scope = str(claims.get("scope", "full"))
+        if scope not in SCOPES:
+            raise HTTPException(401, "invalid token")
+        return Principal(sub, scope == "full" and claims.get("role") == "admin", scope)
 
     return dep
 
@@ -99,6 +112,11 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
                background: bool = True) -> FastAPI:
     auth = auth or jwt_principal(rt.cfg.jwt_secret, rt.cfg.jwt_audience)
 
+    def full(p: Principal = Depends(auth)) -> Principal:
+        if getattr(p, "scope", "full") != "full":
+            raise HTTPException(403, "this token can only be used to log in")
+        return p
+
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
         if before_start:
@@ -138,24 +156,37 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
     async def healthz() -> dict[str, Any]:
         return {"ok": True, "feed": rt.feed.status(), "halted": rt.manager.halted}
 
+    @app.get("/login", response_class=HTMLResponse)
+    async def login_page() -> HTMLResponse:
+        """Remote-browser login page (opened from the Telegram bot or your frontend). The token
+        travels in the URL fragment (#t=...), so it never reaches server or proxy logs."""
+        nonce = secrets.token_urlsafe(16)
+        html = LOGIN_PAGE.read_text(encoding="utf-8").replace("{{NONCE}}", nonce)
+        return HTMLResponse(html, headers={
+            "Content-Security-Policy": (
+                f"default-src 'none'; script-src 'nonce-{nonce}' https://telegram.org; "
+                "connect-src 'self'; img-src blob:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"),
+            "Referrer-Policy": "no-referrer",
+        })
+
     # ---- trading -------------------------------------------------------------------------
     @app.post("/trading/start")
-    async def start(p: Principal = Depends(auth)):
+    async def start(p: Principal = Depends(full)):
         try:
             return await rt.manager.start(p.user_id)
         except Exception as exc:
             raise _http(exc) from None
 
     @app.post("/trading/stop")
-    async def stop(body: StopBody | None = None, p: Principal = Depends(auth)):
+    async def stop(body: StopBody | None = None, p: Principal = Depends(full)):
         return await rt.manager.stop(p.user_id, drain=(body.drain if body else True))
 
     @app.get("/trading/settings")
-    async def get_settings(p: Principal = Depends(auth)):
+    async def get_settings(p: Principal = Depends(full)):
         return (await rt.repo.get_settings(p.user_id)).to_dict()
 
     @app.patch("/trading/settings")
-    async def patch_settings(body: SettingsPatch, p: Principal = Depends(auth)):
+    async def patch_settings(body: SettingsPatch, p: Principal = Depends(full)):
         patch = body.model_dump(exclude_unset=True, exclude={"confirm_live"})
         try:
             return (await rt.manager.update_settings(p.user_id, patch, confirm_live=body.confirm_live)).to_dict()
@@ -163,12 +194,12 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
             raise _http(exc) from None
 
     @app.get("/trading/stats")
-    async def stats(p: Principal = Depends(auth)):
+    async def stats(p: Principal = Depends(full)):
         return await rt.manager.stats(p.user_id)
 
     # ---- session handshake ---------------------------------------------------------------
     @app.get("/auth/status")
-    async def auth_status(p: Principal = Depends(auth)):
+    async def auth_status(p: Principal = Depends(full)):
         return await rt.vault.status(p.user_id)
 
     @app.post("/auth/handshake", status_code=201)
@@ -217,7 +248,7 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
         return Response(status_code=204)
 
     @app.delete("/auth/sessions", status_code=204)
-    async def disconnect(p: Principal = Depends(auth)):
+    async def disconnect(p: Principal = Depends(full)):
         """User-initiated revoke: stop the bot and erase stored tokens."""
         await rt.manager.stop(p.user_id, drain=False)
         await rt.vault.delete_all(p.user_id)
@@ -227,7 +258,7 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
 
     # ---- operator kill switch ------------------------------------------------------------
     @app.post("/admin/halt", status_code=204)
-    async def halt(p: Principal = Depends(auth)):
+    async def halt(p: Principal = Depends(full)):
         if not p.is_admin:
             raise HTTPException(403, "admin only")
         rt.manager.halted = True
@@ -235,7 +266,7 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
         return Response(status_code=204)
 
     @app.post("/admin/resume", status_code=204)
-    async def resume(p: Principal = Depends(auth)):
+    async def resume(p: Principal = Depends(full)):
         if not p.is_admin:
             raise HTTPException(403, "admin only")
         rt.manager.halted = False
