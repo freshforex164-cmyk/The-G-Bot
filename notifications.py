@@ -13,6 +13,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from typing import Protocol
 
+from config import PAYOUT_DISCLAIMER
 from strategy.model import Signal
 from strategy.price_action import SETUP_LABELS
 
@@ -31,13 +32,17 @@ def format_signal_message(signal: Signal) -> str:
     icon = "🔴" if direction == "SELL" else "🟢"
     asset_name = html.escape(signal.asset_name, quote=False)
     setup = html.escape(SETUP_LABELS[signal.setup], quote=False)
-    payout = f"\nPayout: {signal.payout:g}%" if signal.payout is not None else ""
+    payout = (
+        f"Payout: {signal.payout:g}%" if signal.payout is not None else "Payout: unavailable"
+    )
     return (
         f"{icon} <b>{direction}</b>\n"
         f"Asset: {asset_name}\n"
         f"Setup: {setup}\n"
-        f"Expiry: {_expiry_label(signal.expiry_seconds)}{payout}\n"
-        "Valid for: 10 seconds"
+        f"Expiry: {_expiry_label(signal.expiry_seconds)}\n"
+        f"{payout}\n"
+        "Valid for: 10 seconds\n"
+        f"<i>{html.escape(PAYOUT_DISCLAIMER, quote=False)}</i>"
     )
 
 
@@ -146,6 +151,8 @@ class TelegramNotifier:
                 "Use telegram-setup to check the returned chat ID, then add the "
                 "bot to the chat."
             )
+        elif status == 400 and "message is not modified" in description:
+            message = "Telegram message is not modified (400)."
         elif status == 400:
             message = "Telegram rejected the message (400)."
         elif status == 403:

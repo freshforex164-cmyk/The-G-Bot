@@ -4,7 +4,14 @@ import unittest
 from unittest.mock import patch
 
 from data.candles import Candle
+from dataclasses import replace
+
 from strategy.price_action import PriceActionStrategy, Regime, Swing
+from strategy.settings import STRATEGY_SETTINGS
+
+# State-machine fixtures are short; the regime classifier is patched, so the
+# live 30-candle warm-up does not apply to these unit tests.
+SHORT_HISTORY_SETTINGS = replace(STRATEGY_SETTINGS, min_regime_candles=1)
 
 
 def bar(
@@ -23,7 +30,7 @@ def strategy_with_level(
     time: int = 0,
     level: float = 10,
 ) -> PriceActionStrategy:
-    strategy = PriceActionStrategy()
+    strategy = PriceActionStrategy(SHORT_HISTORY_SETTINGS)
     strategy._regime_initialized = True
     strategy.regime_name = regime
     strategy.current_regime = Regime(regime)
@@ -93,6 +100,22 @@ class TrendStateMachineTests(unittest.TestCase):
         self.assertEqual((third.setup, third.direction), ("UP_CONTINUATION_BUY", "BUY"))
         self.assertEqual(strategy.last_signal_type, "CONTINUATION")
         self.assertEqual(strategy.phase, "AWAIT_PULLBACK")
+
+    def test_new_high_pullback_then_candle_holding_the_low_is_buy_not_sell(self) -> None:
+        """Regression: after the pullback SELL, a candle that does not take out
+        the pullback low must give the continuation BUY, never another SELL."""
+        strategy = strategy_with_level("UPTREND")
+        candles = [bar(0, 9.5, 10, 9, 9.8)]
+        new_high = bar(60, 9.8, 10.5, 9.7, 10.4)
+        pullback = bar(120, 10.4, 10.45, 9.9, 10.0)
+        holds_low = bar(180, 10.2, 10.3, 10.0, 10.1)
+        outputs = []
+        for next_bar in (new_high, pullback, holds_low):
+            candles.append(next_bar)
+            signal = self.evaluate(strategy, list(candles), Regime("UPTREND"))
+            outputs.append(signal.direction if signal else None)
+        self.assertEqual(outputs, [None, "SELL", "BUY"])
+        self.assertEqual(strategy.pullback_extreme, 9.9)
 
     def test_trend_signals_alternate_pullback_continuation_pullback(self) -> None:
         strategy = strategy_with_level("UPTREND")

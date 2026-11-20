@@ -14,6 +14,8 @@ class CatalogAsset:
     category: str
     name: str
     aliases: tuple[str, ...] = ()
+    # Exact Pocket Option symbol (e.g. AUDCAD, AUDCAD_otc, SOL-USD_otc).
+    symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,7 @@ def load_catalog(path: str | Path = "assets.json") -> tuple[CatalogAsset, ...]:
                     category=str(category["name"]),
                     name=str(item["name"]),
                     aliases=tuple(map(str, item.get("aliases", ()))),
+                    symbol=(str(item["symbol"]) if item.get("symbol") else None),
                 )
             )
     return tuple(result)
@@ -58,6 +61,7 @@ def match_runtime_assets(
     """Match exact display names/aliases to one live broker symbol each."""
     payouts = payouts or {}
     result: dict[str, MarketAsset] = {}
+    row_symbols = {row.get("symbol") for row in rows if isinstance(row, dict)}
     for row in rows:
         symbol = row.get("symbol")
         if not isinstance(symbol, str) or not symbol:
@@ -70,9 +74,15 @@ def match_runtime_assets(
         )
         if not provider_names:
             provider_names = [symbol]
+        live_symbols = row_symbols
         for asset in CATALOG:
             names = (asset.name, *asset.aliases)
-            if not any(
+            # The exact catalogue symbol wins; display names are only a
+            # fallback when the broker does not list that exact symbol.
+            if asset.symbol is not None and asset.symbol in live_symbols:
+                if symbol != asset.symbol:
+                    continue
+            elif not any(
                 normalize_asset_name(provider) == name
                 for provider in provider_names
                 for name in names

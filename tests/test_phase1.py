@@ -37,10 +37,12 @@ class CandleBuilderTests(unittest.TestCase):
                 "close": 1.2,
             },
         ]
-        with patch("data.candles.time.time", return_value=FIXED_TIME):
-            self.assertEqual(builder.seed(history), 2)
+        clock = patch("data.candles.time.time", return_value=FIXED_TIME)
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.assertEqual(builder.seed(history), 2)
 
-        for second, price in ((1, 1.5), (4, 1.8), (8, 1.4)):
+        for second, price in ((0, 1.5), (4, 1.8), (8, 1.4)):
             self.assertIsNone(
                 builder.update(
                     {"timestamp": FIXED_TIME + offset + second, "price": price}
@@ -172,9 +174,14 @@ class ReadOnlyBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await broker.payouts(), {"EURUSD_otc": 85.0, "USDCHF_otc": 80.0}
         )
+        # History arrives in Pocket Option server time (UTC+2) and is
+        # returned in true UTC.
+        history = await broker.candle_history("EURUSD_otc", 10, 3000)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["timestamp"], FIXED_TIME - 7200)
         self.assertEqual(
-            await broker.candle_history("EURUSD_otc", 10, 3000),
-            [{"time": FIXED_TIME, "open": 1, "high": 2, "low": 0, "close": 1}],
+            (history[0]["open"], history[0]["high"], history[0]["low"], history[0]["close"]),
+            (1, 2, 0, 1),
         )
         await broker.close()
         self.assertTrue(FakePocketOptionClient.instances[0].shutdown_called)

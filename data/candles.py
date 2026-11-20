@@ -34,11 +34,15 @@ def _normalize_broker_timestamp(raw_timestamp: Any) -> int:
     except (TypeError, ValueError, OverflowError):
         raise CandleDataError("Broker tick is missing a valid timestamp.") from None
 
-    # Pocket Option may send milliseconds. BinaryOptionsToolsV2's own live
-    # candle builder normalizes these timestamps and removes this platform offset.
+    # Pocket Option may send milliseconds. BinaryOptionsToolsV2 0.2.15 live
+    # ticks carried a +2h platform offset; 0.2.16+ ticks and all compiled
+    # history are true UTC. Remove the offset only when a timestamp is far
+    # ahead of the clock, so both formats land in the correct minute bucket.
     if timestamp > 10_000_000_000:
         timestamp //= 1000
-    return timestamp - POCKET_OPTION_TIME_OFFSET_SECONDS
+    if timestamp - time.time() > POCKET_OPTION_TIME_OFFSET_SECONDS / 4:
+        timestamp -= POCKET_OPTION_TIME_OFFSET_SECONDS
+    return timestamp
 
 
 def _number(value: Any, field: str) -> float:
@@ -67,6 +71,7 @@ class CandleBuilder:
         self.closed: deque[Candle] = deque(maxlen=max_candles)
         self.current: Candle | None = None
         self._latest_closed_time: int | None = None
+        self._current_partial = False
 
     @property
     def forming_candle(self) -> Candle | None:
@@ -74,10 +79,16 @@ class CandleBuilder:
         return self.current
 
     def seed(self, history: Iterable[Mapping[str, Any]]) -> int:
-        """Seed from broker-compiled history, ignoring the current open time bucket."""
+        """Seed closed history; the open bucket only supplies the forming candle.
+
+        Safe to call after live ticks have started: live closed candles win,
+        and history for the current bucket provides its true open/high/low so
+        the first live candle is complete rather than partial.
+        """
         current_bucket = int(time.time()) // self.period_seconds * self.period_seconds
         by_time: dict[int, Candle] = {}
         normalized_rows: list[tuple[int, Candle]] = []
+        forming_rows: list[tuple[int, Candle]] = []
 
         for row in history:
             if not isinstance(row, Mapping):
@@ -85,7 +96,7 @@ class CandleBuilder:
             raw_time = row.get("timestamp", row.get("time"))
             timestamp = _normalize_broker_timestamp(raw_time)
             bucket_time = timestamp // self.period_seconds * self.period_seconds
-            if bucket_time >= current_bucket:
+            if bucket_time > current_bucket:
                 continue
             candle = Candle(
                 time=bucket_time,
@@ -94,28 +105,50 @@ class CandleBuilder:
                 low=_number(row.get("low"), "low"),
                 close=_number(row.get("close"), "close"),
             )
-            normalized_rows.append((timestamp, candle))
-
-        for timestamp, candle in sorted(normalized_rows, key=lambda item: item[0]):
-            bucket_time = timestamp // self.period_seconds * self.period_seconds
-            existing = by_time.get(bucket_time)
-            if existing is None:
-                by_time[bucket_time] = candle
+            if bucket_time == current_bucket:
+                forming_rows.append((timestamp, candle))
             else:
-                existing.high = max(existing.high, candle.high)
-                existing.low = min(existing.low, candle.low)
-                existing.close = candle.close
+                normalized_rows.append((timestamp, candle))
 
-        for candle in sorted(by_time.values(), key=lambda item: item.time)[
-            -self.max_candles :
-        ]:
-            self.closed.append(candle)
+        def merge(rows: list[tuple[int, Candle]]) -> dict[int, Candle]:
+            merged: dict[int, Candle] = {}
+            for timestamp, candle in sorted(rows, key=lambda item: item[0]):
+                bucket_time = timestamp // self.period_seconds * self.period_seconds
+                existing = merged.get(bucket_time)
+                if existing is None:
+                    merged[bucket_time] = candle
+                else:
+                    existing.high = max(existing.high, candle.high)
+                    existing.low = min(existing.low, candle.low)
+                    existing.close = candle.close
+            return merged
+
+        by_time = merge(normalized_rows)
+        for candle in self.closed:
+            by_time[candle.time] = candle
+        ordered = sorted(by_time.values(), key=lambda item: item.time)
+        self.closed = deque(ordered[-self.max_candles :], maxlen=self.max_candles)
         if self.closed:
             self._latest_closed_time = self.closed[-1].time
+
+        forming = merge(forming_rows).get(current_bucket)
+        if forming is not None:
+            if self.current is None:
+                self.current = forming
+                self._current_partial = False
+            elif self.current.time == forming.time:
+                self.current.open = forming.open
+                self.current.high = max(self.current.high, forming.high)
+                self.current.low = min(self.current.low, forming.low)
+                self._current_partial = False
         return len(self.closed)
 
     def update(self, tick: Mapping[str, Any]) -> Candle | None:
-        """Add a raw tick; return a candle only when its time bucket has closed."""
+        """Add a raw tick; return a candle only when its time bucket has closed.
+
+        Candles start on whole periods. A bucket joined mid-way (first tick
+        after a start, without history for that bucket) is never emitted.
+        """
         raw_time = tick.get("timestamp", tick.get("time"))
         timestamp = _normalize_broker_timestamp(raw_time)
         price = _number(tick.get("close", tick.get("price")), "price")
@@ -134,6 +167,7 @@ class CandleBuilder:
                 low=price,
                 close=price,
             )
+            self._current_partial = timestamp != bucket_time
             return None
 
         if bucket_time < self.current.time:
@@ -146,8 +180,7 @@ class CandleBuilder:
             return None
 
         closed_candle = self.current
-        self.closed.append(closed_candle)
-        self._latest_closed_time = closed_candle.time
+        was_partial = self._current_partial
         self.current = Candle(
             time=bucket_time,
             open=price,
@@ -155,4 +188,9 @@ class CandleBuilder:
             low=price,
             close=price,
         )
+        self._current_partial = False
+        if was_partial:
+            return None
+        self.closed.append(closed_candle)
+        self._latest_closed_time = closed_candle.time
         return closed_candle

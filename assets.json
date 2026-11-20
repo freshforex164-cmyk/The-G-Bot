@@ -3,82 +3,290 @@
     {
       "name": "Currencies",
       "assets": [
-        {"id": "aed-cny", "name": "AED/CNY"},
-        {"id": "aud-cad", "name": "AUD/CAD"},
-        {"id": "aud-chf", "name": "AUD/CHF"},
-        {"id": "cad-chf", "name": "CAD/CHF"},
-        {"id": "cad-jpy", "name": "CAD/JPY"},
-        {"id": "chf-jpy", "name": "CHF/JPY"},
-        {"id": "eur-nzd", "name": "EUR/NZD"},
-        {"id": "gbp-usd", "name": "GBP/USD"},
-        {"id": "kes-usd", "name": "KES/USD"},
-        {"id": "mad-usd", "name": "MAD/USD"},
-        {"id": "ngn-usd", "name": "NGN/USD"},
-        {"id": "nzd-usd", "name": "NZD/USD"},
-        {"id": "qar-cny", "name": "QAR/CNY"},
-        {"id": "sar-cny", "name": "SAR/CNY"},
-        {"id": "usd-bdt", "name": "USD/BDT"},
-        {"id": "usd-clp", "name": "USD/CLP"},
-        {"id": "usd-inr", "name": "USD/INR"},
-        {"id": "usd-vnd", "name": "USD/VND"},
-        {"id": "yer-usd", "name": "YER/USD"},
-        {"id": "eur-usd", "name": "EUR/USD"},
-        {"id": "omr-cny", "name": "OMR/CNY"},
-        {"id": "aed-cny-otc", "name": "AED/CNY OTC"},
-        {"id": "aud-cad-otc", "name": "AUD/CAD OTC"},
-        {"id": "aud-chf-otc", "name": "AUD/CHF OTC"},
-        {"id": "cad-chf-otc", "name": "CAD/CHF OTC"},
-        {"id": "cad-jpy-otc", "name": "CAD/JPY OTC"},
-        {"id": "chf-jpy-otc", "name": "CHF/JPY OTC"},
-        {"id": "eur-nzd-otc", "name": "EUR/NZD OTC"},
-        {"id": "gbp-usd-otc", "name": "GBP/USD OTC"},
-        {"id": "kes-usd-otc", "name": "KES/USD OTC"},
-        {"id": "mad-usd-otc", "name": "MAD/USD OTC"},
-        {"id": "ngn-usd-otc", "name": "NGN/USD OTC"},
-        {"id": "nzd-usd-otc", "name": "NZD/USD OTC"},
-        {"id": "qar-cny-otc", "name": "QAR/CNY OTC"},
-        {"id": "sar-cny-otc", "name": "SAR/CNY OTC"},
-        {"id": "usd-bdt-otc", "name": "USD/BDT OTC"},
-        {"id": "usd-clp-otc", "name": "USD/CLP OTC"},
-        {"id": "usd-inr-otc", "name": "USD/INR OTC"},
-        {"id": "usd-vnd-otc", "name": "USD/VND OTC"},
-        {"id": "yer-usd-otc", "name": "YER/USD OTC"},
-        {"id": "eur-usd-otc", "name": "EUR/USD OTC"},
-        {"id": "omr-cny-otc", "name": "OMR/CNY OTC"}
+        {
+          "id": "aed-cny",
+          "name": "AED/CNY"
+        },
+        {
+          "id": "aud-cad",
+          "name": "AUD/CAD",
+          "symbol": "AUDCAD"
+        },
+        {
+          "id": "aud-chf",
+          "name": "AUD/CHF",
+          "symbol": "AUDCHF"
+        },
+        {
+          "id": "cad-chf",
+          "name": "CAD/CHF",
+          "symbol": "CADCHF"
+        },
+        {
+          "id": "cad-jpy",
+          "name": "CAD/JPY",
+          "symbol": "CADJPY"
+        },
+        {
+          "id": "chf-jpy",
+          "name": "CHF/JPY",
+          "symbol": "CHFJPY"
+        },
+        {
+          "id": "eur-nzd",
+          "name": "EUR/NZD"
+        },
+        {
+          "id": "gbp-usd",
+          "name": "GBP/USD",
+          "symbol": "GBPUSD"
+        },
+        {
+          "id": "kes-usd",
+          "name": "KES/USD"
+        },
+        {
+          "id": "mad-usd",
+          "name": "MAD/USD"
+        },
+        {
+          "id": "ngn-usd",
+          "name": "NGN/USD"
+        },
+        {
+          "id": "nzd-usd",
+          "name": "NZD/USD"
+        },
+        {
+          "id": "qar-cny",
+          "name": "QAR/CNY"
+        },
+        {
+          "id": "sar-cny",
+          "name": "SAR/CNY"
+        },
+        {
+          "id": "usd-bdt",
+          "name": "USD/BDT"
+        },
+        {
+          "id": "usd-clp",
+          "name": "USD/CLP"
+        },
+        {
+          "id": "usd-inr",
+          "name": "USD/INR"
+        },
+        {
+          "id": "usd-vnd",
+          "name": "USD/VND"
+        },
+        {
+          "id": "yer-usd",
+          "name": "YER/USD"
+        },
+        {
+          "id": "eur-usd",
+          "name": "EUR/USD",
+          "symbol": "EURUSD"
+        },
+        {
+          "id": "omr-cny",
+          "name": "OMR/CNY"
+        },
+        {
+          "id": "aed-cny-otc",
+          "name": "AED/CNY OTC",
+          "symbol": "AEDCNY_otc"
+        },
+        {
+          "id": "aud-cad-otc",
+          "name": "AUD/CAD OTC",
+          "symbol": "AUDCAD_otc"
+        },
+        {
+          "id": "aud-chf-otc",
+          "name": "AUD/CHF OTC",
+          "symbol": "AUDCHF_otc"
+        },
+        {
+          "id": "cad-chf-otc",
+          "name": "CAD/CHF OTC",
+          "symbol": "CADCHF_otc"
+        },
+        {
+          "id": "cad-jpy-otc",
+          "name": "CAD/JPY OTC",
+          "symbol": "CADJPY_otc"
+        },
+        {
+          "id": "chf-jpy-otc",
+          "name": "CHF/JPY OTC",
+          "symbol": "CHFJPY_otc"
+        },
+        {
+          "id": "eur-nzd-otc",
+          "name": "EUR/NZD OTC",
+          "symbol": "EURNZD_otc"
+        },
+        {
+          "id": "gbp-usd-otc",
+          "name": "GBP/USD OTC",
+          "symbol": "GBPUSD_otc"
+        },
+        {
+          "id": "kes-usd-otc",
+          "name": "KES/USD OTC",
+          "symbol": "KESUSD_otc"
+        },
+        {
+          "id": "mad-usd-otc",
+          "name": "MAD/USD OTC",
+          "symbol": "MADUSD_otc"
+        },
+        {
+          "id": "ngn-usd-otc",
+          "name": "NGN/USD OTC",
+          "symbol": "NGNUSD_otc"
+        },
+        {
+          "id": "nzd-usd-otc",
+          "name": "NZD/USD OTC",
+          "symbol": "NZDUSD_otc"
+        },
+        {
+          "id": "qar-cny-otc",
+          "name": "QAR/CNY OTC",
+          "symbol": "QARCNY_otc"
+        },
+        {
+          "id": "sar-cny-otc",
+          "name": "SAR/CNY OTC",
+          "symbol": "SARCNY_otc"
+        },
+        {
+          "id": "usd-bdt-otc",
+          "name": "USD/BDT OTC"
+        },
+        {
+          "id": "usd-clp-otc",
+          "name": "USD/CLP OTC",
+          "symbol": "USDCLP_otc"
+        },
+        {
+          "id": "usd-inr-otc",
+          "name": "USD/INR OTC",
+          "symbol": "USDINR_otc"
+        },
+        {
+          "id": "usd-vnd-otc",
+          "name": "USD/VND OTC",
+          "symbol": "USDVND_otc"
+        },
+        {
+          "id": "yer-usd-otc",
+          "name": "YER/USD OTC",
+          "symbol": "YERUSD_otc"
+        },
+        {
+          "id": "eur-usd-otc",
+          "name": "EUR/USD OTC",
+          "symbol": "EURUSD_otc"
+        },
+        {
+          "id": "omr-cny-otc",
+          "name": "OMR/CNY OTC",
+          "symbol": "OMRCNY_otc"
+        }
       ]
     },
     {
       "name": "Crypto",
       "assets": [
-        {"id": "avalanche", "name": "Avalanche OTC"},
-        {"id": "dogecoin", "name": "Dogecoin OTC"},
-        {"id": "solana", "name": "Solana OTC"}
+        {
+          "id": "avalanche",
+          "name": "Avalanche OTC",
+          "symbol": "AVAX_otc"
+        },
+        {
+          "id": "dogecoin",
+          "name": "Dogecoin OTC",
+          "symbol": "DOGE_otc"
+        },
+        {
+          "id": "solana",
+          "name": "Solana OTC",
+          "symbol": "SOL-USD_otc"
+        }
       ]
     },
     {
       "name": "Commodities",
       "assets": [
-        {"id": "brent-oil", "name": "Brent Oil OTC"},
-        {"id": "wti-crude-oil", "name": "WTI Crude Oil OTC"},
-        {"id": "silver", "name": "Silver OTC"},
-        {"id": "gold", "name": "Gold OTC"}
+        {
+          "id": "brent-oil",
+          "name": "Brent Oil OTC",
+          "symbol": "UKBrent_otc"
+        },
+        {
+          "id": "wti-crude-oil",
+          "name": "WTI Crude Oil OTC",
+          "symbol": "USCrude_otc"
+        },
+        {
+          "id": "silver",
+          "name": "Silver OTC",
+          "symbol": "XAGUSD_otc"
+        },
+        {
+          "id": "gold",
+          "name": "Gold OTC",
+          "symbol": "XAUUSD_otc"
+        }
       ]
     },
     {
       "name": "Stocks",
       "assets": [
-        {"id": "american-express", "name": "American Express OTC"},
-        {"id": "facebook-inc", "name": "FACEBOOK INC OTC"},
-        {"id": "johnson-johnson", "name": "Johnson & Johnson OTC"},
-        {"id": "mcdonalds", "name": "McDonald's OTC"}
+        {
+          "id": "american-express",
+          "name": "American Express OTC",
+          "symbol": "#AXP_otc"
+        },
+        {
+          "id": "facebook-inc",
+          "name": "FACEBOOK INC OTC"
+        },
+        {
+          "id": "johnson-johnson",
+          "name": "Johnson & Johnson OTC",
+          "symbol": "#JNJ_otc"
+        },
+        {
+          "id": "mcdonalds",
+          "name": "McDonald's OTC",
+          "symbol": "#MCD_otc"
+        }
       ]
     },
     {
       "name": "Indices",
       "assets": [
-        {"id": "aus-200-otc", "name": "AUS 200 OTC"},
-        {"id": "100gbp", "name": "100GBP"},
-        {"id": "100gbp-otc", "name": "100GBP OTC"}
+        {
+          "id": "aus-200-otc",
+          "name": "AUS 200 OTC",
+          "symbol": "AUS200_otc"
+        },
+        {
+          "id": "100gbp",
+          "name": "100GBP",
+          "symbol": "100GBP"
+        },
+        {
+          "id": "100gbp-otc",
+          "name": "100GBP OTC",
+          "symbol": "100GBP_otc"
+        }
       ]
     }
   ]

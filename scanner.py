@@ -20,7 +20,8 @@ from strategy.settings import STRATEGY_SETTINGS
 from subscriber_store import SubscriberStore
 
 logger = logging.getLogger("gbot.scanner")
-ASSET_TICK_WAIT_SECONDS = 5.0
+ASSET_TICK_WAIT_SECONDS = 10.0
+ASSET_SUBSCRIBE_ATTEMPTS = 2
 ASSET_TICK_MAX_AGE_SECONDS = 5.0
 ASSET_REFRESH_SECONDS = 20.0
 ASSET_UNSUBSCRIBE_GRACE_SECONDS = 10 * 60
@@ -120,6 +121,30 @@ class SignalScanner:
             return None
         return symbol, state.latest_price, state.latest_tick_at
 
+    async def live_payout(self, symbol: str) -> float | None:
+        """Payout for this symbol as read from the feed right now (never cached)."""
+        reader = getattr(self.broker, "payout", None)
+        if not callable(reader):
+            return None
+        try:
+            return await asyncio.wait_for(reader(symbol), timeout=5.0)
+        except Exception as exc:
+            logger.warning("Live payout unavailable (%s).", type(exc).__name__)
+            return None
+
+    async def live_payouts(self) -> dict[str, float]:
+        """All payouts as read from the feed right now; empty when unavailable."""
+        try:
+            payouts = await asyncio.wait_for(self.broker.payouts(), timeout=5.0)
+        except Exception as exc:
+            logger.warning("Live payouts unavailable (%s).", type(exc).__name__)
+            return {}
+        return {
+            symbol: float(value)
+            for symbol, value in payouts.items()
+            if isinstance(value, (int, float)) and 0 < value <= 100
+        }
+
     async def refresh_asset_matches(self) -> dict[str, MarketAsset]:
         rows = await self.broker.active_assets()
         try:
@@ -148,42 +173,10 @@ class SignalScanner:
         }
         return {str(symbol) for symbol in selected}
 
-    async def _probe_for_fresh_tick(self, symbol: str) -> bool:
-        """Open a short-lived stream immediately and require a fresh first tick."""
-        stream = self.broker.subscribe_ticks(symbol)
-        deadline = asyncio.get_running_loop().time() + ASSET_TICK_WAIT_SECONDS
-        try:
-            while True:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    return False
-                try:
-                    tick = await asyncio.wait_for(anext(stream), timeout=remaining)
-                except (StopAsyncIteration, TimeoutError):
-                    return False
-                try:
-                    timestamp = datetime.fromtimestamp(
-                        _normalize_broker_timestamp(
-                            tick.get("timestamp", tick.get("time"))
-                        ),
-                        timezone.utc,
-                    )
-                    float(tick.get("close", tick.get("price")))
-                except (TypeError, ValueError, OverflowError, OSError, CandleDataError):
-                    continue
-                age = (datetime.now(timezone.utc) - timestamp).total_seconds()
-                if 0 <= age < ASSET_TICK_MAX_AGE_SECONDS:
-                    return True
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("Asset availability probe failed (%s).", type(exc).__name__)
-            return False
-        finally:
-            try:
-                await stream.aclose()
-            except Exception:
-                pass
+    def _spawn(self, coro: Awaitable[None], name: str) -> None:
+        task = asyncio.create_task(coro, name=name)
+        self._preparation_tasks.add(task)
+        task.add_done_callback(self._preparation_tasks.discard)
 
     async def _prepare_selected_stream(self) -> None:
         try:
@@ -196,35 +189,101 @@ class SignalScanner:
             )
 
     def _schedule_selected_stream_setup(self) -> None:
-        task = asyncio.create_task(
-            self._prepare_selected_stream(),
-            name="prepare-selected-asset-stream",
-        )
-        self._preparation_tasks.add(task)
-        task.add_done_callback(self._preparation_tasks.discard)
+        self._spawn(self._prepare_selected_stream(), "prepare-selected-asset-stream")
 
-    async def _seed_asset(self, asset: MarketAsset) -> PairScanState:
+    def _new_state(self, asset: MarketAsset) -> PairScanState:
         builder = CandleBuilder(
             period_seconds=STRATEGY_SETTINGS.timeframe_seconds,
             max_candles=config.MAX_CANDLES_PER_PAIR,
         )
+        return PairScanState(asset, builder, PriceActionStrategy())
+
+    async def _seed_state(self, state: PairScanState) -> None:
+        """Seed closed history after the live subscription is already open."""
+        asset = state.asset
         lookback = STRATEGY_SETTINGS.timeframe_seconds * config.MAX_CANDLES_PER_PAIR
         try:
             history = await self.broker.candle_history(
                 asset.symbol, STRATEGY_SETTINGS.timeframe_seconds, lookback
             )
-            builder.seed(history)
+            state.candles.seed(history)
+        except asyncio.CancelledError:
+            raise
         except CandleHistoryUnavailable as exc:
             logger.warning("%s", exc)
-        except (CandleDataError, TimeoutError) as exc:
+        except Exception as exc:
             logger.warning(
                 "Candle history unavailable for %s (%s).",
                 asset.display_name,
                 type(exc).__name__,
             )
-        strategy = PriceActionStrategy()
-        strategy.bootstrap(tuple(builder.closed))
-        return PairScanState(asset, builder, strategy)
+        if self.pairs.get(asset.symbol) is state:
+            state.strategy.bootstrap(tuple(state.candles.closed))
+
+    def _start_stream(self, symbol: str, state: PairScanState) -> None:
+        self._tasks[symbol] = asyncio.create_task(
+            self._stream_pair(symbol, state), name=f"selected-asset-{symbol}"
+        )
+
+    async def _drop_stream(self, symbol: str) -> None:
+        task = self._tasks.pop(symbol, None)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.pairs.pop(symbol, None)
+        self._unselected_since.pop(symbol, None)
+
+    async def _make_room(self, keep: set[str]) -> bool:
+        """Free one slot under MAX_SUBSCRIBED by dropping the oldest unselected stream."""
+        while len(self.pairs) >= config.MAX_SUBSCRIBED:
+            candidates = [
+                symbol for symbol in self.pairs if symbol not in keep
+            ]
+            if not candidates:
+                logger.warning(
+                    "Subscription limit reached (%d symbols).", config.MAX_SUBSCRIBED
+                )
+                return False
+            oldest = min(
+                candidates,
+                key=lambda symbol: self._unselected_since.get(symbol, float("inf")),
+            )
+            await self._drop_stream(oldest)
+        return True
+
+    async def _ensure_stream(self, asset: MarketAsset) -> PairScanState | None:
+        """Subscribe this exact symbol now (not the scanner list) and seed afterwards."""
+        state = self.pairs.get(asset.symbol)
+        if state is not None:
+            state.asset = asset
+            return state
+        if not await self._make_room(self._selected_symbols() | {asset.symbol}):
+            return None
+        state = self._new_state(asset)
+        self.pairs[asset.symbol] = state
+        self._start_stream(asset.symbol, state)
+        self._spawn(self._seed_state(state), f"seed-{asset.symbol}")
+        return state
+
+    async def _restart_stream(self, symbol: str, state: PairScanState) -> None:
+        task = self._tasks.pop(symbol, None)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if self.pairs.get(symbol) is state:
+            self._start_stream(symbol, state)
+
+    async def _wait_for_fresh_tick(self, symbol: str, state: PairScanState) -> bool:
+        if self.price_for_symbol(symbol) is not None:
+            return True
+        state.first_tick.clear()
+        try:
+            await asyncio.wait_for(
+                state.first_tick.wait(), timeout=ASSET_TICK_WAIT_SECONDS
+            )
+        except TimeoutError:
+            return False
+        return self.price_for_symbol(symbol) is not None
 
     async def _reconcile_selected(self) -> None:
         async with self._reconcile_lock:
@@ -253,25 +312,15 @@ class SignalScanner:
                 if symbol in open_assets
             }
             for symbol in set(self.pairs) - set(available):
-                task = self._tasks.pop(symbol, None)
-                if task is not None:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
-                self.pairs.pop(symbol, None)
-                self._unselected_since.pop(symbol, None)
-            # Fetch each newly selected history sequentially on the shared client.
+                await self._drop_stream(symbol)
             for symbol, asset in available.items():
                 if symbol in self.pairs:
                     self.pairs[symbol].asset = asset
-                    continue
-                state = await self._seed_asset(asset)
-                self.pairs[symbol] = state
-                self._tasks[symbol] = asyncio.create_task(
-                    self._stream_pair(symbol, state),
-                    name=f"selected-asset-{symbol}",
-                )
+                elif symbol in desired_symbols:
+                    await self._ensure_stream(asset)
 
     async def select_asset(self, chat_id: int, asset_id: str) -> MarketAsset | None:
+        """Subscribe the chosen symbol and wait for a fresh tick (2 x 10 s)."""
         if asset_id not in CATALOG_BY_ID:
             return None
         try:
@@ -284,26 +333,32 @@ class SignalScanner:
         asset = self.asset_matches.get(asset_id)
         if asset is None or not asset.is_open:
             return None
-        state = self.pairs.get(asset.symbol)
-        if state is None:
-            if not await self._probe_for_fresh_tick(asset.symbol):
-                return None
-            await asyncio.to_thread(self.subscribers.set_asset, chat_id, asset.symbol)
-            self._schedule_selected_stream_setup()
-            return asset
-        if state.first_tick.is_set() and self.price_for_symbol(asset.symbol) is None:
-            state.first_tick.clear()
-        if self.price_for_symbol(asset.symbol) is None:
-            try:
-                await asyncio.wait_for(
-                    state.first_tick.wait(), timeout=ASSET_TICK_WAIT_SECONDS
-                )
-            except TimeoutError:
-                return None
-            if self.price_for_symbol(asset.symbol) is None:
-                return None
-        await asyncio.to_thread(self.subscribers.set_asset, chat_id, asset.symbol)
-        await self._reconcile_selected()
+        symbol = asset.symbol
+        available = False
+        for attempt in range(ASSET_SUBSCRIBE_ATTEMPTS):
+            async with self._reconcile_lock:
+                state = await self._ensure_stream(asset)
+                if state is None:
+                    return None
+                if attempt > 0:
+                    await self._restart_stream(symbol, state)
+            if await self._wait_for_fresh_tick(symbol, state):
+                available = True
+                break
+            logger.info(
+                "No fresh tick for %s on subscribe attempt %d/%d.",
+                asset.display_name,
+                attempt + 1,
+                ASSET_SUBSCRIBE_ATTEMPTS,
+            )
+        if not available:
+            if symbol not in self._selected_symbols():
+                async with self._reconcile_lock:
+                    await self._drop_stream(symbol)
+            return None
+        await asyncio.to_thread(self.subscribers.set_asset, chat_id, symbol)
+        self._unselected_since.pop(symbol, None)
+        self._schedule_selected_stream_setup()
         return asset
 
     async def _stream_pair(self, symbol: str, state: PairScanState) -> None:
@@ -365,10 +420,16 @@ class SignalScanner:
                 symbol,
                 tuple(state.candles.closed),
                 asset_name=state.asset.display_name,
-                payout=state.asset.payout,
+                payout=None,
             )
             if signal is not None:
-                self._publish_signal(signal)
+                self._spawn(
+                    self._publish_with_live_payout(signal), f"signal-{symbol}"
+                )
+
+    async def _publish_with_live_payout(self, signal: Signal) -> None:
+        signal.payout = await self.live_payout(signal.pair)
+        self._publish_signal(signal)
 
     def _publish_signal(self, signal: Signal) -> None:
         if not self.subscribers.subscribed_chat_ids(signal.pair):

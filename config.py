@@ -19,6 +19,8 @@ def _positive_int_setting(name: str, default: int) -> int:
 MIN_PAYOUT_OPTIONS = (80, 85, 88, 92)
 MIN_PAYOUT = 80
 MAX_SCAN_PAIRS = _positive_int_setting("MAX_SCAN_PAIRS", 20)
+# Upper bound on live symbol subscriptions held at once (selected + grace period).
+MAX_SUBSCRIBED = _positive_int_setting("MAX_SUBSCRIBED", 30)
 PAYOUT_REFRESH_SECONDS = 60
 MAX_ACTIVE_SIGNALS = 5
 RECOMMENDED_EXPIRY_SECONDS = STRATEGY_SETTINGS.expiry_seconds
@@ -165,3 +167,22 @@ def load_ssid() -> str:
             "the complete current session."
         )
     return ssid
+
+
+def account_type(ssid: str | None = None) -> str:
+    """Return DEMO or REAL from the SSID's isDemo flag; never returns SSID data."""
+    raw = (ssid if ssid is not None else os.environ.get("PO_SSID", "")).strip()
+    try:
+        payload = json.loads(raw[2:]) if raw.startswith("42[") else None
+        flag = payload[1].get("isDemo") if isinstance(payload, list) else None
+    except (json.JSONDecodeError, AttributeError, IndexError, TypeError):
+        flag = None
+    if flag is None:
+        return "UNKNOWN"
+    return "DEMO" if int(flag) == 1 else "REAL"
+
+
+PAYOUT_DISCLAIMER = (
+    "Payouts vary by account type and change over time. "
+    "Check the payout on your chart before you trade."
+)

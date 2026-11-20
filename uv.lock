@@ -1,21 +1,21 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 
 [[package]]
 name = "binaryoptionstoolsv2"
-version = "0.2.15"
+version = "0.2.18"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/3f/10/5dfc7b0a203069f1244f731d954e466174d35a5a4dff723409c0d83cd21d/binaryoptionstoolsv2-0.2.15.tar.gz", hash = "sha256:f7908e06ab2a84d64aeb4a37d905ec514aed5bc5cd0a8d8defbaa9e58657606c", size = 305381, upload-time = "2026-09-07T14:47:56.555Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/67/52/51c4dcbb16cb43b21800e2e7a9cebfa9819ed9618cb4fbcdc866c6a595b2/binaryoptionstoolsv2-0.2.18.tar.gz", hash = "sha256:d4f62ee138d47d8362c35280e8519b93eab3d13925c7e312f520a7c23e77d5d0", size = 355710, upload-time = "2026-11-17T08:37:22.505Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/42/50/afc012765e7d99a48f9f732776735e04d6d41c6b741ce80c99f9eecf0ae7/binaryoptionstoolsv2-0.2.15-cp310-abi3-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:d13ddbe4be1c7ca7769b5a2b564b865d767d9bd89de189c7c842618befdec0f6", size = 8985003, upload-time = "2026-09-07T14:47:44.794Z" },
-    { url = "https://files.pythonhosted.org/packages/26/23/35bc8815c21afc152d4603245309b59d593063e448218dbffc16aa75ac8a/binaryoptionstoolsv2-0.2.15-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:926281534d84781c972c11a8528f2141f8a8a2ac85816afc13a85f1380e5d5e8", size = 4802051, upload-time = "2026-09-07T14:47:46.757Z" },
-    { url = "https://files.pythonhosted.org/packages/66/57/c70b0af1a3f60a92310ebef432544349e06de3f25eb69be1120792316a74/binaryoptionstoolsv2-0.2.15-cp310-abi3-manylinux_2_28_armv7l.whl", hash = "sha256:a5e708efb637ed4694f0b6dadfa830af526f72a87070fda8630fe2991c0bfd72", size = 4133921, upload-time = "2026-09-07T14:47:48.009Z" },
-    { url = "https://files.pythonhosted.org/packages/4d/19/4a0e25dd0061ca6b3f22bb192452821562f3b4795b82e209df10cb01ecc8/binaryoptionstoolsv2-0.2.15-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:9ea3c23e4bd1826b8a42c195721f514461e04b440991e69a60922a624914ba4c", size = 5095037, upload-time = "2026-09-07T14:47:49.147Z" },
-    { url = "https://files.pythonhosted.org/packages/16/3e/b2046aef268de1317e295ce83d3f045851aa26bf68caf86d982f71811956/binaryoptionstoolsv2-0.2.15-cp310-abi3-musllinux_1_1_aarch64.whl", hash = "sha256:4b3516051432eeec9a206fa491cc729bd3c8a55750c4e1fed81485bc6c7880a9", size = 4799188, upload-time = "2026-09-07T14:47:50.523Z" },
-    { url = "https://files.pythonhosted.org/packages/66/45/914296e74c3ed4dcf11bda0a0065c1714576eb225f67f80bc48adb08407c/binaryoptionstoolsv2-0.2.15-cp310-abi3-musllinux_1_1_x86_64.whl", hash = "sha256:8e08b68517fe8b67b97f3ea818f002a952232303f02fe5463019681360ef113d", size = 5092732, upload-time = "2026-09-07T14:47:52.042Z" },
-    { url = "https://files.pythonhosted.org/packages/3f/76/044cd3dfd0a2a57256cb72679b83d6ca06da2eb2cae0a8ed9f94584cb908/binaryoptionstoolsv2-0.2.15-cp310-abi3-win32.whl", hash = "sha256:098cb5286cf8a2cdecdf03557abeb1a9959cdf739500eaf9ef09abf327a6c951", size = 3618803, upload-time = "2026-09-07T14:47:53.281Z" },
-    { url = "https://files.pythonhosted.org/packages/27/25/ef030ef06b150e712e65849b9edd6716ebaab00be09cdef458a7b9135373/binaryoptionstoolsv2-0.2.15-cp310-abi3-win_amd64.whl", hash = "sha256:733fab9921a78c698c556098ae4f6bf7b7a41038aaeff9ab67d505bcaea62acc", size = 4287400, upload-time = "2026-09-07T14:47:54.723Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/d5/dd413ebf745504ae2c69150128660be73a7a5bc83679d33a4e0cb195f597/binaryoptionstoolsv2-0.2.18-cp310-abi3-macosx_10_12_universal2.macosx_10_12_x86_64.macosx_11_0_arm64.whl", hash = "sha256:e88642ad68b9b60a125067bc5ec0890782a1c5acdf7a3d3d73bb414ae71775db", size = 6403201, upload-time = "2026-11-17T08:37:10.858Z" },
+    { url = "https://files.pythonhosted.org/packages/65/34/1b9527ce276c560dbf87d47bf73d517fcb14925ae6cf75b8e00d7f1821cf/binaryoptionstoolsv2-0.2.18-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:e1e45245206ecef330f36b31711de07c2dec9772a5b39a53015a387ac5b45458", size = 3514083, upload-time = "2026-11-17T08:37:12.612Z" },
+    { url = "https://files.pythonhosted.org/packages/da/15/f14123dd55c79a26249b61fcc1977a8c4fdc9f18f29d89feb70bc80800fd/binaryoptionstoolsv2-0.2.18-cp310-abi3-manylinux_2_28_armv7l.whl", hash = "sha256:bcedfffdf553818c8f28c9be9e707ec67b8931e16a171306f5dfc95a1c4260ea", size = 3278927, upload-time = "2026-11-17T08:37:13.923Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/0e/820ff20238edd6dd533429f05052afcce5af1717a15d448fa98bbd12813f/binaryoptionstoolsv2-0.2.18-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:5eaa4b82269b67ea93d0b10aca0d026c0e05ce220f667e1f7d5651869a31cb97", size = 3643282, upload-time = "2026-11-17T08:37:15.356Z" },
+    { url = "https://files.pythonhosted.org/packages/81/66/5875005b1147ba349dc1d99b2d684e5cc77d68eec3ef78cab8c7caccf0a5/binaryoptionstoolsv2-0.2.18-cp310-abi3-musllinux_1_1_aarch64.whl", hash = "sha256:fe7882464bb4d7d636ce47efa2eb40a908b54184c1285977a075cbc389482698", size = 3511843, upload-time = "2026-11-17T08:37:16.846Z" },
+    { url = "https://files.pythonhosted.org/packages/69/f8/f3db3fb379f74703041a31bea5913f59136aa955d04ad286b5e49d6a71a7/binaryoptionstoolsv2-0.2.18-cp310-abi3-musllinux_1_1_x86_64.whl", hash = "sha256:ade6a763f37568a37479f87abd2d0e2e829e5b94d94aa5228d1a16fc3042381b", size = 3648220, upload-time = "2026-11-17T08:37:18.667Z" },
+    { url = "https://files.pythonhosted.org/packages/f0/6c/ff5cce70a3b048d45c0a587fe57396073a3baec8de927f21188d7617c8c4/binaryoptionstoolsv2-0.2.18-cp310-abi3-win32.whl", hash = "sha256:64be9ada3d8eb0154d61c230e40861445d9a9e6d75069d6e2beb24f3d764d417", size = 2879541, upload-time = "2026-11-17T08:37:19.845Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/c7/8b7810d5b1efeb54e225d2af1bc735146e020d1bea8eea8a19d079523ed6/binaryoptionstoolsv2-0.2.18-cp310-abi3-win_amd64.whl", hash = "sha256:7d5d4fb10028d88967647cd30e0d37ca4de40a36a8d63c89dc2a07a4eb2a4c9c", size = 3207802, upload-time = "2026-11-17T08:37:21.247Z" },
 ]
 
 [[package]]
@@ -29,7 +29,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "binaryoptionstoolsv2", specifier = "==0.2.15" },
+    { name = "binaryoptionstoolsv2", specifier = "==0.2.18" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.6" },
 ]
 

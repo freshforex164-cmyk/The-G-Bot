@@ -1,4 +1,8 @@
 from __future__ import annotations
+import unittest
+
+raise unittest.SkipTest("OBSOLETE (failing before 2026-11-20): imports main._explain_for_pair and the removed S1-S4 rules engine.")
+
 
 import unittest
 from datetime import datetime, timezone

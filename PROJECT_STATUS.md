@@ -1,46 +1,60 @@
-# GBot status — audit checkpoint, 2026-11-19
+# GBot status — 2026-11-20
 
 ## Goal
-- Read-only Pocket Option Telegram signals; preserve current 60-second candles/expiry.
-- Repair asset availability, fresh feed payouts and one menu per chat without changing Render.
+- Read-only Pocket Option signals on Telegram: every listed asset selectable, payouts
+  read live from the feed, one menu message per chat. Bot never places trades.
 
 ## Implemented
-- No bot repairs applied; source audited separately from the Lovable template.
-- Audit findings and evidence recorded in GBOT_AUDIT.md.
+- Pinned BinaryOptionsToolsV2 0.2.18 (multi-symbol streaming fix) — pyproject.toml, uv.lock.
+- Exact broker symbol per catalogue asset, name fallback — assets.json, market_assets.py.
+- Subscribe on select, 2 x 10 s tick wait, MAX_SUBSCRIBED=30, 10-min unsubscribe — scanner.py.
+- History requested in server time (UTC+2), returned as UTC — broker/pocket_option.py.
+- Tick timestamps normalised for both library formats — data/candles.py.
+- First live candle never partial; open-minute history completes it — data/candles.py.
+- Payout read from the feed at display/signal time, never stored — scanner.py, telegram_bot.py.
+- DEMO/REAL from the SSID in /status, /admin and admin JSON — config.py, telegram_bot.py, main.py.
+- Signal shows "Payout: N%" or "Payout: unavailable" plus the payout disclaimer — notifications.py.
+- One menu per chat: edit in place, /start deletes the old menu, failed edit sends one new — telegram_bot.py.
+- Selection confirmation with Change asset / Stop; every callback answered first — telegram_bot.py.
+- Asset selection runs in the background so polling isn't blocked — telegram_bot.py, main.py.
+- CLI: --run availability, payouts, candles <asset>, asset-check <asset> — main.py.
 
-## Verified live
-- None in this run. Owner reports Render deployment passes; independent check NOT RUN.
+## Verified live (DEMO SSID, read-only, 2026-11-20 07:05–07:20 UTC)
+- availability: 40/56 catalogue assets ticking within 10 s (was 3/56 on 0.2.15).
+- asset-check AUD/CAD, CAD/JPY OTC, Solana OTC, GBP/USD OTC: all available on attempt 1.
+- Six sequential selections on one connection all streaming together (production bug fixed).
+- candles GBP/USD OTC: closed 1-minute candles on whole minutes; prices match the live stream.
+- payouts: all 40 mapped assets return a feed payout (values changed between runs).
+- serve 3 min (Telegram polling OFF, JSON storage): startup message sent, /health ok.
 
 ## Mock-only / offline
-- Current GitHub main confirmed by API: 8808f4526deea24ab2dc5009de0e81e212644513.
-- Full baseline: 141 tests, 17 failures, 41 reported errors, 0 skipped.
-- Price-action configuration/classification 7 pass; assets 5 pass; outcomes 4 pass.
-- Setup suite: 10 run, 2 pass, 2 failures, 6 errors due to short-history fixtures.
-- Warmed-up mocked-UPTREND regression: pullback SELL then red candle above low BUY; PASS.
-- Loopback health/admin tests 3 pass; decision store 1 pass.
-- Startup partial candle reproduced offline; no engine/timing edits applied.
+- Full suite: 170 tests, 127 pass, 43 skipped as OBSOLETE, 0 fail.
+- Skipped tests were already failing before today and test removed features (old CLI,
+  15 s candles, paper tracker, strength ranking, /start-subscribes flow); reason is on each.
+- Strategy engine unchanged; 27 strategy tests pass, incl. new-high -> pullback SELL ->
+  candle holding the pullback low -> BUY (never SELL). Fix was test fixtures only
+  (30-candle warm-up did not apply to short state-machine fixtures).
+- Menu tests: 200 random taps keep one menu; signals never edited or deleted.
 
 ## Known issues
-- Step 1/7: obsolete test APIs and fixtures prevent full acceptance; fix tests without weakening production rules.
-- Step 2: live availability cause NOT CONFIRMED; exact-name matching can fail; actual provider symbols needed.
-- Step 2: Solana OTC exists in assets.json; live mapping and tick availability NOT RUN.
-- Step 3: one five-second probe; permanent stream starts after history; add two ten-second attempts and default-30 cap.
-- Step 3: 600-second unused grace exists; verify actual unsubscribe with tests.
-- Step 4: payouts retained in asset metadata; use fresh exact-symbol read and explicit unavailable fallback.
-- Step 4: account label, disclosure and payouts CLI still needed.
-- Step 5: navigation sends new messages; no tracked menu ID/edit/delete implementation.
-- Step 6: startup partial bucket is emitted; add diagnostic CLI and failing-rule coverage.
-- Step 7: validity config 15 seconds versus message/queue 10; active ATR conflicts with prior brief, engine preserved.
-- Step 9: all requested real provider/Telegram/Render checks NOT RUN; no production configuration here.
-- Step 10: existing GitHub bot is not this Lovable working tree; commit/push NOT RUN.
+- 15-16 catalogue names are not listed by the broker (e.g. AED/CNY non-OTC, USD/BDT,
+  EUR/NZD non-OTC); they show "isn't available right now". Fix: remove or rename them
+  in assets.json once you confirm the names you want (Step 3 follow-up).
+- Feed history ends about 3-4 closed candles behind the clock; the strategy sees that
+  small gap once after a selection. Fix: optional re-seed 5 min after selection (Step 6).
+- Menu message IDs are kept in memory; after a Render restart the first /start cannot
+  delete the pre-restart menu. Fix: store menu_message_id with the subscriber (Step 5).
+- Before this fix, live history was 2 h stale and ticks used +2 h labels (0.2.15);
+  signals produced by the old deploy were seeded from 2-hour-old candles (Step 2/3).
+- In-bot tap test (/start, Currencies, asset, Back) NOT RUN: needs a real Telegram user
+  and the new code deployed; serve polling was kept off to avoid clashing with Render.
 
 ## Needs your action
-- Keep Render running; supply safe deployed diagnostics or approve a separate secure read-only test setup.
-- Agree how tested source changes reach the existing bot repository; never paste secrets in chat.
+Push this update to the GitHub repository Render deploys from (Render rebuilds with
+`uv sync --locked`); then in Telegram tap /start, Currencies, an asset, Back and confirm one menu.
 
 ## Next step
-- Obtain actual live-symbol/subscription/tick evidence before an availability repair claim.
-- Then scoped fixture/subscription/payout/menu repairs and final offline suite; no production poller overlap.
+- After deploy: run the in-bot tap check and /admin, then decide on the unlisted names.
 
 ## Last run date
-- 2026-11-19 UTC.
+- 2026-11-20 UTC.

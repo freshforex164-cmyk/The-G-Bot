@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any, TypeVar
 
@@ -14,6 +15,7 @@ from config import (
     CONNECTION_MONITOR_INTERVAL_SECONDS,
     INITIAL_CONNECT_TIMEOUT_SECONDS,
     PAYOUTS_TIMEOUT_SECONDS,
+    POCKET_OPTION_TIME_OFFSET_SECONDS,
     RECONNECT_BASE_DELAY_SECONDS,
     RECONNECT_CALL_TIMEOUT_SECONDS,
     RECONNECT_MAX_ATTEMPTS,
@@ -44,6 +46,14 @@ class PocketOptionOperationError(PocketOptionBrokerError):
 
 class CandleHistoryUnavailable(PocketOptionBrokerError):
     """Raised when optional historical candle seeding is unavailable."""
+
+
+async def _read_all_payouts(client: PocketOptionAsync) -> Any:
+    """Read every live payout; BinaryOptionsToolsV2 0.2.16+ renamed the call."""
+    read_all = getattr(client, "payouts", None)
+    if callable(read_all):
+        return await read_all()
+    return await client.payout()
 
 
 class PocketOptionBroker:
@@ -264,7 +274,7 @@ class PocketOptionBroker:
     async def payouts(self) -> dict[str, float]:
         try:
             raw_payouts = await asyncio.wait_for(
-                self._request("read payouts", lambda client: client.payout()),
+                self._request("read payouts", _read_all_payouts),
                 timeout=PAYOUTS_TIMEOUT_SECONDS,
             )
         except TimeoutError:
@@ -281,6 +291,18 @@ class PocketOptionBroker:
             if isinstance(pair, str) and isinstance(payout, (int, float)):
                 parsed[pair] = float(payout)
         return parsed
+
+    async def payout(self, symbol: str) -> float | None:
+        """Read one symbol's payout from the live feed now; None when unknown."""
+        try:
+            payouts = await self.payouts()
+        except Exception as exc:
+            logger.warning("Payout read failed (%s).", type(exc).__name__)
+            return None
+        value = payouts.get(symbol)
+        if value is None or not 0 < value <= 100:
+            return None
+        return float(value)
 
     async def active_assets(self) -> list[dict[str, Any]]:
         """Read provider asset names and open flags without printing metadata."""
@@ -302,13 +324,23 @@ class PocketOptionBroker:
     async def candle_history(
         self, pair: str, period_seconds: int, lookback_seconds: int
     ) -> list[dict[str, Any]]:
+        """Closed history up to now, with timestamps converted to true UTC.
+
+        Pocket Option's history API works in server time (UTC+2). Asking with a
+        UTC "now" returns candles that end two hours ago, so the request uses
+        server time and every returned timestamp is shifted back to UTC.
+        """
+        offset = POCKET_OPTION_TIME_OFFSET_SECONDS
+        server_now = int(time.time()) + offset
+
+        async def read(client: PocketOptionAsync) -> Any:
+            advanced = getattr(client, "get_candles_advanced", None)
+            if callable(advanced):
+                return await advanced(pair, period_seconds, lookback_seconds, server_now)
+            return await client.compile_candles(pair, period_seconds, lookback_seconds)
+
         try:
-            history = await self._request(
-                "fetch candle history",
-                lambda client: client.compile_candles(
-                    pair, period_seconds, lookback_seconds
-                ),
-            )
+            history = await self._request("fetch candle history", read)
         except (PocketOptionAuthenticationError, PocketOptionConnectionError):
             raise
         except PocketOptionOperationError as exc:
@@ -321,7 +353,19 @@ class PocketOptionBroker:
             raise CandleHistoryUnavailable(
                 f"Historical candle seed for {pair} had an unexpected format."
             )
-        return history
+        converted: list[dict[str, Any]] = []
+        for row in history:
+            if not isinstance(row, dict):
+                continue
+            raw = row.get("timestamp", row.get("time"))
+            try:
+                stamp = int(float(raw))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if stamp > 10_000_000_000:
+                stamp //= 1000
+            converted.append({**row, "timestamp": stamp - offset, "time": stamp - offset})
+        return converted
 
     async def subscribe_ticks(self, pair: str) -> AsyncGenerator[dict[str, Any], None]:
         """Yield raw price updates from BinaryOptionsToolsV2.subscribe_symbol()."""

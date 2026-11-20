@@ -100,16 +100,18 @@ class PriceActionDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             message,
             "🔴 <b>SELL</b>\nAsset: AED/CNY\nSetup: Uptrend pullback\n"
-            "Expiry: 1 minute\nPayout: 92%\nValid for: 10 seconds",
+            "Expiry: 1 minute\nPayout: 92%\nValid for: 10 seconds\n"
+            "<i>Payouts vary by account type and change over time. "
+            "Check the payout on your chart before you trade.</i>",
         )
         self.assertEqual(captured["body"]["parse_mode"], "HTML")
         self.assertNotIn("strength", message.lower())
         self.assertNotIn("1.23", message)
 
-    async def test_assets_without_known_payout_omit_payout_line(self):
+    async def test_assets_without_known_payout_say_payout_unavailable(self):
         signal = self.signal()
         signal.payout = None
-        self.assertNotIn("Payout:", format_signal_message(signal))
+        self.assertIn("Payout: unavailable", format_signal_message(signal))
 
     async def test_start_shows_five_categories_and_asset_selection_subscribes(self):
         with TemporaryDirectory() as temp_dir:
@@ -153,8 +155,10 @@ class PriceActionDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
             self.assertEqual(store.subscribed_chat_ids("AEDCNY_otc"), [101])
-            self.assertIn("Selected AED/CNY", client.messages[-1][1])
-            self.assertIn("92%", client.messages[-1][1])
+            self.assertEqual(
+                client.messages[-1][1],
+                "Selected AED/CNY. Signals are on for this asset.",
+            )
 
     async def test_unavailable_asset_shows_exact_message_and_category_again(self):
         with TemporaryDirectory() as temp_dir:
@@ -175,9 +179,8 @@ class PriceActionDeliveryTests(unittest.IsolatedAsyncioTestCase):
                     }
                 }
             )
-            self.assertEqual(
-                client.messages[-2][1],
-                "EUR/USD isn't available right now. Pick another asset.",
+            self.assertTrue(
+                client.messages[-1][1].startswith("EUR/USD isn't available right now.")
             )
             self.assertTrue(
                 any(

@@ -161,13 +161,36 @@ class TelegramBotClient:
         *,
         reply_markup: Mapping[str, Any] | None = None,
         parse_mode: str | None = "HTML",
-    ) -> None:
+    ) -> Any:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
         if parse_mode:
             payload["parse_mode"] = parse_mode
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
-        await self.call("sendMessage", payload)
+        return await self.call("sendMessage", payload)
+
+    async def edit_message_text(
+        self,
+        chat_id: int | str,
+        message_id: int,
+        text: str,
+        *,
+        reply_markup: Mapping[str, Any] | None = None,
+        parse_mode: str | None = "HTML",
+    ) -> Any:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return await self.call("editMessageText", payload)
+
+    async def delete_message(self, chat_id: int | str, message_id: int) -> None:
+        await self.call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
 
     async def answer_callback(self, callback_id: str) -> None:
         await self.call("answerCallbackQuery", {"callback_query_id": callback_id})
@@ -217,6 +240,7 @@ class TelegramCommandHandler:
         started_at: float | None = None,
         test_signal_provider: Callable[[], Awaitable[list[str]]] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        background_selection: bool = False,
     ) -> None:
         self.client = client
         self.subscribers = subscribers
@@ -233,6 +257,11 @@ class TelegramCommandHandler:
         self._clock = clock
         self._last_command_reply_at: dict[tuple[str, str], float] = {}
         self._last_reply_text: dict[str, str] = {}
+        # One menu message per chat: its message_id is edited in place.
+        self.menu_message_ids: dict[int, int] = {}
+        self._menu_locks: dict[int, asyncio.Lock] = {}
+        self.background_selection = background_selection
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
     async def _send_command_reply(
         self,
@@ -296,10 +325,11 @@ class TelegramCommandHandler:
             chat_id = self._update_chat_id(update)
             if chat_id is not None:
                 try:
-                    await self._send_command_reply(
+                    await self._render_menu(
                         chat_id,
-                        "Sorry, that request could not be completed. Try again.",
-                        command=self._update_command(update),
+                        "Sorry, that request could not be completed. Try again.\n\n"
+                        "Choose an asset category:",
+                        self._categories_keyboard(),
                     )
                 except TelegramSendError:
                     logger.warning("Could not send a Telegram command error response.")
@@ -333,7 +363,26 @@ class TelegramCommandHandler:
             data = str(callback.get("data", ""))
             chat_id = self._update_chat_id(update)
             if callback_id is not None:
-                await self.client.answer_callback(str(callback_id))
+                # Answer first so the button stops loading, whatever follows.
+                try:
+                    await self.client.answer_callback(str(callback_id))
+                except TelegramSendError as exc:
+                    logger.warning(
+                        "Callback answer failed (%s).",
+                        exc.status_code or type(exc).__name__,
+                    )
+            message = callback.get("message")
+            message_id = message.get("message_id") if isinstance(message, Mapping) else None
+            if chat_id is not None and isinstance(message_id, int):
+                self.menu_message_ids[chat_id] = message_id
+            if chat_id is not None and data.startswith("asset:") and self.background_selection:
+                task = asyncio.create_task(
+                    self._locked_select(chat_id, data.split(":", 1)[1]),
+                    name=f"select-asset-{chat_id}",
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+                return
             if chat_id is not None and data.startswith("assetcat:"):
                 await self._show_category(chat_id, data.split(":", 1)[1])
                 return
@@ -344,7 +393,9 @@ class TelegramCommandHandler:
                 await self._select_asset(chat_id, data.split(":", 1)[1])
                 return
             if chat_id is not None and data.startswith("signals:"):
-                await self._dispatch(data.removeprefix("signals:"), chat_id)
+                await self._dispatch(
+                    data.removeprefix("signals:"), chat_id, from_menu=True
+                )
             return
 
         message = update.get("message")
@@ -365,33 +416,43 @@ class TelegramCommandHandler:
         await self._dispatch(command, chat_id, sender_id=sender_id)
 
     async def _dispatch(
-        self, command: str, chat_id: int, *, sender_id: int | None = None
+        self,
+        command: str,
+        chat_id: int,
+        *,
+        sender_id: int | None = None,
+        from_menu: bool = False,
     ) -> None:
         if command in {"start", "stop", "status", "help", "register", "pricecheck"}:
             if command == "start":
-                await self._show_categories(chat_id)
+                if from_menu:
+                    await self._show_categories(chat_id)
+                else:
+                    await self._restart_menu(chat_id)
             elif command == "stop":
                 changed = await asyncio.to_thread(
                     self.subscribers.set_subscribed, chat_id, False
                 )
-                await self._send_command_reply(
+                await self._render_menu(
                     chat_id,
-                    "Signals are off"
-                    if changed
-                    else "Signals are already off",
-                    command="stop",
-                    reply_markup=self._keyboard(chat_id),
-                    force=True,
+                    "Signals are off." if changed else "Signals are already off.",
+                    self._keyboard(chat_id),
                 )
             elif command == "status":
-                await self._status_reply(chat_id)
+                if from_menu:
+                    await self._render_menu(
+                        chat_id, await self._status_text(chat_id), self._keyboard(chat_id)
+                    )
+                else:
+                    await self._status_reply(chat_id)
             elif command == "help":
                 await self._send_command_reply(
                     chat_id,
                     "GBot reports informational price-action signals from closed "
                     "1-minute candles. Use /start to choose one asset, /status to "
                     "check your selection, /pricecheck for its latest price, and "
-                    "/stop to stop receiving signals. GBot never places trades.",
+                    "/stop to stop receiving signals. GBot never places trades.\n\n"
+                    + html.escape(config.PAYOUT_DISCLAIMER, quote=False),
                     command="help",
                     force=True,
                 )
@@ -411,7 +472,7 @@ class TelegramCommandHandler:
                 return
             if command in {"admin", "health"}:
                 await self._send_command_reply(
-                    chat_id, self._admin_report(), command=command
+                    chat_id, await self._admin_report_with_payouts(), command=command
                 )
             elif command == "pause":
                 pause = getattr(self.scanner, "pause", None)
@@ -454,7 +515,9 @@ class TelegramCommandHandler:
                         command="testsignal",
                     )
                     return
-                messages = await self.test_signal_provider()
+                messages = self.test_signal_provider()
+                if asyncio.iscoroutine(messages):
+                    messages = await messages
                 if messages:
                     await self._send_command_reply(
                         self.admin_chat_id,
@@ -469,23 +532,27 @@ class TelegramCommandHandler:
         )
 
     def _keyboard(self, chat_id: int) -> dict[str, Any]:
-        rows: list[list[dict[str, str]]] = []
         subscriber = self.subscribers.subscribers.get(chat_id)
         if subscriber is not None and subscriber.subscribed:
-            rows.extend(
-                [
-                    [{"text": "Stop signals", "callback_data": "signals:stop"}],
-                    [{"text": "Status", "callback_data": "signals:status"}],
-                ]
-            )
+            rows = [
+                [{"text": "Change asset", "callback_data": "assetback"}],
+                [{"text": "Stop", "callback_data": "signals:stop"}],
+            ]
         else:
-            rows.extend(
-                [
-                    [{"text": "Start signals", "callback_data": "signals:start"}],
-                    [{"text": "Register", "callback_data": "signals:register"}],
-                ]
-            )
+            rows = [
+                [{"text": "Choose an asset", "callback_data": "signals:start"}],
+                [{"text": "Register", "callback_data": "signals:register"}],
+            ]
         return {"inline_keyboard": rows}
+
+    @staticmethod
+    def _selected_keyboard() -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [{"text": "Change asset", "callback_data": "assetback"}],
+                [{"text": "Stop", "callback_data": "signals:stop"}],
+            ]
+        }
 
     @staticmethod
     def _categories_keyboard() -> dict[str, Any]:
@@ -499,46 +566,132 @@ class TelegramCommandHandler:
     def _asset_matches(self) -> dict[str, Any]:
         return getattr(self.scanner, "asset_matches", {}) if self.scanner else {}
 
-    async def _show_categories(self, chat_id: int) -> None:
-        await self._send_command_reply(
-            chat_id,
-            "Choose an asset category:",
-            command="start",
-            reply_markup=self._categories_keyboard(),
-            force=True,
+    def _menu_lock(self, chat_id: int) -> asyncio.Lock:
+        lock = self._menu_locks.get(chat_id)
+        if lock is None:
+            lock = self._menu_locks[chat_id] = asyncio.Lock()
+        return lock
+
+    async def _send_menu(
+        self, chat_id: int, text: str, reply_markup: Mapping[str, Any]
+    ) -> None:
+        result = await self.client.send_message(
+            chat_id, text, reply_markup=reply_markup
+        )
+        message_id = result.get("message_id") if isinstance(result, Mapping) else None
+        if isinstance(message_id, int):
+            self.menu_message_ids[chat_id] = message_id
+        else:
+            self.menu_message_ids.pop(chat_id, None)
+
+    async def _render_menu(
+        self, chat_id: int, text: str, reply_markup: Mapping[str, Any]
+    ) -> None:
+        """Edit this chat's single menu message; send one new menu if editing fails."""
+        message_id = self.menu_message_ids.get(chat_id)
+        if message_id is not None:
+            try:
+                await self.client.edit_message_text(
+                    chat_id, message_id, text, reply_markup=reply_markup
+                )
+                return
+            except TelegramSendError as exc:
+                if "not modified" in str(exc):
+                    return
+                logger.info(
+                    "Menu edit failed (%s); sending a new menu.",
+                    exc.status_code or type(exc).__name__,
+                )
+        await self._send_menu(chat_id, text, reply_markup)
+
+    async def _restart_menu(self, chat_id: int) -> None:
+        """/start: delete the previous menu (the bot's own message) and send a new one."""
+        message_id = self.menu_message_ids.pop(chat_id, None)
+        if message_id is not None:
+            try:
+                await self.client.delete_message(chat_id, message_id)
+            except TelegramSendError as exc:
+                logger.info(
+                    "Previous menu could not be deleted (%s).",
+                    exc.status_code or type(exc).__name__,
+                )
+        await self._send_menu(
+            chat_id, "Choose an asset category:", self._categories_keyboard()
         )
 
-    async def _show_category(self, chat_id: int, index_text: str) -> None:
+    async def _show_categories(self, chat_id: int, notice: str = "") -> None:
+        await self._render_menu(
+            chat_id,
+            f"{notice}Choose an asset category:",
+            self._categories_keyboard(),
+        )
+
+    async def _live_payouts(self) -> dict[str, float]:
+        reader = getattr(self.scanner, "live_payouts", None)
+        if not callable(reader):
+            return {}
+        try:
+            return await reader()
+        except Exception as exc:
+            logger.warning("Menu payouts unavailable (%s).", type(exc).__name__)
+            return {}
+
+    async def _show_category(
+        self, chat_id: int, index_text: str, notice: str = ""
+    ) -> None:
         try:
             category = CATEGORIES[int(index_text)]
         except (ValueError, IndexError):
             await self._show_categories(chat_id)
             return
         matches = self._asset_matches()
+        payouts = await self._live_payouts()
         assets = [item for item in CATALOG if item.category == category]
         buttons: list[dict[str, str]] = []
         for item in assets:
             live = matches.get(item.id)
             label = item.name
-            payout = getattr(live, "payout", None)
+            payout = payouts.get(live.symbol) if live is not None else None
             if payout is not None:
                 label += f" · {payout:g}%"
             buttons.append({"text": label, "callback_data": f"asset:{item.id}"})
         rows = [buttons[offset : offset + 2] for offset in range(0, len(buttons), 2)]
         rows.append([{"text": "Back", "callback_data": "assetback"}])
-        await self._send_command_reply(
+        await self._render_menu(
             chat_id,
-            f"{category} — choose an asset:",
-            command=f"category-{index_text}",
-            reply_markup={"inline_keyboard": rows},
-            force=True,
+            f"{notice}{html.escape(category, quote=False)} — choose an asset:",
+            {"inline_keyboard": rows},
         )
+
+    async def _locked_select(self, chat_id: int, asset_id: str) -> None:
+        async with self._menu_lock(chat_id):
+            try:
+                await self._select_asset(chat_id, asset_id)
+            except Exception as exc:
+                logger.error("Asset selection failed (%s).", type(exc).__name__)
+                try:
+                    await self._show_categories(
+                        chat_id, "Sorry, that request could not be completed. Try again.\n\n"
+                    )
+                except TelegramSendError:
+                    logger.warning("Could not update the menu after an error.")
+
+    async def wait_idle(self) -> None:
+        while self._background_tasks:
+            await asyncio.gather(*tuple(self._background_tasks), return_exceptions=True)
 
     async def _select_asset(self, chat_id: int, asset_id: str) -> None:
         asset = CATALOG_BY_ID.get(asset_id)
         if asset is None:
             await self._show_categories(chat_id)
             return
+        name = html.escape(asset.name, quote=False)
+        category_index = str(CATEGORIES.index(asset.category))
+        await self._render_menu(
+            chat_id,
+            f"Checking {name}…",
+            {"inline_keyboard": [[{"text": "Back", "callback_data": "assetback"}]]},
+        )
         select = getattr(self.scanner, "select_asset", None)
         try:
             live = await select(chat_id, asset_id) if callable(select) else None
@@ -548,22 +701,14 @@ class TelegramCommandHandler:
             )
             live = None
         if not live:
-            await self._send_command_reply(
-                chat_id,
-                f"{asset.name} isn't available right now. Pick another asset.",
-                command=f"asset-{asset_id}",
-                force=True,
+            await self._show_category(
+                chat_id, category_index, f"{name} isn't available right now.\n\n"
             )
-            await self._show_category(chat_id, str(CATEGORIES.index(asset.category)))
             return
-        payout = f"\nPayout: {live.payout:g}%" if live.payout is not None else ""
-        await self._send_command_reply(
+        await self._render_menu(
             chat_id,
-            f"Selected {asset.name}. Signals for this asset are on for this chat."
-            f"{payout}",
-            command=f"asset-{asset_id}",
-            reply_markup=self._keyboard(chat_id),
-            force=True,
+            f"Selected {name}. Signals are on for this asset.",
+            self._selected_keyboard(),
         )
 
     async def _pricecheck_reply(self, chat_id: int) -> None:
@@ -623,24 +768,31 @@ class TelegramCommandHandler:
                 "The Pocket Option account link is not configured. "
                 "Already have an account? Tap Start signals."
             )
-        await self._send_command_reply(
-            chat_id,
-            text,
-            command="register",
-            reply_markup=self._keyboard(chat_id),
+        await self._render_menu(chat_id, text, self._keyboard(chat_id))
+
+    async def _payout_line(self, symbol: str | None) -> str:
+        account = config.account_type()
+        reader = getattr(self.scanner, "live_payout", None)
+        payout = await reader(symbol) if symbol and callable(reader) else None
+        value = f"{payout:g}%" if payout is not None else "unavailable"
+        return f"Payout: {value} ({account} account)"
+
+    async def _status_text(self, chat_id: int) -> str:
+        subscriber = self.subscribers.subscribers.get(chat_id)
+        subscribed = bool(subscriber and subscriber.subscribed)
+        symbol = getattr(subscriber, "selected_asset", None)
+        return (
+            f"Signals: {'on' if subscribed else 'off'}\n"
+            f"Scanner: {self._scanner_status()}\n"
+            f"Asset: {html.escape(self._asset_name(subscriber), quote=False)}\n"
+            f"{await self._payout_line(symbol)}"
         )
 
     async def _status_reply(self, chat_id: int) -> None:
-        subscriber = self.subscribers.subscribers.get(chat_id)
-        subscribed = bool(subscriber and subscriber.subscribed)
-        scanner_status = self._scanner_status()
         await self._send_command_reply(
             chat_id,
-            f"Signals: {'on' if subscribed else 'off'}\n"
-            f"Scanner: {scanner_status}\n"
-            f"Asset: {self._asset_name(subscriber)}",
+            await self._status_text(chat_id),
             command="status",
-            reply_markup=self._keyboard(chat_id),
             force=True,
         )
 
@@ -719,6 +871,19 @@ class TelegramCommandHandler:
             "uptime_seconds": max(0, int(time.monotonic() - self.started_at)),
         }
 
+    async def _admin_report_with_payouts(self) -> str:
+        report = self._admin_report()
+        pairs = getattr(self.scanner, "pairs", {}) if self.scanner else {}
+        if not pairs:
+            return report + f"\nPayouts ({config.account_type()}): no assets streaming"
+        payouts = await self._live_payouts()
+        parts = []
+        for symbol, state in sorted(pairs.items()):
+            name = getattr(getattr(state, "asset", None), "display_name", symbol)
+            value = payouts.get(symbol)
+            parts.append(f"{name} {value:g}%" if value is not None else f"{name} unavailable")
+        return report + f"\nPayouts ({config.account_type()}): " + ", ".join(parts)
+
     def _admin_report(self) -> str:
         metrics = self.admin_metrics()
         age = metrics["last_tick_age_seconds"]
@@ -740,6 +905,7 @@ class TelegramCommandHandler:
         return (
             f"Feed: {metrics['feed_status']}\n"
             f"SSID: {'configured' if os.environ.get('PO_SSID', '').strip() else 'missing'}\n"
+            f"Account: {config.account_type()}\n"
             f"Last tick age: {age_text}\n"
             f"Selected assets streaming: {metrics['selected_assets_streaming']}\n"
             f"Subscribers: {metrics['subscriber_count']}\n"

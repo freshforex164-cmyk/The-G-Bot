@@ -236,8 +236,141 @@ async def run_assets() -> bool:
         await broker.close()
 
 
+async def run_availability(*, wait_seconds: float = 10.0) -> bool:
+    """Per catalogue asset: mapped symbol, live-list presence, subscribe, fresh tick."""
+    broker = PocketOptionBroker(config.load_ssid())
+    try:
+        await broker.connect()
+        rows = await broker.active_assets()
+        live_symbols = {row.get("symbol") for row in rows}
+        matches = await _live_asset_map(broker)
+        targets = sorted(
+            {live.symbol for live in matches.values() if live.is_open}
+        )
+        subscribed: dict[str, bool] = {}
+        last_tick: dict[str, float] = {}
+
+        async def watch(symbol: str) -> None:
+            stream = broker.subscribe_ticks(symbol)
+            try:
+                async for tick in stream:
+                    subscribed[symbol] = True
+                    try:
+                        timestamp, _price = _tick_values(tick)
+                    except (TypeError, ValueError, OverflowError, OSError, CandleDataError):
+                        continue
+                    last_tick[symbol] = timestamp.timestamp()
+            except Exception as exc:
+                logger.warning("Availability stream failed (%s).", type(exc).__name__)
+            finally:
+                await stream.aclose()
+
+        async def subscribe_all() -> None:
+            for symbol in targets:
+                subscribed.setdefault(symbol, False)
+                tasks.append(asyncio.create_task(watch(symbol)))
+                await asyncio.sleep(0.2)
+
+        tasks: list[asyncio.Task[None]] = []
+        await subscribe_all()
+        await asyncio.sleep(wait_seconds)
+        now = datetime.now(timezone.utc).timestamp()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        print("Display name | Symbol | In live list | Subscribed | Tick in last 10s")
+        ticking = 0
+        for asset in CATALOG:
+            live = matches.get(asset.id)
+            symbol = live.symbol if live else "unmatched"
+            in_list = "yes" if live and live.symbol in live_symbols else "no"
+            sub = "yes" if live and live.symbol in subscribed else "no"
+            fresh = live is not None and now - last_tick.get(live.symbol, 0) <= 10
+            ticking += int(fresh)
+            print(f"{asset.name} | {symbol} | {in_list} | {sub} | {'yes' if fresh else 'no'}")
+        print(f"Assets with a tick in the last 10s: {ticking}/{len(CATALOG)}")
+        return ticking > 0
+    finally:
+        await broker.close()
+
+
+async def run_payouts() -> bool:
+    """Print each catalogue asset with its payout as read from the feed now."""
+    broker = PocketOptionBroker(config.load_ssid())
+    try:
+        await broker.connect()
+        matches = match_runtime_assets(await broker.active_assets())
+        payouts = await broker.payouts()
+        read_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        print(f"Account: {config.account_type()} | read at {read_at}")
+        print("Display name | Symbol | Feed payout")
+        known = 0
+        for asset in CATALOG:
+            live = matches.get(asset.id)
+            value = payouts.get(live.symbol) if live else None
+            if value is not None and not 0 < value <= 100:
+                value = None
+            known += int(value is not None)
+            print(
+                f"{asset.name} | {live.symbol if live else 'unmatched'} | "
+                + (f"{value:g}%" if value is not None else "unavailable")
+            )
+        print(config.PAYOUT_DISCLAIMER)
+        return known > 0
+    finally:
+        await broker.close()
+
+
+async def run_candles(asset_name: str) -> bool:
+    """Print the last 3 closed 1-minute candles and the next close time."""
+    catalog_asset = next(
+        (a for a in CATALOG if a.name == asset_name or a.id == asset_name), None
+    )
+    if catalog_asset is None:
+        print(f"Unknown catalogue asset: {asset_name}")
+        return False
+    period = STRATEGY_SETTINGS.timeframe_seconds
+    broker = PocketOptionBroker(config.load_ssid())
+    try:
+        await broker.connect()
+        live = match_runtime_assets(await broker.active_assets()).get(catalog_asset.id)
+        if live is None:
+            print(f"{catalog_asset.name}: no live symbol")
+            return False
+        builder = CandleBuilder(period_seconds=period, max_candles=10)
+        builder.seed(await broker.candle_history(live.symbol, period, period * 10))
+        closed = list(builder.closed)[-3:]
+        from telegram_bot import configured_timezone
+
+        local_zone = configured_timezone()
+        print(f"{catalog_asset.name} ({live.symbol}), {period}s candles")
+        for candle in closed:
+            start = datetime.fromtimestamp(candle.time, timezone.utc)
+            print(
+                f"start={start.isoformat(timespec='seconds')} "
+                f"({start.astimezone(local_zone).strftime('%H:%M %Z')}) "
+                f"O={candle.open:g} H={candle.high:g} L={candle.low:g} C={candle.close:g}"
+            )
+        now = datetime.now(timezone.utc).timestamp()
+        next_close = (int(now) // period + 1) * period
+        print(
+            "Next close: "
+            + datetime.fromtimestamp(next_close, timezone.utc).isoformat(timespec="seconds")
+        )
+        latest_closed_start = next_close - 2 * period
+        if closed and closed[-1].time < latest_closed_start:
+            behind = (latest_closed_start - closed[-1].time) // period
+            print(
+                f"Note: feed history is {behind} closed candle(s) behind the clock; "
+                "the live stream fills these after an asset is selected."
+            )
+        return len(closed) == 3
+    finally:
+        await broker.close()
+
+
 async def run_asset_check(asset_name: str) -> bool:
-    """Show mapping, selection, payout, and the first fresh tick if selected."""
+    """Read-only: map the name, subscribe that symbol (2 x 10 s), report tick and payout."""
     catalog_asset = next(
         (
             asset
@@ -246,50 +379,60 @@ async def run_asset_check(asset_name: str) -> bool:
         ),
         None,
     )
+    print(f"Display name: {catalog_asset.name if catalog_asset else asset_name}")
     if catalog_asset is None:
-        print(f"Display name: {asset_name}")
-        print("Symbol: unavailable")
-        print("Mapping found: no")
-        print("Subscribed: no")
-        print("First tick time: unavailable")
-        print("Last price: unavailable")
-        print("Payout: unavailable")
+        print("Mapping found: no (not in catalogue)")
         return False
 
     broker = PocketOptionBroker(config.load_ssid())
     try:
         await broker.connect()
-        matches = await _live_asset_map(broker)
-        live = matches.get(catalog_asset.id)
-        subscribers = await asyncio.to_thread(SubscriberStore)
-        selected = _subscribed_symbols(subscribers)
-        is_selected = bool(live and live.symbol in selected)
-        tick = (
-            await _read_selected_tick(broker, live.symbol)
-            if live and is_selected
-            else None
-        )
-        print(f"Display name: {catalog_asset.name}")
-        print(f"Symbol: {live.symbol if live else 'unavailable'}")
-        print(f"Mapping found: {'yes' if live else 'no'}")
-        print(f"Subscribed: {'yes' if is_selected else 'no'}")
+        rows = await broker.active_assets()
+        live = match_runtime_assets(rows).get(catalog_asset.id)
+        print(f"Catalogue symbol: {catalog_asset.symbol or 'none'}")
+        print(f"Mapped symbol: {live.symbol if live else 'unavailable'}")
+        print(f"In broker live list: {'yes' if live else 'no'}")
+        print(f"Open: {'yes' if live and live.is_open else 'no'}")
+        tick: tuple[datetime, float] | None = None
+        attempts = 0
+        if live and live.is_open:
+            for attempts in range(1, 3):
+                stream = broker.subscribe_ticks(live.symbol)
+                try:
+                    deadline = asyncio.get_running_loop().time() + 10.0
+                    while tick is None:
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            break
+                        try:
+                            raw = await asyncio.wait_for(anext(stream), timeout=remaining)
+                        except (StopAsyncIteration, TimeoutError):
+                            break
+                        try:
+                            stamp, price = _tick_values(raw)
+                        except (TypeError, ValueError, OverflowError, OSError, CandleDataError):
+                            continue
+                        age = (datetime.now(timezone.utc) - stamp).total_seconds()
+                        if 0 <= age < 10:
+                            tick = (stamp, price)
+                finally:
+                    await stream.aclose()
+                if tick is not None:
+                    break
+        print(f"Subscribe attempts: {attempts}")
+        print(f"Subscribed: {'yes' if attempts else 'no'}")
         print(
             "First tick time: "
-            + (tick[0].isoformat(timespec="seconds") if tick else "unavailable")
+            + (tick[0].isoformat(timespec="seconds") if tick else "none within 10 s")
         )
         print(f"Last price: {tick[1]:g}" if tick else "Last price: unavailable")
+        payout = await broker.payout(live.symbol) if live else None
         print(
-            f"Payout: {live.payout:g}%"
-            if live and live.payout is not None
-            else "Payout: unavailable"
+            (f"Payout: {payout:g}%" if payout is not None else "Payout: unavailable")
+            + f" ({config.account_type()} account)"
         )
-        if tick and not tick[2]:
-            print("Tick status: stale")
-        elif tick:
-            print("Tick status: fresh")
-        else:
-            print("Tick status: unavailable")
-        return bool(live and live.is_open and tick and tick[2])
+        print(f"Result: {'available' if tick else 'unavailable'}")
+        return tick is not None
     finally:
         await broker.close()
 
@@ -483,6 +626,7 @@ async def run_serve() -> None:
         fanout=fanout,
         admin_chat_id=admin_chat_id,
         test_signal_provider=_test_signal_messages,
+        background_selection=True,
     )
     polling = TelegramPollingService(bot, handler)
     stop_event = asyncio.Event()
@@ -509,6 +653,7 @@ async def run_serve() -> None:
             "active_pairs": len(scanner.pairs),
             "active_signals": len(scanner.active_signals),
             "ssid_configured": bool(os.environ.get("PO_SSID", "").strip()),
+            "account_type": config.account_type(),
         }
 
     status_server = AdminHttpServer(
@@ -629,6 +774,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "serve",
             "assets",
             "asset-check",
+            "availability",
+            "payouts",
+            "candles",
             "pricecheck",
             "strategy-debug",
             "replay",
@@ -649,7 +797,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "asset_name",
         nargs="?",
-        help="Exact catalogue display name for --run asset-check.",
+        help="Exact catalogue display name for --run asset-check or candles.",
     )
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -661,6 +809,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             asyncio.run(run_serve())
         elif args.run == "assets":
             return 0 if asyncio.run(run_assets()) else 1
+        elif args.run == "candles":
+            if not args.asset_name:
+                parser.error("--run candles requires an exact asset display name.")
+            return 0 if asyncio.run(run_candles(args.asset_name)) else 1
+        elif args.run == "payouts":
+            return 0 if asyncio.run(run_payouts()) else 1
+        elif args.run == "availability":
+            return 0 if asyncio.run(run_availability()) else 1
         elif args.run == "asset-check":
             if not args.asset_name:
                 parser.error("--run asset-check requires an exact asset display name.")

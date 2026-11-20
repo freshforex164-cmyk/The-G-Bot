@@ -63,51 +63,46 @@ class AssetCommandTests(unittest.IsolatedAsyncioTestCase):
         self.broker.connect.assert_awaited_once()
         self.broker.close.assert_awaited_once()
 
-    async def test_asset_check_reports_requested_fields_for_a_selected_symbol(self):
-        timestamp = datetime.now(timezone.utc)
+    async def test_asset_check_subscribes_the_exact_symbol_and_reports_fields(self):
+        subscribed: list[str] = []
+
+        class Broker:
+            async def connect(self):
+                return None
+
+            async def close(self):
+                return None
+
+            async def active_assets(self):
+                return [{"symbol": "GBPUSD_otc", "name": "GBP/USD OTC", "is_active": True}]
+
+            async def payout(self, symbol):
+                return 91.0
+
+            def subscribe_ticks(self, symbol):
+                subscribed.append(symbol)
+
+                async def ticks():
+                    yield {"timestamp": datetime.now(timezone.utc).timestamp(), "close": 1.234}
+
+                return ticks()
+
         output = io.StringIO()
         with (
             patch.object(main.config, "load_ssid", return_value="mock-session"),
-            patch.object(main, "PocketOptionBroker", return_value=self.broker),
-            patch.object(main, "_live_asset_map", new=AsyncMock(
-                return_value={"gbp-usd-otc": self.asset}
-            )),
-            patch.object(main, "SubscriberStore", return_value=self.store),
-            patch.object(main, "_read_selected_tick", new=AsyncMock(
-                return_value=(timestamp, 1.234, True)
-            )) as read_tick,
+            patch.object(main.config, "account_type", return_value="DEMO"),
+            patch.object(main, "PocketOptionBroker", return_value=Broker()),
             redirect_stdout(output),
         ):
             self.assertTrue(await main.run_asset_check("GBP/USD OTC"))
-
         text = output.getvalue()
-        self.assertIn("Display name: GBP/USD OTC", text)
-        self.assertIn("Symbol: GBPUSD_otc", text)
-        self.assertIn("Mapping found: yes", text)
-        self.assertIn("Subscribed: yes", text)
+        self.assertEqual(subscribed, ["GBPUSD_otc"])
+        self.assertIn("Mapped symbol: GBPUSD_otc", text)
+        self.assertIn("In broker live list: yes", text)
+        self.assertIn("Subscribe attempts: 1", text)
         self.assertIn("Last price: 1.234", text)
-        self.assertIn("Payout: 91%", text)
-        self.assertIn("Tick status: fresh", text)
-        read_tick.assert_awaited_once_with(self.broker, "GBPUSD_otc")
-
-    async def test_unselected_asset_check_never_opens_a_tick_stream(self):
-        self.store.subscribers[10].subscribed = False
-        output = io.StringIO()
-        with (
-            patch.object(main.config, "load_ssid", return_value="mock-session"),
-            patch.object(main, "PocketOptionBroker", return_value=self.broker),
-            patch.object(main, "_live_asset_map", new=AsyncMock(
-                return_value={"gbp-usd-otc": self.asset}
-            )),
-            patch.object(main, "SubscriberStore", return_value=self.store),
-            patch.object(main, "_read_selected_tick", new=AsyncMock()) as read_tick,
-            redirect_stdout(output),
-        ):
-            self.assertFalse(await main.run_asset_check("GBP/USD OTC"))
-
-        self.assertIn("Subscribed: no", output.getvalue())
-        self.assertIn("First tick time: unavailable", output.getvalue())
-        read_tick.assert_not_awaited()
+        self.assertIn("Payout: 91% (DEMO account)", text)
+        self.assertIn("Result: available", text)
 
 
 class SelectedStreamGraceTests(unittest.IsolatedAsyncioTestCase):
