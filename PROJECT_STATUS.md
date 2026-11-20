@@ -48,6 +48,10 @@
   password fields focused a native input, typing filled the site's fields, Google button tap reached
   the page, password never returned by /view. NOT VERIFIED on the real Pocket Option page (not
   reachable from the test machine on 2026-11-20), Google pop-up, real Telegram client.
+- Re-check 2026-11-20 12:30 UTC on commit 3400281: GBot suite 144 pass / 43 skipped / 0 fail; autotrade
+  suite 74 pass / 3 skipped (Postgres) / 0 fail, incl. the phone-login browser test. Real Pocket Option
+  login page again unreachable from the test machine (plain browser timed out too, so it is the network,
+  not the login code) — first real test must run from the deployed autotrade server.
 - Skipped tests were already failing before today and test removed features (old CLI,
   15 s candles, paper tracker, strength ranking, /start-subscribes flow); reason is on each.
 - Strategy engine unchanged; 27 strategy tests pass, incl. new-high -> pullback SELL ->
@@ -70,6 +74,8 @@
 
 - Auto-trading NOT VERIFIED live: real Pocket Option login and SSID capture, Google sign-in (Google may
   block automated browsers), real orders, the Docker image build, and the Mini App in a real Telegram app.
+- Risk: Pocket Option may block data-centre addresses (it blocked the test machine). If /at_login shows a
+  blank or timed-out page on the deployed server, the autotrade host's network is being refused.
 
 ## Needs your action
 - To use auto-trading: deploy autotrade/Dockerfile as its own service with Postgres and its env vars
