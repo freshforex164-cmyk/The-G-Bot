@@ -67,14 +67,38 @@ LIVE_WARNING = (
     "Your daily stop-loss and stake limits still apply. To switch, send:\n/at_live confirm"
 )
 
-SSID_HELP = (
+SSID_MENU_TEXT = (
     "🔑 Direct SSID Login (no browser sign-in)\n"
-    "1. Open Pocket Option in a desktop browser and log in (Demo or Real cabinet).\n"
-    "2. Developer tools → Network → WS → the frame starting with 42[\"auth\",\n"
-    "3. Copy the whole frame and send it here as:\n/at_ssid 42[\"auth\",{...}]\n\n"
-    "Demo and Real are separate SSIDs (isDemo 1 or 0): send each one you want to use. "
-    "Your message is deleted right away and the SSID is stored encrypted."
+    "Which Pocket Option account is this SSID for? Demo and Real use separate SSIDs."
 )
+
+
+def ssid_steps(kind: str) -> str:
+    which, flag = ("Real", "0") if kind == "real" else ("Demo", "1")
+    return (
+        f"🔑 {which} account SSID\n"
+        f"1. Open Pocket Option in a desktop browser, log in and open your {which} cabinet.\n"
+        "2. Developer tools → Network → WS → the frame starting with 42[\"auth\",\n"
+        f"3. Check it contains \"isDemo\":{flag}, copy the whole frame and send it here "
+        "(with or without /at_ssid in front).\n\n"
+        "Your message is deleted right away and the SSID is stored encrypted."
+    )
+
+
+SSID_HELP = SSID_MENU_TEXT       # kept for older imports
+
+# Trade amounts offered in the Auto-Trade setup menu: (button label, stake).
+STAKE_OPTIONS: tuple[tuple[str, float], ...] = (
+    ("$1.00", 1.0), ("$1.50", 1.5), ("$2.00", 2.0),
+    ("$2.50", 2.5), ("$5.00 RISK", 5.0), ("$10.00 RISK", 10.0),
+    ("$25.00", 25.0), ("$50.00", 50.0), ("$100.00", 100.0),
+)
+STAKE_VALUES = frozenset(value for _, value in STAKE_OPTIONS)
+
+
+def _session_kind(mode: Any) -> str:
+    return "real" if str(mode) == "live" else "demo"
+
 
 Send = Callable[..., Awaitable[Any]]
 
@@ -218,6 +242,7 @@ class AutotradeCommands:
         self.client = client
         self._send = send
         self.roster = roster          # AutotradeRoster: who gets trades instead of signal cards
+        self._ssid_wanted: dict[int, str] = {}   # Demo/Real picked in the /at_ssid menu (small, per user)
 
     def _roster_add(self, uid: int) -> None:
         if self.roster is not None:
@@ -234,6 +259,81 @@ class AutotradeCommands:
             {"text": "Log in to Pocket Option", "web_app": {"url": link}} if link.startswith("https://")
             else {"text": "Log in to Pocket Option", "url": link})
         return {"inline_keyboard": [[button], [{"text": "🔑 Direct SSID Login", "callback_data": "at:ssid"}]]}
+
+    @staticmethod
+    def ssid_menu_markup() -> dict[str, Any]:
+        return {"inline_keyboard": [[{"text": "🧪 Demo Account", "callback_data": "at:ssid:demo"},
+                                     {"text": "💵 Real Account", "callback_data": "at:ssid:real"}]]}
+
+    @staticmethod
+    def stake_rows(current: Any = None) -> list[list[dict[str, str]]]:
+        """Trade-amount picker: three per row, the saved amount ticked, then Stop and Main Menu."""
+        try:
+            chosen = float(current)
+        except (TypeError, ValueError):
+            chosen = None
+        buttons = [{"text": label + (" ✅" if chosen == value else ""), "callback_data": f"at:stake:{value:g}"}
+                   for label, value in STAKE_OPTIONS]
+        rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+        rows.append([{"text": "🛑 Stop", "callback_data": "mode:signals"},
+                     {"text": "🏠 Main Menu", "callback_data": "menu:main"}])
+        return rows
+
+    async def setup_state(self, uid: int) -> dict[str, Any]:
+        """Everything the Auto-Trade setup screen needs, read from the saved session vault (no browser).
+
+        connected: the saved session for the current mode (Demo/Real) is active, so no new login is needed.
+        """
+        assert self.client is not None
+        try:
+            settings = await self.client.settings(uid)
+        except AutotradeError as exc:
+            if exc.code != "reauth_required":
+                raise
+            settings = {}
+        mode = str(settings.get("mode", "demo"))
+        kind = _session_kind(mode)
+        try:
+            sessions = await self.client.auth_status(uid)
+        except AutotradeError as exc:
+            if exc.code != "reauth_required":
+                raise
+            sessions = {}
+        connected = (sessions.get(kind) or {}).get("status") == "active"
+        balance = None
+        if connected:
+            try:   # last known reading: quick, no broker round trip
+                data = await self.client.balance(uid, fresh=False)
+                if isinstance(data.get("balance"), (int, float)) and _session_kind(
+                        "live" if data.get("account") == "real" else "demo") == kind:
+                    balance = float(data["balance"])
+            except AutotradeError:
+                balance = None
+        return {"settings": settings, "mode": mode, "kind": kind, "connected": connected,
+                "sessions": sessions, "balance": balance}
+
+    async def set_stake(self, uid: int, value: float) -> tuple[dict[str, Any], str]:
+        """Save a stake from the picker. Returns (settings, note). The daily stop-loss is raised to the stake
+        when needed (a stake above it is never accepted); the user is told when that happens."""
+        assert self.client is not None
+        if value not in STAKE_VALUES:
+            raise AutotradeError(422, "invalid_settings", message="choose one of the listed amounts")
+        current = await self.client.settings(uid)
+        patch: dict[str, Any] = {"stake": value}
+        note = ""
+        try:
+            stop_loss = float(current.get("daily_stop_loss", 0))
+        except (TypeError, ValueError):
+            stop_loss = 0.0
+        if value > stop_loss:
+            patch["daily_stop_loss"] = value
+            note = (f"Daily stop-loss raised to ${value:.2f} so this amount is allowed "
+                    "(change it with /at_set stop_loss <amount>).")
+        return await self.client.update_settings(uid, patch), note
+
+    async def fresh_balance(self, uid: int) -> dict[str, Any]:
+        assert self.client is not None
+        return await self.client.balance(uid, fresh=True)
 
     @staticmethod
     def live_markup() -> dict[str, Any]:
@@ -323,13 +423,25 @@ class AutotradeCommands:
                              self.login_markup(uid))
         elif command == "at_ssid":
             if not args:
-                await self.reply(chat_id, SSID_HELP)
+                await self.reply(chat_id, SSID_MENU_TEXT, self.ssid_menu_markup())
+                return
+            if args.lower() in {"demo", "real"}:
+                self._ssid_wanted[uid] = args.lower()
+                await self.reply(chat_id, ssid_steps(args.lower()))
                 return
             res = await c.submit_ssid(uid, args)
-            which = "Real" if res.get("kind") == "real" else "Demo"
-            note = "" if res.get("verified") else " (Pocket Option couldn't be reached to check it; it will be used next time)"
-            await self.reply(chat_id, f"✅ {which} session saved{note}. No browser sign-in needed: "
-                             "tap 🤖 Start Auto-Trade or send /at_start.")
+            kind = "real" if res.get("kind") == "real" else "demo"
+            which = "Real" if kind == "real" else "Demo"
+            wanted = self._ssid_wanted.pop(uid, None)
+            mismatch = (f"\nNote: you chose {wanted.capitalize()}, but this SSID is for your {which} account."
+                        if wanted and wanted != kind else "")
+            if res.get("verified"):
+                head = f"✅ Connected to your Pocket Option {which} account. Your session is saved."
+            else:
+                head = (f"✅ {which} session saved. Pocket Option couldn't be reached to confirm it right now; "
+                        "it is checked again before the first trade.")
+            await self.reply(chat_id, f"{head}{mismatch}\nNo browser sign-in needed: choose an asset with /start "
+                             "and tap 🤖 Start Auto-Trade.")
         elif command == "at_start":
             await c.start(uid)
             stats = await c.stats(uid)

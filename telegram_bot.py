@@ -66,8 +66,9 @@ class TelegramCommandHandler(core.TelegramCommandHandler):
 
     @staticmethod
     def _main_keyboard():
-        return keyboard([("Choose Asset", "menu:assets"), ("Account Info", "menu:account")],
-                        [("Auto Trading", "menu:autotrade"), ("Support/Help", "menu:help")])
+        # Asset-first: auto-trading starts from an asset's menu, so there is no top-level Auto Trading button.
+        return keyboard([("Choose Asset", "menu:assets")],
+                        [("Account Info", "menu:account"), ("Support/Help", "menu:help")])
 
     def _keyboard(self, chat_id):
         return self._main_keyboard()
@@ -192,17 +193,11 @@ class TelegramCommandHandler(core.TelegramCommandHandler):
         elif target == "help":
             await self._render_menu(chat_id, "<b>Support/Help</b>\nSignals use closed 1-minute candles and 1-minute expiry. Payouts may vary.",
                 keyboard([("Signal status", "signals:status"), ("Stop signals", "signals:stop")], [("Back", "menu:main")]))
-        elif target == "autotrade":
-            await self._render_menu(chat_id, "<b>Auto Trading</b>\nDemo is the default. Live trading requires explicit confirmation.",
-                keyboard([("Log in", "menu:at_login"), ("Results", "menu:at_stats")],
-                         [("Start", "menu:at_start"), ("Stop", "menu:at_stop")],
-                         [("Demo", "menu:at_demo"), ("Live", "menu:live")],
-                         [("Log out", "menu:at_logout"), ("Back", "menu:main")]))
         elif target == "live":
             if sender_id != chat_id:
                 return
             await self._render_menu(chat_id, "<b>Switch to Live?</b>\nTrades use real money. Losses are possible.",
-                                    keyboard([("Confirm Live", "menu:live_confirm"), ("Back", "menu:autotrade")]))
+                                    keyboard([("Confirm Live", "menu:live_confirm"), ("Back", "mode:autotrade")]))
         elif target == "live_confirm":
             await self._dispatch("at_live", chat_id, sender_id=sender_id, args="confirm")
         elif target in ALL_COMMANDS - ADMIN_ONLY_COMMANDS:
@@ -212,7 +207,8 @@ class TelegramCommandHandler(core.TelegramCommandHandler):
         # Service replies reuse the menu; independently delivered signal messages are untouched.
         markup = dict(reply_markup) if reply_markup else keyboard()
         rows = list(markup.get("inline_keyboard", []))
-        rows.append([{"text": "Back", "callback_data": "menu:autotrade"}])
+        rows.append([{"text": "Back", "callback_data": "mode:autotrade"},
+                     {"text": "🏠 Main Menu", "callback_data": "menu:main"}])
         await self._render_menu(chat_id, html.escape(text, quote=False), {"inline_keyboard": rows})
 
     async def _dispatch(self, command, chat_id, *, sender_id=None, from_menu=False, args=""):
@@ -246,8 +242,5 @@ class TelegramCommandHandler(core.TelegramCommandHandler):
             return
         if command == "help":
             await self._navigate(chat_id, "help", sender_id)
-            return
-        if command == "autotrade":
-            await self._navigate(chat_id, "autotrade", sender_id)
             return
         await super()._dispatch(command, chat_id, sender_id=sender_id, from_menu=from_menu, args=args)

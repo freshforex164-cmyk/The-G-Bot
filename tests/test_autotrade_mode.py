@@ -48,6 +48,7 @@ class ModeMenuTests(unittest.IsolatedAsyncioTestCase):
         self.store = SubscriberStore(database_url="", file_path=Path(self.tmp.name) / "s.json")
         self.client = MenuClient()
         self.service = FakeService()
+        self.service.sessions = {"demo": {"status": "active"}, "real": {"status": "missing"}}
         self.handler = TelegramCommandHandler(self.client, self.store, admin_id=None, scanner=StoringScanner(self.store),
                                               autotrade=self.service)
 
@@ -72,9 +73,13 @@ class ModeMenuTests(unittest.IsolatedAsyncioTestCase):
         menu = await self.pick_asset(GROUP)
         self.assertNotIn("🤖 Start Auto-Trade", buttons(menu["markup"]))
 
+    async def start_auto(self) -> None:
+        await self.handler.handle_update(tap("mode:autotrade"))
+        await self.handler.handle_update(tap("at:go"))
+
     async def test_start_auto_trade_switches_mode_and_joins_the_auto_trader_list(self):
         await self.pick_asset()
-        await self.handler.handle_update(tap("mode:autotrade"))
+        await self.start_auto()
         menu = self.client.menus(USER)[-1]
         self.assertIn(("start", USER), self.service.calls)
         self.assertTrue(self.handler.roster.is_active(USER))
@@ -86,7 +91,7 @@ class ModeMenuTests(unittest.IsolatedAsyncioTestCase):
     async def test_auto_trade_turns_follow_mode_on_first(self):
         self.service.settings_data["follow_signals"] = False
         await self.pick_asset()
-        await self.handler.handle_update(tap("mode:autotrade"))
+        await self.start_auto()
         self.assertIn(("update_settings", USER, {"follow_signals": True}), self.service.calls)
 
     async def test_without_a_connected_account_the_login_button_is_shown(self):
@@ -95,12 +100,13 @@ class ModeMenuTests(unittest.IsolatedAsyncioTestCase):
         await self.handler.handle_update(tap("mode:autotrade"))
         menu = self.client.menus(USER)[-1]
         self.assertIn("Log in to Pocket Option", buttons(menu["markup"]))
-        self.assertIn("Connect your Pocket Option account first", menu["text"])
+        self.assertIn("Account not connected", menu["text"])
+        self.assertNotIn(("start", USER), self.service.calls)
         self.assertFalse(self.handler.roster.is_active(USER))
 
     async def test_receive_signals_leaves_auto_trade(self):
         await self.pick_asset()
-        await self.handler.handle_update(tap("mode:autotrade"))
+        await self.start_auto()
         await self.handler.handle_update(tap("mode:signals"))
         await self.handler.wait_idle()
         self.assertFalse(self.handler.roster.is_active(USER))
@@ -112,6 +118,7 @@ class ModeMenuTests(unittest.IsolatedAsyncioTestCase):
     async def test_mode_buttons_need_the_users_own_tap(self):
         await self.pick_asset()
         await self.handler.handle_update(tap("mode:autotrade", sender_id=None))
+        await self.handler.handle_update(tap("at:go", sender_id=None))
         self.assertNotIn(("start", USER), self.service.calls)
 
     async def test_balance_button_sends_a_fresh_balance(self):

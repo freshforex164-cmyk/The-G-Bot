@@ -1,3 +1,40 @@
+# G-Bot status — asset-first menu, Auto-Trade setup screen & trade amounts (2026-11-21)
+
+## Fixed / implemented in this revision
+- **Main menu**: `/start` shows only **Choose Asset**, **Account Info**, **Support/Help**. The old top-level
+  Auto Trading menu (and its `menu:autotrade` screen) is gone; `/autotrade` now answers with the service
+  overview. Auto-trading always starts from an asset: Choose Asset → category → asset →
+  **📡 Receive Signals** / **🤖 Start Auto-Trade**.
+- **🤖 Start Auto-Trade = setup screen, no blind start**: reads the vault (`GET /auth/status`, no browser) for
+  the session of the current mode. Not connected → "⚠️ Account not connected" with Log in / 🔑 Direct SSID
+  Login and Demo/Real switch. Connected → no login prompt; shows account (🧪 DEMO / 💵 REAL), last known
+  balance, trade amount, **🚀 Start Auto-Trade · $X**, Demo/Real switch and the amount picker.
+- **Trade amount picker**: $1.00 · $1.50 · $2.00 · $2.50 · $5.00 RISK · $10.00 RISK · $25.00 · $50.00 ·
+  $100.00, plus 🛑 Stop (back to signals, stops auto-trade) and 🏠 Main Menu. Saved amount is ticked. Only
+  listed amounts are accepted. An amount above the daily stop-loss raises the stop-loss to that amount (the
+  user is told). Service caps still apply: Demo ≤ `AUTOTRADE_MAX_STAKE` (100), Real ≤
+  `AUTOTRADE_LIVE_MAX_STAKE` (default 10) — higher Real amounts are refused with the service's message.
+- **Balance check before start**: 🚀 Start reads a fresh balance; below the trade amount → not started, user
+  asked to lower the amount or top up. The per-trade balance check in the worker is unchanged.
+- **/at_ssid**: without a value it shows **🧪 Demo Account / 💵 Real Account**; each shows step-by-step
+  instructions for that account (`isDemo` 1/0). The SSID can be sent with `/at_ssid` or pasted alone (a
+  private message starting `42["auth"`); it is deleted at once. Reply: "✅ Connected to your Pocket Option
+  Real/Demo account" when the WebSocket check passed, otherwise "saved, checked again before the first
+  trade". Choosing Real but pasting a Demo SSID (or the reverse) is flagged.
+- **Setup on every auto-trade message**: opened, result, skipped, low-balance and failed alerts all carry
+  `Setup: <name>` (engine codes such as `uptrend_pullback` shown as card names; "Price Action" fallback).
+  Signal cards already showed Setup (unchanged).
+- Unchanged and re-checked: saved-session reuse before any Chromium launch (`/auth/handshake`, `/at_login`),
+  low-memory Chromium flags (`--js-flags=--max-old-space-size=128`, `--no-sandbox`,
+  `--disable-dev-shm-usage`, single-process, asset blocking, browser closed right after capture).
+
+## Verified in this revision
+- GBot suite: 170 passed (12 new in `tests/test_ui_refinement.py`).
+- Autotrade suite: 133 passed, 4 skipped; `test_secure_login` browser test needs Playwright installed
+  (not available in the check environment; unchanged code).
+
+---
+
 # G-Bot status — saved-session reuse, Direct SSID login, Real + Demo auto-trade (2026-11-21)
 
 ## Fixed / implemented in this revision

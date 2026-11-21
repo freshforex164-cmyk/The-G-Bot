@@ -18,8 +18,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import config
 from autotrade_commands import ALL_COMMANDS as AUTOTRADE_COMMAND_NAMES
-from autotrade_client import AutotradeRoster
-from autotrade_commands import AutotradeCommands
+from autotrade_client import AutotradeError, AutotradeRoster
+from autotrade_commands import AutotradeCommands, error_text
 from market_assets import CATALOG, CATALOG_BY_ID, CATEGORIES
 from notifications import TelegramNotifier, TelegramSendError, format_signal_message
 from strategy.model import Signal
@@ -446,6 +446,9 @@ class TelegramCommandHandler:
             except (TypeError, ValueError):
                 pass
         text = message.get("text")
+        if (chat_id is not None and isinstance(text, str) and text.lstrip().startswith('42["auth"')
+                and sender_id is not None and int(chat_id) == sender_id):
+            text = "/at_ssid " + text.strip()     # a pasted SSID frame without the command: same as /at_ssid
         if chat_id is None or not isinstance(text, str) or not text.startswith("/"):
             return
         parts = text.split(maxsplit=1)
@@ -872,10 +875,11 @@ class TelegramCommandHandler:
 
     async def _handle_mode_button(self, chat_id: int, sender_id: int | None, data: str) -> None:
         private = sender_id is not None and int(sender_id) == int(chat_id)
-        if data.startswith("at:"):
+        if data.startswith("at:") and not data.startswith(("at:stake:", "at:go")):
             command, args = {"at:balance": ("at_balance", ""), "at:stats": ("at_stats", ""),
                              "at:demo": ("at_demo", ""), "at:live": ("at_live", ""),
                              "at:liveconfirm": ("at_live", "confirm"), "at:ssid": ("at_ssid", ""),
+                             "at:ssid:demo": ("at_ssid", "demo"), "at:ssid:real": ("at_ssid", "real"),
                              "at:login": ("at_login", "")}.get(data, ("", ""))
             if command and private:
                 await self._autotrade_safe(command, chat_id, int(sender_id), args, False)
@@ -892,25 +896,95 @@ class TelegramCommandHandler:
             notice = "Auto-Trade is stopping; open trades finish first.\n\n" if was_auto else ""
             await self._render_mode_menu(chat_id, name, notice)
             return
+        if not self._autotrade_allowed(chat_id) or not private:
+            await self._render_mode_menu(
+                chat_id, name, "Auto-Trade only works in a private chat with the bot.\n\n"
+                if self.autotrade_enabled else "Auto-Trade isn't set up on this bot yet.\n\n")
+            return
         if data == "mode:autotrade":
-            if not self._autotrade_allowed(chat_id) or not private:
-                await self._render_mode_menu(
-                    chat_id, name, "Auto-Trade only works in a private chat with the bot.\n\n"
-                    if self.autotrade_enabled else "Auto-Trade isn't set up on this bot yet.\n\n")
-                return
             if self._is_auto(chat_id):
                 await self._render_mode_menu(chat_id, name)
                 return
-            await self._render_menu(chat_id, f"Starting 🤖 Auto-Trade for {name}…",
-                                    {"inline_keyboard": [[{"text": "Back", "callback_data": "assetback"}]]})
-            started, detail, markup = await self.autotrade.enable_follow(int(chat_id))
-            if started:
-                await asyncio.to_thread(self.subscribers.set_subscribed, chat_id, True)
-                await self._render_mode_menu(chat_id, name, account=detail)
+            await self._render_autotrade_setup(chat_id, name)
+            return
+        if data.startswith("at:stake:"):
+            try:
+                value = float(data.removeprefix("at:stake:"))
+                _, note = await self.autotrade.set_stake(int(chat_id), value)
+            except (ValueError, AutotradeError) as exc:
+                text = error_text(exc) if isinstance(exc, AutotradeError) else "That amount isn't available."
+                await self._render_autotrade_setup(chat_id, name, f"{html.escape(text, quote=False)}\n\n")
                 return
-            rows = list((markup or {}).get("inline_keyboard", [])) + self._mode_keyboard(chat_id)["inline_keyboard"]
-            await self._render_menu(chat_id, f"{html.escape(detail, quote=False)}\n\nAsset: {name}",
-                                    {"inline_keyboard": rows})
+            await self._render_autotrade_setup(chat_id, name, f"✅ Trade amount set to ${value:.2f}.\n"
+                                               + (f"{html.escape(note, quote=False)}\n" if note else "") + "\n")
+            return
+        if data == "at:go":
+            await self._start_autotrade(chat_id, name)
+
+    async def _render_autotrade_setup(self, chat_id: int, name: str, notice: str = "") -> None:
+        """🤖 Start Auto-Trade: reuse the saved session (no login prompt when connected), else ask to log in."""
+        try:
+            state = await self.autotrade.setup_state(int(chat_id))
+        except AutotradeError as exc:
+            await self._render_mode_menu(chat_id, name, f"{html.escape(error_text(exc), quote=False)}\n\n")
+            return
+        account = "💵 REAL" if state["kind"] == "real" else "🧪 DEMO"
+        switch_row = [{"text": "🧪 Demo" + (" ✅" if state["kind"] == "demo" else ""), "callback_data": "at:demo"},
+                      {"text": "💵 Real" + (" ✅" if state["kind"] == "real" else ""), "callback_data": "at:live"}]
+        if not state["connected"]:
+            which = "Real" if state["kind"] == "real" else "Demo"
+            rows = list(self.autotrade.login_markup(int(chat_id))["inline_keyboard"])
+            rows += [switch_row, [{"text": "Back", "callback_data": "assetback"}]]
+            await self._render_menu(
+                chat_id,
+                f"{notice}⚠️ <b>Account not connected</b>\nConnect your Pocket Option {which} account first: "
+                f"tap a button below, then tap 🤖 Start Auto-Trade again.\n\nAsset: {name} · Account: {account}",
+                {"inline_keyboard": rows})
+            return
+        settings = state["settings"]
+        try:
+            stake = float(settings.get("stake", 1.0))
+        except (TypeError, ValueError):
+            stake = 1.0
+        balance = state["balance"]
+        balance_line = f"Balance: ${balance:,.2f}" if balance is not None else "Balance: checked before you start"
+        text = (f"{notice}🤖 <b>Auto-Trade setup</b> · {name}\n"
+                f"Account: <b>{account}</b> (connected ✅)\n{balance_line}\n"
+                f"Trade amount: <b>${stake:.2f}</b>\n\nPick a trade amount, then start:")
+        rows = [[{"text": f"🚀 Start Auto-Trade · ${stake:.2f}", "callback_data": "at:go"}], switch_row]
+        rows += self.autotrade.stake_rows(stake)
+        await self._render_menu(chat_id, text, {"inline_keyboard": rows})
+
+    async def _start_autotrade(self, chat_id: int, name: str) -> None:
+        if self._is_auto(chat_id):
+            await self._render_mode_menu(chat_id, name)
+            return
+        await self._render_menu(chat_id, f"Checking your balance and starting 🤖 Auto-Trade for {name}…",
+                                {"inline_keyboard": [[{"text": "Back", "callback_data": "assetback"}]]})
+        try:   # never start on an account that cannot cover the stake
+            state = await self.autotrade.setup_state(int(chat_id))
+            stake = float(state["settings"].get("stake", 1.0))
+            fresh = await self.autotrade.fresh_balance(int(chat_id))
+        except AutotradeError as exc:
+            await self._render_autotrade_setup(chat_id, name, f"{html.escape(error_text(exc), quote=False)}\n\n")
+            return
+        if not state["connected"]:
+            await self._render_autotrade_setup(chat_id, name)
+            return
+        balance = fresh.get("balance")
+        if isinstance(balance, (int, float)) and float(balance) < stake:
+            await self._render_autotrade_setup(
+                chat_id, name, f"⚠️ Your balance ${float(balance):,.2f} is below the ${stake:.2f} trade amount. "
+                "Pick a lower amount or top up your account.\n\n")
+            return
+        started, detail, markup = await self.autotrade.enable_follow(int(chat_id))
+        if started:
+            await asyncio.to_thread(self.subscribers.set_subscribed, chat_id, True)
+            await self._render_mode_menu(chat_id, name, account=detail)
+            return
+        rows = list((markup or {}).get("inline_keyboard", [])) + self._mode_keyboard(chat_id)["inline_keyboard"]
+        await self._render_menu(chat_id, f"{html.escape(detail, quote=False)}\n\nAsset: {name}",
+                                {"inline_keyboard": rows})
 
     async def _pricecheck_reply(self, chat_id: int) -> None:
         subscriber = self.subscribers.subscribers.get(chat_id)

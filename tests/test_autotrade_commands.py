@@ -218,7 +218,7 @@ class AutotradeCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.handler.handle_update(update)
         self.assertIn(("submit_ssid", USER, ssid), self.service.calls)
         self.assertEqual(self.chat.deleted, [(USER, 77)])
-        self.assertIn("Real session saved", self.chat.last())
+        self.assertIn("Connected to your Pocket Option Real account", self.chat.last())
 
     async def test_ssid_without_value_shows_help(self):
         await self.send("/at_ssid")

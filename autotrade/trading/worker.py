@@ -315,7 +315,8 @@ class UserWorker:
 
     def _alert_skip(self, d: Decision, reason: str) -> None:
         if d.signal_id:          # only GBot signals: the user would otherwise hear nothing about them
-            self._alert(skipped_text(asset=self._asset_name(d), direction=d.direction, reason=reason))
+            self._alert(skipped_text(asset=self._asset_name(d), direction=d.direction, reason=reason,
+                                     setup=d.reason or ""))
 
     async def _drain(self, broker: BrokerClient) -> None:
         """Let open trades settle so their results are logged before the connection closes."""
@@ -368,7 +369,7 @@ class UserWorker:
                 self._alert_skip(d, reason)
             else:
                 self._alert(low_balance_text(mode=s.mode, asset=self._asset_name(d), direction=d.direction,
-                                             stake=s.stake, balance=balance))
+                                             stake=s.stake, balance=balance, setup=d.reason or ""))
             return
         self.last_reject = None
         self._last_trade_at = now          # cooldown starts before the order, so a failure cannot cause rapid retries
@@ -382,7 +383,7 @@ class UserWorker:
             trade_id = await broker.place(d.asset, d.direction, s.stake, d.expiry_seconds)
         except BrokerError as exc:
             await self._repo.update_trade(self.user_id, ref, status="failed", error=str(exc)[:200])
-            self._alert(failed_text(asset=name, direction=d.direction))
+            self._alert(failed_text(asset=name, direction=d.direction, setup=d.reason or ""))
             return
         except (Disconnected, RateLimited) as exc:
             # The broker may have accepted the order: never retry, flag for review.
@@ -396,7 +397,7 @@ class UserWorker:
         self._alert(opened_text(mode=s.mode, asset=name, direction=d.direction, setup=setup, stake=s.stake,
                                 payout=payout, expiry_seconds=d.expiry_seconds))
         self._spawn_tracker(broker, ref, trade_id, s.stake, payout, d.expiry_seconds + 45,
-                            info={"mode": s.mode, "asset": name, "direction": d.direction})
+                            info={"mode": s.mode, "asset": name, "direction": d.direction, "setup": setup})
 
     # -- results ------------------------------------------------------------------------------
     def _spawn_tracker(self, broker: BrokerClient, ref: str, trade_id: str, stake: float,
@@ -416,7 +417,8 @@ class UserWorker:
                 balance = await self._refresh_balance(broker)
                 if info:
                     self._alert(settled_text(mode=info["mode"], asset=info["asset"], direction=info["direction"],
-                                             stake=stake, outcome=out.result, profit=profit, balance=balance))
+                                             stake=stake, outcome=out.result, profit=profit, balance=balance,
+                                             setup=info.get("setup", "")))
         except asyncio.CancelledError:
             raise  # left 'open'; the next session adopts it
         except Exception as exc:
@@ -433,4 +435,4 @@ class UserWorker:
                 continue
             self._spawn_tracker(broker, t.client_ref, t.broker_trade_id, t.stake, t.payout, 90,
                                 info={"mode": t.mode, "asset": str(t.meta.get("asset_name") or t.asset),
-                                      "direction": t.direction})
+                                      "direction": t.direction, "setup": t.reason or ""})

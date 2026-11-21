@@ -44,42 +44,55 @@ def _account(mode: str) -> str:
     return "Real" if mode == "live" else "Demo"
 
 
+def setup_name(setup: str | None) -> str:
+    """Card name of the market setup, e.g. "uptrend_pullback" -> "Uptrend Pullback"."""
+    text = str(setup or "").strip()
+    if not text or text == "gbot_signal":
+        return "Price Action"
+    if "_" in text or text.islower():
+        text = " ".join(word.capitalize() for word in text.replace("_", " ").split())
+    return text[:48] or "Price Action"
+
+
 def opened_text(*, mode: str, asset: str, direction: str, setup: str, stake: float, payout: int | None,
                 expiry_seconds: int) -> str:
     minutes = max(1, expiry_seconds // 60)
-    lines = [f"🤖 Auto-Trade opened · {_account(mode).upper()}", direction_line(direction)]
-    if setup:
-        lines.append(f"Setup: {setup}")
+    lines = [f"🤖 Auto-Trade opened · {_account(mode).upper()}", direction_line(direction),
+             f"Setup: {setup_name(setup)}"]
     lines += [f"Asset: {asset}", f"Expiration: {minutes} minute{'s' if minutes != 1 else ''}",
               f"Stake: {_money(stake)}", f"Payout: {payout}%" if payout is not None else "Payout: unavailable"]
     return "\n".join(lines)
 
 
 def settled_text(*, mode: str, asset: str, direction: str, stake: float, outcome: str, profit: float | None,
-                 balance: float | None) -> str:
+                 balance: float | None, setup: str = "") -> str:
     head = {"win": f"✅ WIN · +{_money(profit)}", "loss": f"❌ LOSS · -{_money(abs(profit or 0))}",
             "draw": "➖ BREAK EVEN · 0.00"}.get(outcome, "❔ Result unavailable")
     lines = [f"{head} · {_account(mode).upper()}",
-             f"{asset} · {direction_line(direction)[2:]} · stake {_money(stake)}"]
+             f"{asset} · {direction_line(direction)[2:]} · stake {_money(stake)}",
+             f"Setup: {setup_name(setup)}"]
     if balance is not None:
         lines.append(f"Balance ({_account(mode)}): {balance:,.2f}")
     return "\n".join(lines)
 
 
-def skipped_text(*, asset: str, direction: str, reason: str) -> str:
+def skipped_text(*, asset: str, direction: str, reason: str, setup: str = "") -> str:
     why = SKIP_REASONS.get(reason, reason.replace("_", " "))
-    return f"⏭ Auto-Trade skipped a signal: {asset} {direction_line(direction)[2:]}\nReason: {why}."
+    return (f"⏭ Auto-Trade skipped a signal: {asset} {direction_line(direction)[2:]}\n"
+            f"Setup: {setup_name(setup)}\nReason: {why}.")
 
 
-def low_balance_text(*, mode: str, asset: str, direction: str, stake: float, balance: float) -> str:
+def low_balance_text(*, mode: str, asset: str, direction: str, stake: float, balance: float,
+                     setup: str = "") -> str:
     account = "Real" if mode == "live" else "Demo"
     return (f"⚠️ Low balance: Auto-Trade skipped {asset} {direction_line(direction)[2:]}.\n"
+            f"Setup: {setup_name(setup)}\n"
             f"Your {account} balance is {_money(balance)}, below the {_money(stake)} stake. "
             "Top up your account or lower the stake with /at_set stake <amount>.")
 
 
-def failed_text(*, asset: str, direction: str) -> str:
-    return (f"⚠️ Auto-Trade could not place {asset} {direction_line(direction)[2:]}. "
+def failed_text(*, asset: str, direction: str, setup: str = "") -> str:
+    return (f"⚠️ Auto-Trade could not place {asset} {direction_line(direction)[2:]} ({setup_name(setup)}). "
             "Pocket Option did not accept the order; nothing was traded.")
 
 
