@@ -19,6 +19,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from ..errors import ReauthRequired, SettingsError
+from .ratelimit import RateLimiter, parse_rate, wait_text
 from ..runtime import Runtime
 from ..trading.manager import CapacityError, LiveDisabled, ServiceUnavailable, TradingHalted
 from ..trading.models import Decision
@@ -31,11 +32,15 @@ class Principal:
     user_id: str
     is_admin: bool = False
     # "full" = normal API token. "login" = short-lived link token (e.g. sent by the Telegram bot)
-    # that may only drive /auth/handshake*; every other route rejects it.
+    # that may only drive /auth/handshake*. "signal" = GBot's signal hand-off token: only
+    # POST /trading/signal. "service" = GBot itself (sub "service:gbot"): only GET /trading/active.
+    # Every route rejects the scopes it was not made for.
     scope: str = "full"
 
 
-SCOPES = ("full", "login")
+SCOPES = ("full", "login", "signal", "service")
+SERVICE_SUBJECT = "service:gbot"
+TOO_MANY_LOGINS = "Another sign-in is in progress on the server. Try again in a minute."
 SUBMIT_FAILED = "The sign-in could not be submitted. Use the Pocket Option page to continue."
 SAFE_SUBMIT_MESSAGES = frozenset({
     "The broker login page is not ready.",
@@ -80,7 +85,6 @@ class SettingsPatch(BaseModel):
     strategy: str | None = Field(None, max_length=32)
     symbol_real: str | None = Field(None, max_length=32)
     symbol_otc: str | None = Field(None, max_length=32)
-    gap_threshold: float | None = None
     stake: float | None = None
     expiry_seconds: int | None = None
     max_concurrent: int | None = None
@@ -100,6 +104,7 @@ class SignalIn(BaseModel):
     direction: Literal["BUY", "SELL", "CALL", "PUT"]
     expiry_seconds: Literal[60] = 60
     setup: str = Field("", max_length=48)
+    asset_name: str = Field("", max_length=48)       # display name for trade alerts, e.g. "EUR/USD OTC"
     valid_until: datetime | None = None
 
 
@@ -168,8 +173,32 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
 
     def full(p: Principal = Depends(auth)) -> Principal:
         if getattr(p, "scope", "full") != "full":
-            raise HTTPException(403, "this token can only be used to log in")
+            raise HTTPException(403, "this token cannot be used here")
         return p
+
+    def login(p: Principal = Depends(auth)) -> Principal:
+        if getattr(p, "scope", "full") not in ("full", "login"):
+            raise HTTPException(403, "this token cannot be used here")
+        return p
+
+    def signal_token(p: Principal = Depends(auth)) -> Principal:
+        if getattr(p, "scope", "full") != "signal":
+            raise HTTPException(403, "signal hand-offs need a signal token")
+        return p
+
+    def service_token(p: Principal = Depends(auth)) -> Principal:
+        if getattr(p, "scope", "full") != "service" or p.user_id != SERVICE_SUBJECT:
+            raise HTTPException(403, "service token required")
+        return p
+
+    handshake_limit = RateLimiter(*parse_rate(rt.cfg.handshake_rate, (6, 600)))
+    credentials_limit = RateLimiter(*parse_rate(rt.cfg.credentials_rate, (5, 900)))
+
+    def limited(limiter: RateLimiter, user_id: str) -> None:
+        wait = limiter.hit(user_id)
+        if wait:
+            raise HTTPException(429, {"error": "rate_limited", "message": wait_text(wait),
+                                      "retry_after": int(wait)}, headers={"Retry-After": str(int(wait))})
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -262,13 +291,24 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
         return await rt.manager.stats(p.user_id)
 
     @app.post("/trading/signal")
-    async def signal(body: SignalIn, p: Principal = Depends(full)):
-        """GBot pushes each signal a user receives; their running bot places it (risk rules apply)."""
+    async def signal(body: SignalIn, p: Principal = Depends(signal_token)):
+        """GBot hands each signal for an auto-trading user to their running bot (risk rules apply)."""
         direction = "CALL" if body.direction in ("BUY", "CALL") else "PUT"
+        meta = {"asset_name": body.asset_name} if body.asset_name else {}
         decision = Decision(asset=body.asset, direction=direction, expiry_seconds=60,
                             reason=body.setup or "gbot_signal", signal_id=body.signal_id,
-                            valid_until=body.valid_until)
+                            valid_until=body.valid_until, meta=meta)
         return await rt.manager.submit_signal(p.user_id, decision)
+
+    @app.get("/trading/active")
+    async def active(p: Principal = Depends(service_token)):
+        """Who is auto-trading right now (running bots that place GBot signals)."""
+        return {"users": rt.manager.active_users()}
+
+    @app.get("/trading/balance")
+    async def balance(fresh: bool = True, p: Principal = Depends(full)):
+        """Account balance for the selected mode; works while the bot is stopped (last value is saved)."""
+        return await rt.manager.balance(p.user_id, fresh=fresh)
 
     # ---- session handshake ---------------------------------------------------------------
     @app.get("/auth/status")
@@ -276,12 +316,17 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
         return await rt.vault.status(p.user_id)
 
     @app.post("/auth/handshake", status_code=201)
-    async def handshake_start(body: HandshakeStart | None = None, p: Principal = Depends(auth)):
+    async def handshake_start(body: HandshakeStart | None = None, p: Principal = Depends(login)):
+        limited(handshake_limit, p.user_id)
         vp = (body.width, body.height) if body and body.width and body.height else None
         try:
             s = await rt.handshakes.start(p.user_id, vp)
-        except RuntimeError as exc:
-            raise HTTPException(503, str(exc)) from None
+        except RuntimeError:
+            raise HTTPException(503, {"error": "busy", "message": TOO_MANY_LOGINS}) from None
+        except Exception as exc:     # never a blank 500 page
+            log.warning("could not start the sign-in browser: %s", type(exc).__name__)
+            raise HTTPException(503, {"error": "browser_unavailable",
+                                      "message": "The secure sign-in browser could not start. Try again in a minute."}) from None
         return {"session_id": s.id, "state": s.state}
 
     def _get(session_id: str, p: Principal):
@@ -291,44 +336,49 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
             raise HTTPException(404, "unknown login session") from None
 
     @app.get("/auth/handshake/{session_id}")
-    async def handshake_status(session_id: str, p: Principal = Depends(auth)):
+    async def handshake_status(session_id: str, p: Principal = Depends(login)):
         s = _get(session_id, p)
         return {"session_id": s.id, "state": s.state, "error": s.error, "message": s.message, "kinds": s.kinds}
 
     @app.get("/auth/handshake/{session_id}/screen")
-    async def handshake_screen(session_id: str, p: Principal = Depends(auth)):
+    async def handshake_screen(session_id: str, p: Principal = Depends(login)):
         _get(session_id, p)
         try:
             return Response(await rt.handshakes.screenshot(session_id, p.user_id), media_type="image/jpeg")
-        except RuntimeError as exc:
-            raise HTTPException(409, str(exc)) from None
+        except Exception:       # not active, navigating or the browser just closed
+            raise HTTPException(409, "login session is not active") from None
 
     @app.get("/auth/handshake/{session_id}/view")
-    async def handshake_view(session_id: str, p: Principal = Depends(auth)):
+    async def handshake_view(session_id: str, p: Principal = Depends(login)):
         """Phone viewport size + the focused input's position/type, so the page can place a native
         input over it. Password values are never returned."""
         _get(session_id, p)
         try:
             return await rt.handshakes.view(session_id, p.user_id)
-        except RuntimeError as exc:
-            raise HTTPException(409, str(exc)) from None
+        except Exception:
+            raise HTTPException(409, "login session is not active") from None
 
     @app.post("/auth/handshake/{session_id}/input", status_code=204)
-    async def handshake_input(session_id: str, ev: InputEvent, p: Principal = Depends(auth)):
+    async def handshake_input(session_id: str, ev: InputEvent, p: Principal = Depends(login)):
         _get(session_id, p)
         if (ev.type == "click" and (ev.x is None or ev.y is None)) or (ev.type == "text" and not ev.text) \
                 or (ev.type == "key" and not ev.key) or (ev.type == "value" and ev.value is None):
             raise HTTPException(422, "missing fields for this input type")
         try:
             await rt.handshakes.interact(session_id, p.user_id, ev.model_dump(exclude_none=True))
-        except RuntimeError as exc:
-            raise HTTPException(409, str(exc)) from None
+        except Exception:
+            raise HTTPException(409, "login session is not active") from None
         return Response(status_code=204)
 
     @app.post("/auth/handshake/{session_id}/credentials", status_code=204)
     async def handshake_credentials(session_id: str, body: BrokerCredentials, request: Request,
-                                    p: Principal = Depends(auth)):
+                                    p: Principal = Depends(login)):
         _get(session_id, p)
+        try:
+            limited(credentials_limit, p.user_id)
+        except HTTPException:
+            body.password = SecretStr("")
+            raise
         # TLS is mandatory outside local tests. Behind Render's proxy TLS ends at the proxy, so the
         # forwarded protocol is trusted (AUTOTRADE_TRUST_PROXY, default on).
         if not is_secure_request(request, rt.cfg.trust_proxy):
@@ -348,7 +398,7 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
         return Response(status_code=204)
 
     @app.delete("/auth/handshake/{session_id}", status_code=204)
-    async def handshake_cancel(session_id: str, p: Principal = Depends(auth)):
+    async def handshake_cancel(session_id: str, p: Principal = Depends(login)):
         _get(session_id, p)
         await rt.handshakes.cancel(session_id, p.user_id)
         return Response(status_code=204)

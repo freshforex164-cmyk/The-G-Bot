@@ -9,6 +9,7 @@ from .auth.health import SessionHealth
 from .clock import Clock
 from .config import Config
 from .market.feed import SharedMarketFeed
+from .notify import NullNotifier, TelegramNotifier
 from .storage.repo import InMemoryRepository, Repository
 from .trading.broker import BrokerClient, PocketOptionBroker
 from .trading.manager import TradingManager
@@ -25,12 +26,13 @@ class Runtime:
     feed: SharedMarketFeed
     manager: TradingManager
     handshakes: HandshakeManager
+    notifier: Any = None
 
 
 def build_runtime(cfg: Config, *, repo: Repository | None = None, keyring: KeyRing | None = None,
                   broker_factory: Callable[[str], BrokerClient] = PocketOptionBroker,
                   backend_factory: Callable[[], CaptureBackend] | None = None,
-                  clock: Clock | None = None, reconnect_base: float = 2.0) -> Runtime:
+                  clock: Clock | None = None, reconnect_base: float = 2.0, notifier: Any = None) -> Runtime:
     clock = clock or Clock()
     repo = repo or InMemoryRepository()
     vault = TokenVault(repo, keyring or KeyRing.from_env(), clock)
@@ -41,8 +43,11 @@ def build_runtime(cfg: Config, *, repo: Repository | None = None, keyring: KeyRi
         return broker_factory(ssid) if ssid else None
 
     feed = SharedMarketFeed(feed_broker, clock)
+    if notifier is None:
+        notifier = TelegramNotifier(cfg.telegram_bot_token) if cfg.telegram_bot_token else NullNotifier()
     manager = TradingManager(cfg=cfg, repo=repo, vault=vault, health=health, feed=feed,
-                             broker_factory=broker_factory, clock=clock, reconnect_base=reconnect_base)
+                             broker_factory=broker_factory, clock=clock, reconnect_base=reconnect_base,
+                             notifier=notifier)
 
     async def sink(user_id: str, tokens: dict[str, str], meta: dict[str, Any]) -> None:
         derived = set(meta.get("derived", []))
@@ -55,5 +60,9 @@ def build_runtime(cfg: Config, *, repo: Repository | None = None, keyring: KeyRi
         await manager.reset_to_demo(user_id, "new login")
         await repo.audit(user_id, "tokens_captured", {"kinds": sorted(tokens), "method": meta.get("method")})
 
-    handshakes = HandshakeManager(cfg, backend_factory or (lambda: PlaywrightBackend(cfg.headless)), sink, clock)
-    return Runtime(cfg, repo, vault, health, feed, manager, handshakes)
+    def default_backend() -> PlaywrightBackend:
+        return PlaywrightBackend(cfg.headless, low_memory=cfg.low_memory, block_assets=cfg.block_login_assets,
+                                 block_third_party=cfg.block_third_party)
+
+    handshakes = HandshakeManager(cfg, backend_factory or default_backend, sink, clock)
+    return Runtime(cfg, repo, vault, health, feed, manager, handshakes, notifier)

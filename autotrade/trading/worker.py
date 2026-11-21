@@ -13,7 +13,8 @@ from typing import Callable
 from ..clock import Clock, utc_day_start
 from ..errors import (BrokerError, Disconnected, ModeMismatch, RateLimited, SessionExpired, VaultError)
 from ..market.feed import SharedMarketFeed
-from ..storage.repo import BotState, Repository
+from ..notify import NullNotifier, Notifier, failed_text, opened_text, settled_text, skipped_text
+from ..storage.repo import BalanceRow, BotState, Repository
 from ..vault.service import TokenVault
 from .broker import BrokerClient, TradeOutcome, map_exception
 from .models import DEMO, Decision, TradeRecord, TradingSettings
@@ -56,13 +57,15 @@ class UserWorker:
                  broker_factory: Callable[[str], BrokerClient], risk: RiskManager, clock: Clock,
                  is_halted: Callable[[], bool] = lambda: False,
                  strategies: dict[str, Callable[[], Strategy]] | None = None,
-                 reconnect_base: float = 2.0):
+                 reconnect_base: float = 2.0, notifier: Notifier | None = None):
         self.user_id = user_id
         self._repo, self._vault, self._feed = repo, vault, feed
         self._factory, self._risk, self._clock = broker_factory, risk, clock
         self._is_halted = is_halted
         self._strategies = strategies or STRATEGIES
         self._reconnect_base = reconnect_base
+        self._notifier = notifier or NullNotifier()
+        self._broker: BrokerClient | None = None
         self.settings = TradingSettings()
         self.status = WorkerStatus.STARTING
         self.last_error: str | None = None
@@ -100,6 +103,19 @@ class UserWorker:
                 "signals_received": self.signals_received,
                 "balance": self.balance, "balance_account": self.balance_kind,
                 "balance_at": self.balance_at.isoformat() if self.balance_at else None}
+
+    @property
+    def follows_signals(self) -> bool:
+        """On GBot's "who is auto-trading" list: running (or about to) and placing GBot signals."""
+        return self.desired and self.settings.follow_signals and self.status in (
+            WorkerStatus.STARTING, WorkerStatus.RUNNING, WorkerStatus.PAUSED, WorkerStatus.RECONNECTING)
+
+    async def refresh_balance_now(self) -> float | None:
+        """Fresh balance from the live connection (None when not connected right now)."""
+        broker = self._broker
+        if broker is None:
+            return None
+        return await self._refresh_balance(broker)
 
     def submit_signal(self, d: Decision) -> str:
         """Queue a GBot signal for this user. Returns 'queued' or why it was ignored."""
@@ -215,6 +231,7 @@ class UserWorker:
     async def _session(self, broker: BrokerClient, strategy: Strategy, s0: TradingSettings) -> None:
         follow = s0.follow_signals
         symbols = () if follow else strategy.required_symbols(s0)
+        self._broker = broker
         await self._adopt_open_trades(broker, s0.mode)
         await self._refresh_balance(broker)
         if symbols:
@@ -246,6 +263,7 @@ class UserWorker:
                         d = self._pending.popleft()
                         if self._expired(d):
                             self._note("signal_expired")
+                            self._alert_skip(d, "signal_expired")
                             continue
                         await self._try_trade(broker, d, s, (), pushed=True)
                     continue
@@ -257,25 +275,47 @@ class UserWorker:
                 await self._drain(broker)
         finally:
             self._wake = None
+            self._broker = None
             if symbols:
                 self._feed.unregister(ev)
                 await self._feed.release(symbols)
 
-    async def _refresh_balance(self, broker: BrokerClient) -> None:
-        """Best effort: a balance read never stops trading."""
+    async def _refresh_balance(self, broker: BrokerClient) -> float | None:
+        """Best effort: a balance read never stops trading. Saved so it survives restarts."""
         fn = getattr(broker, "balance", None)
         if not callable(fn):
-            return
+            return None
         try:
             value = await asyncio.wait_for(fn(), timeout=5.0)
         except asyncio.CancelledError:
             raise
         except Exception:
-            return
-        if value is not None:
-            self.balance = round(float(value), 2)
-            self.balance_kind = "demo" if self._client_is_demo else "real"
-            self.balance_at = self._clock.utcnow()
+            return None
+        if value is None or float(value) < 0:      # the library reports -1 when unknown
+            return None
+        self.balance = round(float(value), 2)
+        self.balance_kind = "demo" if self._client_is_demo else "real"
+        self.balance_at = self._clock.utcnow()
+        try:
+            await self._repo.save_balance(BalanceRow(self.user_id, self.balance_kind, self.balance, self.balance_at))
+        except Exception:
+            log.warning("could not persist balance for user %s", self.user_id)
+        return self.balance
+
+    # -- alerts (best effort) -----------------------------------------------------------------
+    @staticmethod
+    def _asset_name(d: Decision) -> str:
+        return str(d.meta.get("asset_name") or d.asset)
+
+    def _alert(self, text: str) -> None:
+        try:
+            self._notifier.send(self.user_id, text)
+        except Exception:
+            log.info("trade alert failed for user %s", self.user_id)
+
+    def _alert_skip(self, d: Decision, reason: str) -> None:
+        if d.signal_id:          # only GBot signals: the user would otherwise hear nothing about them
+            self._alert(skipped_text(asset=self._asset_name(d), direction=d.direction, reason=reason))
 
     async def _drain(self, broker: BrokerClient) -> None:
         """Let open trades settle so their results are logged before the connection closes."""
@@ -303,6 +343,7 @@ class UserWorker:
         verdict = self._risk.check(s, d, state)
         if not verdict.ok:
             self._note(verdict.reason)
+            self._alert_skip(d, verdict.reason)
             self.status = WorkerStatus.PAUSED if verdict.halt else WorkerStatus.RUNNING
             return
         self.status = WorkerStatus.RUNNING
@@ -313,11 +354,13 @@ class UserWorker:
         pv = self._risk.check_payout(s, payout)
         if not pv.ok:
             self._note(pv.reason)
+            self._alert_skip(d, pv.reason)
             return
         self.last_reject = None
         self._last_trade_at = now          # cooldown starts before the order, so a failure cannot cause rapid retries
         ref = uuid.uuid4().hex
         meta = {**d.meta, **({"signal_id": d.signal_id, "source": "gbot_signal"} if d.signal_id else {})}
+        name = self._asset_name(d)
         rec = TradeRecord(self.user_id, ref, s.mode, d.asset, d.direction, s.stake, d.expiry_seconds,
                           payout=payout, reason=d.reason, meta=meta, opened_at=self._clock.utcnow())
         await self._repo.insert_trade(rec)
@@ -325,6 +368,7 @@ class UserWorker:
             trade_id = await broker.place(d.asset, d.direction, s.stake, d.expiry_seconds)
         except BrokerError as exc:
             await self._repo.update_trade(self.user_id, ref, status="failed", error=str(exc)[:200])
+            self._alert(failed_text(asset=name, direction=d.direction))
             return
         except (Disconnected, RateLimited) as exc:
             # The broker may have accepted the order: never retry, flag for review.
@@ -334,14 +378,19 @@ class UserWorker:
             await self._repo.update_trade(self.user_id, ref, status="failed", error="session rejected")
             raise
         await self._repo.update_trade(self.user_id, ref, status="open", broker_trade_id=trade_id)
-        self._spawn_tracker(broker, ref, trade_id, s.stake, payout, d.expiry_seconds + 45)
+        setup = d.reason if d.reason and d.reason != "gbot_signal" else ""
+        self._alert(opened_text(mode=s.mode, asset=name, direction=d.direction, setup=setup, stake=s.stake,
+                                payout=payout, expiry_seconds=d.expiry_seconds))
+        self._spawn_tracker(broker, ref, trade_id, s.stake, payout, d.expiry_seconds + 45,
+                            info={"mode": s.mode, "asset": name, "direction": d.direction})
 
     # -- results ------------------------------------------------------------------------------
     def _spawn_tracker(self, broker: BrokerClient, ref: str, trade_id: str, stake: float,
-                       payout: int | None, timeout: float) -> None:
-        self._trackers[ref] = asyncio.create_task(self._track(broker, ref, trade_id, stake, payout, timeout))
+                       payout: int | None, timeout: float, info: dict | None = None) -> None:
+        self._trackers[ref] = asyncio.create_task(
+            self._track(broker, ref, trade_id, stake, payout, timeout, info or {}))
 
-    async def _track(self, broker, ref, trade_id, stake, payout, timeout) -> None:
+    async def _track(self, broker, ref, trade_id, stake, payout, timeout, info) -> None:
         try:
             out = await broker.outcome(trade_id, timeout)
             profit = compute_profit(out, stake, payout)
@@ -350,7 +399,10 @@ class UserWorker:
             else:
                 await self._repo.update_trade(self.user_id, ref, status="settled", outcome=out.result,
                                               profit=profit, settled_at=self._clock.utcnow())
-                await self._refresh_balance(broker)
+                balance = await self._refresh_balance(broker)
+                if info:
+                    self._alert(settled_text(mode=info["mode"], asset=info["asset"], direction=info["direction"],
+                                             stake=stake, outcome=out.result, profit=profit, balance=balance))
         except asyncio.CancelledError:
             raise  # left 'open'; the next session adopts it
         except Exception as exc:
@@ -365,4 +417,6 @@ class UserWorker:
             if not t.broker_trade_id:   # crashed before the broker acknowledged it
                 await self._repo.update_trade(self.user_id, t.client_ref, status="unknown", error="no broker acknowledgement")
                 continue
-            self._spawn_tracker(broker, t.client_ref, t.broker_trade_id, t.stake, t.payout, 90)
+            self._spawn_tracker(broker, t.client_ref, t.broker_trade_id, t.stake, t.payout, 90,
+                                info={"mode": t.mode, "asset": str(t.meta.get("asset_name") or t.asset),
+                                      "direction": t.direction})

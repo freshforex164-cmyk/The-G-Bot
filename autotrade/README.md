@@ -55,12 +55,19 @@ repo root (GBot side, standard library only, no new GBot dependencies)
 | POST | /trading/stop | Stop; `{"drain":false}` skips waiting for open trades |
 | PATCH | /trading/settings | Change settings. Live needs `{"mode":"live","confirm_live":true}` |
 | GET | /trading/settings, /trading/stats | Settings; status, balance, today's wins/losses/break-even and P/L, win rate, recent trades, session status |
-| POST | /trading/signal | GBot hands over a signal the user just received; a running bot with `follow_signals` places it (risk rules apply, duplicates/expired ignored) |
+| POST | /trading/signal | GBot hands over a signal for an auto-trading user; a running bot with `follow_signals` places it (risk rules apply, duplicates/expired ignored). **Only `scope=signal` tokens** (30 s) |
+| GET | /trading/active | "Who is auto-trading": running bots that follow GBot signals. **Only GBot's `scope=service`, `sub=service:gbot` token** |
+| GET | /trading/balance?fresh=true | Balance of the selected account; from the running bot, or a short broker connection while stopped; falls back to the last saved value (table `autotrade_balances`) |
 | GET/POST/DELETE | /auth/status, /auth/handshake[...] | Login capture; `DELETE /auth/sessions` revokes tokens and stops the bot |
 | POST | /auth/handshake/{session_id}/credentials | Validated email/password submission, restricted to the login-session owner; HTTPS required outside localhost tests |
 | POST | /admin/halt, /admin/resume | Operator kill switch (JWT claim `role=admin`) |
 | GET | /healthz | Feed state |
 | GET | /login | Login page. Token in the URL fragment `#t=...`; a `scope=login` token works only on `/auth/handshake*` |
+
+Token scopes: `full` (user API), `login` (`/auth/handshake*` only), `signal` (`POST /trading/signal` only),
+`service` (`GET /trading/active` only). Per-user limits: `POST /auth/handshake` 6 per 10 min
+(`AUTOTRADE_HANDSHAKE_RATE`), `/credentials` 5 per 15 min (`AUTOTRADE_CREDENTIALS_RATE`) -> `429` with a
+readable "wait N minutes" message.
 
 ## Telegram commands (GBot)
 Private chat with the bot only. Each Telegram user is service user `tg:<telegram user id>`.
@@ -71,7 +78,13 @@ Private chat with the bot only. Each Telegram user is service user `tg:<telegram
 | /at_login | Sends a "Log in to Pocket Option" button (Telegram Mini App) with a 15-minute login-only link |
 | /at_start, /at_stop | Start; stop (waits for open trades to finish) |
 | /at_stats | Today + all-time results and the last 5 trades |
-| /at_set name value | `stake`, `expiry`, `max_trades`, `stop_loss`, `take_profit`, `cooldown`, `min_payout`, `gap`; no arguments shows current values |
+| /at_balance | Fresh balance reading (works while the bot is stopped; shows the last saved value if Pocket Option can't be reached) |
+| /at_set name value | `stake`, `expiry`, `max_trades`, `stop_loss`, `take_profit`, `cooldown`, `min_payout`, `follow`; no arguments shows current values |
+
+Menu: `/start` -> category -> asset -> **📡 Receive Signals** (cards only, no trades) or **🤖 Start Auto-Trade**
+(this user's signals are placed automatically; instead of cards the service sends *trade opened* and *trade
+closed* alerts with win/loss, profit and new balance, or why a signal was skipped). Plus 💰 Balance and 📊 Stats
+buttons. Auto-Trade is offered only in private chats.
 | /at_live confirm | Switch to Live (without `confirm` it only shows the warning) |
 | /at_demo | Back to Demo |
 | /at_logout | Stop the bot and delete the stored sessions |
@@ -81,6 +94,8 @@ Expired session -> the bot answers "send /at_login". Service down -> "can't be r
 are not affected, and slow calls run in the background so the signal menu never freezes.
 
 ## Risk controls (per user)
+Follow-mode defaults: stake 1, max 2 open trades, 5 s cooldown, min payout 80%, daily stop-loss 10,
+take-profit 20. Saved settings still holding the old defaults (1 open trade, 60 s) are upgraded on read.
 stake, expiry, max concurrent, daily stop-loss and take-profit (both mandatory, UTC day, realized P/L
 plus open-trade exposure), cooldown, minimum payout (read live before each order), max tick age.
 New users are **Demo**. Live needs: `AUTOTRADE_ALLOW_LIVE=true` on the service (default false), an active
@@ -99,7 +114,19 @@ Environment: `DATABASE_URL`, `AUTOTRADE_VAULT_KEY` (or `AUTOTRADE_VAULT_KEYS` + 
 `AUTOTRADE_JWT_SECRET` (32+ chars, shared with your auth), `AUTOTRADE_FEED_SSID` (Demo account),
 optional `AUTOTRADE_ALLOW_LIVE`, `AUTOTRADE_MAX_STAKE`, `AUTOTRADE_MAX_WORKERS`, `AUTOTRADE_CORS_ORIGINS`,
 `AUTOTRADE_TRUST_PROXY` (default true: trust `X-Forwarded-Proto` from Render's HTTPS proxy) and `FORWARDED_ALLOW_IPS` (default `*`).
+`TELEGRAM_BOT_TOKEN` (same bot token as GBot) enables the trade opened/closed alerts; without it trading
+still works but users get no alerts.
+
+### 512 MB instances (Render free/starter)
+Login runs one Chromium at a time (`AUTOTRADE_MAX_HANDSHAKES=1`) in low-memory mode (`AUTOTRADE_LOW_MEMORY`,
+default true): `--single-process --no-zygote --no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage
+--disable-gpu --js-flags=--max-old-space-size=256` plus low-end-device mode, device scale 1, no service
+workers. During login the broker's images, fonts, media and stylesheets (`AUTOTRADE_BLOCK_LOGIN_ASSETS`) and
+third-party trackers (`AUTOTRADE_BLOCK_THIRD_PARTY`) are not loaded; Google sign-in and CAPTCHA pages load in
+full. The browser is closed as soon as the Demo and Real sessions are captured, every close step is time-boxed,
+and a crash ends on a readable "browser stopped unexpectedly, try again" page instead of a blank screen.
 Run `AUTOTRADE_APPLY_SCHEMA=1 python -m autotrade.main` once (applies `schema.sql`), then without the flag.
+New tables added later (`autotrade_balances`) are created automatically at start-up.
 Keep the vault key out of the database and out of git. Run as its own service (needs Chromium and a
 long-lived process, so not a serverless function and not the Render GBot service).
 

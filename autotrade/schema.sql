@@ -57,6 +57,15 @@ create table if not exists autotrade_bot_state (
   updated_at      timestamptz not null default now()
 );
 
+-- Last known account balance per account type, so it survives restarts (/at_balance).
+create table if not exists autotrade_balances (
+  user_id    text          not null,
+  kind       text          not null check (kind in ('demo','real')),
+  balance    numeric(14,2) not null,
+  updated_at timestamptz   not null default now(),
+  primary key (user_id, kind)
+);
+
 create table if not exists autotrade_audit (
   id         bigserial   primary key,
   user_id    text,
@@ -72,12 +81,13 @@ alter table autotrade_settings    enable row level security;
 alter table autotrade_trades      enable row level security;
 alter table autotrade_bot_state   enable row level security;
 alter table autotrade_audit       enable row level security;
+alter table autotrade_balances    enable row level security;
 do $$
 declare r text;
 begin
   foreach r in array array['anon','authenticated'] loop
     if exists (select 1 from pg_roles where rolname = r) then
-      execute format('revoke all on autotrade_credentials, autotrade_settings, autotrade_trades, autotrade_bot_state, autotrade_audit from %I', r);
+      execute format('revoke all on autotrade_credentials, autotrade_settings, autotrade_trades, autotrade_bot_state, autotrade_audit, autotrade_balances from %I', r);
     end if;
   end loop;
 end $$;

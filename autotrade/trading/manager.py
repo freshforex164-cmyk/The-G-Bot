@@ -45,8 +45,9 @@ class TradingManager:
     def __init__(self, *, cfg: Config, repo: Repository, vault: TokenVault, health: SessionHealth,
                  feed: SharedMarketFeed, broker_factory: Callable[[str], BrokerClient],
                  risk: RiskManager | None = None, clock: Clock | None = None,
-                 reconnect_base: float = 2.0):
+                 reconnect_base: float = 2.0, notifier: Any = None):
         self._reconnect_base = reconnect_base
+        self._notifier = notifier
         self.cfg, self.repo, self.vault, self.health, self.feed = cfg, repo, vault, health, feed
         self._factory = broker_factory
         self._risk = risk or RiskManager()
@@ -84,7 +85,8 @@ class TradingManager:
                 raise ServiceUnavailable(f"broker unreachable: {res.reason}")
             worker = UserWorker(user_id, repo=self.repo, vault=self.vault, feed=self.feed,
                                 broker_factory=self._factory, risk=self._risk, clock=self._clock,
-                                is_halted=lambda: self.halted, reconnect_base=self._reconnect_base)
+                                is_halted=lambda: self.halted, reconnect_base=self._reconnect_base,
+                                notifier=self._notifier)
             worker.apply_settings(s)
             self._workers[user_id] = worker
             task = asyncio.create_task(worker.run(), name=f"worker:{user_id}")
@@ -168,6 +170,64 @@ class TradingManager:
         reason = worker.submit_signal(decision)
         return {"accepted": reason == "queued", "reason": reason}
 
+    def active_users(self) -> list[str]:
+        """GBot's "who is auto-trading" list: users whose bot is on and places GBot signals.
+        Only these users get trade hand-offs (and no raw signal cards) from GBot."""
+        return sorted(u for u, w in self._workers.items() if self.is_running(u) and w.follows_signals)
+
+    async def balance(self, user_id: str, fresh: bool = True) -> dict[str, Any]:
+        """Balance of the account for the selected mode. Fresh from the running bot, or from a short
+        broker connection when the bot is stopped; otherwise the last saved value."""
+        s = await self.repo.get_settings(user_id)
+        kind = "demo" if s.mode == DEMO else "real"
+        value, error = None, None
+        if fresh:
+            worker = self._workers.get(user_id)
+            if worker is not None and self.is_running(user_id):
+                value = await worker.refresh_balance_now()
+                if value is None:
+                    error = "bot_not_connected"
+            else:
+                value, error = await self._read_balance_once(user_id, kind)
+        saved = (await self.repo.get_balances(user_id)).get(kind)
+        if value is not None:
+            return {"account": kind, "balance": value, "fresh": True,
+                    "at": self._clock.utcnow().isoformat()}
+        return {"account": kind, "balance": saved.balance if saved else None, "fresh": False,
+                "at": saved.updated_at.isoformat() if saved and saved.updated_at else None,
+                "error": error}
+
+    async def _read_balance_once(self, user_id: str, kind: str) -> tuple[float | None, str | None]:
+        from ..errors import VaultError
+        from ..storage.repo import BalanceRow
+        try:
+            ssid = await self.vault.get(user_id, kind)
+        except VaultError:
+            return None, "session_unreadable"
+        if ssid is None:
+            return None, "no_session"
+        broker = self._factory(ssid)
+        try:
+            await asyncio.wait_for(broker.connect(), timeout=25)
+            raw = await asyncio.wait_for(broker.balance(), timeout=10)
+        except Exception as exc:
+            from ..errors import SessionExpired
+            from .broker import map_exception
+            if isinstance(map_exception(exc), SessionExpired):
+                await self.vault.mark_expired(user_id, kind, "rejected during balance check")
+                return None, "session_expired"
+            return None, "broker_unreachable"
+        finally:
+            await asyncio.shield(broker.close())
+        if raw is None or float(raw) < 0:
+            return None, "balance_unavailable"
+        value = round(float(raw), 2)
+        try:
+            await self.repo.save_balance(BalanceRow(user_id, kind, value, self._clock.utcnow()))
+        except Exception:
+            log.warning("could not persist balance for user %s", user_id)
+        return value, None
+
     # -- reporting ----------------------------------------------------------------------------
     async def stats(self, user_id: str) -> dict[str, Any]:
         s = await self.repo.get_settings(user_id)
@@ -179,6 +239,11 @@ class TradingManager:
         bot = worker.snapshot() if worker and (running or worker.status in _TERMINAL) else \
             {"status": state.status if state else "stopped", "last_error": state.last_error if state else None,
              "open_trades": 0, "last_skip_reason": None}
+        if bot.get("balance") is None:          # stopped or restarted: last saved balance for this mode
+            saved = (await self.repo.get_balances(user_id)).get("demo" if s.mode == DEMO else "real")
+            if saved is not None:
+                bot = {**bot, "balance": saved.balance, "balance_account": saved.kind,
+                       "balance_at": saved.updated_at.isoformat() if saved.updated_at else None}
         return {
             "bot": {**bot, "running": running, "halted_by_operator": self.halted},
             "mode": s.mode,

@@ -32,6 +32,14 @@ class BotState:
     updated_at: datetime | None = None
 
 
+@dataclass
+class BalanceRow:
+    user_id: str
+    kind: str                      # demo | real
+    balance: float
+    updated_at: datetime | None = None
+
+
 class Repository(Protocol):
     async def upsert_credential(self, row: CredentialRow) -> None: ...
     async def get_credential(self, user_id: str, kind: str) -> CredentialRow | None: ...
@@ -50,6 +58,8 @@ class Repository(Protocol):
     async def set_bot_state(self, state: BotState) -> None: ...
     async def get_bot_state(self, user_id: str) -> BotState | None: ...
     async def list_desired_running(self) -> list[str]: ...
+    async def save_balance(self, row: BalanceRow) -> None: ...
+    async def get_balances(self, user_id: str) -> dict[str, BalanceRow]: ...
     async def audit(self, user_id: str | None, event: str, detail: dict[str, Any]) -> None: ...
 
 
@@ -79,6 +89,7 @@ class InMemoryRepository:
         self.settings: dict[str, TradingSettings] = {}
         self.trades: list[TradeRecord] = []
         self.states: dict[str, BotState] = {}
+        self.balances: dict[tuple[str, str], BalanceRow] = {}
         self.audit_log: list[tuple[str | None, str, dict[str, Any]]] = []
 
     async def upsert_credential(self, row: CredentialRow) -> None:
@@ -143,6 +154,12 @@ class InMemoryRepository:
 
     async def list_desired_running(self):
         return [u for u, s in self.states.items() if s.desired_running]
+
+    async def save_balance(self, row: BalanceRow) -> None:
+        self.balances[(row.user_id, row.kind)] = copy.deepcopy(row)
+
+    async def get_balances(self, user_id):
+        return {k: copy.deepcopy(r) for (u, k), r in self.balances.items() if u == user_id}
 
     async def audit(self, user_id, event, detail) -> None:
         self.audit_log.append((user_id, event, detail))

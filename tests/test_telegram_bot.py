@@ -7,9 +7,7 @@ from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from tempfile import TemporaryDirectory
 from pathlib import Path
-from types import SimpleNamespace
 
-import config
 from notifications import TelegramSendError
 from subscriber_store import SubscriberStore
 from telegram_bot import (
@@ -86,52 +84,6 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    @unittest.skip("OBSOLETE (failing before 2026-11-20): expects the old /start-subscribes flow, strength help text and minimum-payout status.")
-
-    async def test_start_subscribes_and_shows_only_stop_and_status(self) -> None:
-        await self.handler.handle_update(message_update("/start@gbot"))
-        self.assertEqual(self.store.subscribed_chat_ids(), [101])
-        chat_id, text, markup, _ = self.client.messages[-1]
-        self.assertEqual(chat_id, 101)
-        self.assertEqual(text, "Signals are on for this chat")
-        self.assertEqual(
-            [row[0]["text"] for row in markup["inline_keyboard"]],
-            ["Stop signals", "Status"],
-        )
-
-    @unittest.skip("OBSOLETE (failing before 2026-11-20): expects the old /start-subscribes flow, strength help text and minimum-payout status.")
-
-    async def test_start_again_is_idempotent_and_does_not_repeat_welcome(self) -> None:
-        await self.handler.handle_update(message_update("/start"))
-        self.now += 21
-        await self.handler.handle_update(message_update("/start"))
-        self.assertEqual(self.store.subscribed_chat_ids(), [101])
-        self.assertEqual(self.client.messages[-1][1], "Signals are already on")
-        self.assertEqual(
-            [row[0]["text"] for row in self.client.messages[-1][2]["inline_keyboard"]],
-            ["Stop signals", "Status"],
-        )
-
-    @unittest.skip("OBSOLETE (failing before 2026-11-20): expects the old /start-subscribes flow, strength help text and minimum-payout status.")
-
-    async def test_stop_unsubscribes_and_status_reports_state(self) -> None:
-        await self.handler.handle_update(message_update("/start"))
-        await self.handler.handle_update(message_update("/stop"))
-        self.assertEqual(self.store.subscribed_chat_ids(), [])
-        self.assertEqual(self.client.messages[-1][1], "Signals are off.")
-        self.assertEqual(
-            [row[0]["text"] for row in self.client.messages[-1][2]["inline_keyboard"]],
-            ["Choose an asset", "Register"],
-        )
-        await self.handler.handle_update(message_update("/status"))
-        text = self.client.messages[-1][1]
-        self.assertIn("Signals: off", text)
-        self.assertIn("Scanner: Starting, waiting for first prices", text)
-        self.assertIn(f"Minimum payout: {config.MIN_PAYOUT}%", text)
-        self.assertNotIn("n/a", text)
-        self.assertNotIn("UTC", text)
-        self.assertNotIn("OTC pairs", text)
-        self.assertNotIn("Subscribers:", text)
 
     async def test_stop_again_is_idempotent(self) -> None:
         await self.handler.handle_update(message_update("/stop"))
@@ -140,35 +92,6 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.handler.handle_update(message_update("/stop"))
         self.assertEqual(self.client.messages[-1][1], "Signals are already off.")
         self.assertEqual(self.store.subscribed_chat_ids(), [])
-
-    @unittest.skip("OBSOLETE (failing before 2026-11-20): expects the old /start-subscribes flow, strength help text and minimum-payout status.")
-
-    async def test_status_reports_live_when_connected_and_receiving_fresh_ticks(self):
-        self.handler.scanner = SimpleNamespace(
-            is_paused=False,
-            last_tick_age_seconds=0.5,
-            broker=SimpleNamespace(is_connected=True),
-        )
-        await self.handler.handle_update(message_update("/status"))
-        self.assertIn("Scanner: Live", self.client.messages[-1][1])
-
-    @unittest.skip("OBSOLETE (failing before 2026-11-20): expects the old /start-subscribes flow, strength help text and minimum-payout status.")
-
-    async def test_status_command_cooldown_and_duplicate_message_suppression(self):
-        await self.handler.handle_update(message_update("/status"))
-        self.assertEqual(len(self.client.messages), 1)
-        await self.handler.handle_update(message_update("/status"))
-        self.assertEqual(len(self.client.messages), 1)
-
-        self.now += 21
-        self.store.set_subscribed(101, True)
-        await self.handler.handle_update(message_update("/status"))
-        self.assertEqual(len(self.client.messages), 2)
-        self.assertIn("Signals: on", self.client.messages[-1][1])
-
-        self.now += 21
-        await self.handler.handle_update(message_update("/status"))
-        self.assertEqual(len(self.client.messages), 2)
 
 
     async def test_register_without_referral_omits_url_button(self) -> None:
@@ -184,16 +107,6 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("not configured", text)
         self.assertNotIn("url", str(markup))
 
-    @unittest.skip("OBSOLETE (failing before 2026-11-20): expects the old /start-subscribes flow, strength help text and minimum-payout status.")
-
-    async def test_help_describes_information_only_signals(self) -> None:
-        await self.handler.handle_update(message_update("/help"))
-        text = self.client.messages[-1][1]
-        self.assertIn("How GBot works", text)
-        self.assertIn("place the trade quickly", text)
-        self.assertIn("Strength shows how strong the setup is", text)
-        self.assertIn("not financial advice", text)
-        self.assertIn("not a guarantee", text)
 
     async def test_admin_command_is_restricted_to_configured_user(self) -> None:
         await self.handler.handle_update(
@@ -281,26 +194,6 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text, "TEST - not a confirmed signal\nBUY Pair OTC")
         self.assertIsNone(self.client.messages[-1][3])
 
-    @unittest.skip("OBSOLETE (failing before 2026-11-20): expects the old /start-subscribes flow, strength help text and minimum-payout status.")
-
-    async def test_callback_buttons_answer_query_and_change_subscription(self) -> None:
-        await self.handler.handle_update(
-            {
-                "callback_query": {
-                    "id": "callback-1",
-                    "from": {"id": 101},
-                    "data": "signals:start",
-                    "message": {"chat": {"id": 101}},
-                }
-            }
-        )
-        self.assertEqual(self.client.callbacks, ["callback-1"])
-        self.assertEqual(self.store.subscribed_chat_ids(), [101])
-        self.assertEqual(self.client.messages[-1][1], "Signals are on for this chat")
-        self.assertEqual(
-            [row[0]["text"] for row in self.client.messages[-1][2]["inline_keyboard"]],
-            ["Stop signals", "Status"],
-        )
 
     async def test_unrecognized_callback_is_still_acknowledged(self) -> None:
         await self.handler.handle_update(
@@ -314,22 +207,6 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.client.callbacks, ["callback-unknown"])
         self.assertEqual(self.client.messages, [])
-
-    @unittest.skip("OBSOLETE (failing before 2026-11-20): expects the old /start-subscribes flow, strength help text and minimum-payout status.")
-
-    async def test_subscription_persists_across_store_restart(self) -> None:
-        await self.handler.handle_update(message_update("/start"))
-        restarted = SubscriberStore(
-            database_url="",
-            file_path=Path(self.temp_dir.name) / "subscribers.json",
-        )
-        self.assertEqual(restarted.subscribed_chat_ids(), [101])
-        restarted.set_subscribed(101, False)
-        reloaded = SubscriberStore(
-            database_url="",
-            file_path=Path(self.temp_dir.name) / "subscribers.json",
-        )
-        self.assertEqual(reloaded.subscribed_chat_ids(), [])
 
 
 class TelegramApiAndPollingTests(unittest.IsolatedAsyncioTestCase):

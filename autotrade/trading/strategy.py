@@ -57,5 +57,4 @@ class PriceActionExecution:
 
 
 # Register new strategies here. A user selects one by name in settings.strategy.
-STRATEGIES: dict[str, Callable[[], Strategy]] = {"price_action": PriceActionExecution, "gap": PriceActionExecution}
-# Existing saved strategy names remain readable; they no longer execute gap rules.
+STRATEGIES: dict[str, Callable[[], Strategy]] = {"price_action": PriceActionExecution}

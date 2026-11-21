@@ -29,8 +29,15 @@ class Config:
     max_workers: int = 200
     feed_ssid_env: str = "AUTOTRADE_FEED_SSID"  # name of the env var holding the feed account SSID
     handshake_timeout: float = 300.0
-    max_handshakes: int = 3
+    max_handshakes: int = 1           # one Chromium at a time fits Render's 512 MB instance
     headless: bool = True
+    low_memory: bool = True           # single-process Chromium with a small JS heap (512 MB hosts)
+    block_login_assets: bool = True   # no images/fonts/media/stylesheets from the broker during login
+    block_third_party: bool = True    # no trackers/ads during login (Google/CAPTCHA always allowed)
+    # Per-user brute-force limits: "<attempts>/<seconds>".
+    handshake_rate: str = "6/600"
+    credentials_rate: str = "5/900"
+    telegram_bot_token: str = ""      # trade open/settle alerts go straight to the user's Telegram chat
     recheck_seconds: float = 6 * 3600
     cors_origins: tuple[str, ...] = field(default_factory=tuple)
     trust_proxy: bool = True          # TLS terminated by the host's proxy (Render)
@@ -48,8 +55,14 @@ class Config:
             live_max_stake=_num("AUTOTRADE_LIVE_MAX_STAKE", 10.0),
             max_workers=int(_num("AUTOTRADE_MAX_WORKERS", 200)),
             handshake_timeout=_num("AUTOTRADE_HANDSHAKE_TIMEOUT", 300),
-            max_handshakes=int(_num("AUTOTRADE_MAX_HANDSHAKES", 3)),
+            max_handshakes=int(_num("AUTOTRADE_MAX_HANDSHAKES", 1)),
             headless=_bool("AUTOTRADE_HEADLESS", True),
+            low_memory=_bool("AUTOTRADE_LOW_MEMORY", True),
+            block_login_assets=_bool("AUTOTRADE_BLOCK_LOGIN_ASSETS", True),
+            block_third_party=_bool("AUTOTRADE_BLOCK_THIRD_PARTY", True),
+            handshake_rate=os.environ.get("AUTOTRADE_HANDSHAKE_RATE", "6/600"),
+            credentials_rate=os.environ.get("AUTOTRADE_CREDENTIALS_RATE", "5/900"),
+            telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
             recheck_seconds=_num("AUTOTRADE_RECHECK_SECONDS", 6 * 3600),
             cors_origins=origins,
             trust_proxy=_bool("AUTOTRADE_TRUST_PROXY", True),

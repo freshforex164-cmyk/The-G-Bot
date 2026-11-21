@@ -112,10 +112,8 @@ class HandshakeTests(unittest.IsolatedAsyncioTestCase):
         first = await hm.start("a")
         again = await hm.start("a")                 # replaces the first
         self.assertEqual(first.state, "cancelled")
-        await hm.start("b")
-        await hm.start("c")
         with self.assertRaises(RuntimeError):
-            await hm.start("d")                      # max_handshakes = 3
+            await hm.start("b")                      # max_handshakes = 1: one Chromium fits 512 MB
         for sid, u in ((again.id, "a"),):
             await hm.cancel(sid, u)
         for s in list(hm._sessions.values()):

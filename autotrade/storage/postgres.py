@@ -6,7 +6,20 @@ from pathlib import Path
 from typing import Any
 
 from ..trading.models import TradeRecord, TradingSettings
-from .repo import BotState, CredentialRow
+from .repo import BalanceRow, BotState, CredentialRow
+
+# Always applied at start-up (idempotent), even without AUTOTRADE_APPLY_SCHEMA, so tables added after the
+# first deploy exist on databases that were set up earlier.
+MIGRATIONS = """
+create table if not exists autotrade_balances (
+  user_id    text          not null,
+  kind       text          not null check (kind in ('demo','real')),
+  balance    numeric(14,2) not null,
+  updated_at timestamptz   not null default now(),
+  primary key (user_id, kind)
+);
+alter table autotrade_balances enable row level security;
+"""
 
 _TRADE_COLUMNS = {"status", "broker_trade_id", "outcome", "profit", "settled_at", "error", "opened_at"}
 _TRADE_SELECT = ("user_id, client_ref, mode, asset, direction, stake, expiry_seconds, status, broker_trade_id, "
@@ -34,6 +47,12 @@ class PostgresRepository:
             sql = (Path(__file__).resolve().parent.parent / "schema.sql").read_text()
             async with self._pool.connection() as conn:
                 await conn.execute(sql)
+        try:
+            async with self._pool.connection() as conn:
+                await conn.execute(MIGRATIONS)
+        except Exception as exc:     # e.g. no CREATE privilege: balances just are not persisted
+            import logging
+            logging.getLogger("autotrade.postgres").warning("start-up migration failed: %s", type(exc).__name__)
 
     async def close(self) -> None:
         await self._pool.close()
@@ -160,6 +179,18 @@ class PostgresRepository:
 
     async def list_desired_running(self):
         return [r[0] for r in await self._all("select user_id from autotrade_bot_state where desired_running")]
+
+    # balances ----------------------------------------------------------------------------------
+    async def save_balance(self, row: BalanceRow) -> None:
+        await self._exec(
+            """insert into autotrade_balances (user_id, kind, balance, updated_at) values (%s,%s,%s,coalesce(%s, now()))
+               on conflict (user_id, kind) do update set balance=excluded.balance, updated_at=excluded.updated_at""",
+            (row.user_id, row.kind, row.balance, row.updated_at))
+
+    async def get_balances(self, user_id) -> dict[str, BalanceRow]:
+        rows = await self._all("select user_id, kind, balance, updated_at from autotrade_balances where user_id=%s",
+                               (user_id,))
+        return {r[1]: BalanceRow(r[0], r[1], float(r[2]), r[3]) for r in rows}
 
     async def audit(self, user_id, event, detail) -> None:
         await self._exec("insert into autotrade_audit (user_id, event, detail) values (%s,%s,%s)",

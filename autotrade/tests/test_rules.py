@@ -36,7 +36,7 @@ class SettingsTests(unittest.TestCase):
     def test_bounds(self):
         bad = [dict(stake=0.5), dict(stake=101), dict(expiry_seconds=5), dict(max_concurrent=6),
                dict(daily_stop_loss=0), dict(daily_take_profit=-1), dict(cooldown_seconds=1),
-               dict(min_payout=10), dict(stake=20, daily_stop_loss=10), dict(gap_threshold=0),
+               dict(min_payout=10), dict(stake=20, daily_stop_loss=10),
                dict(symbol_real="EURUSD", symbol_otc="EURUSD"), dict(symbol_otc="bad symbol!")]
         for change in bad:
             with self.subTest(change=change), self.assertRaises(SettingsError):

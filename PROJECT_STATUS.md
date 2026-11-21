@@ -1,3 +1,66 @@
+# G-Bot status — 512 MB login, Signals vs Auto-Trade, reliability upgrades
+
+## Fixed / implemented in this revision
+- **Login on Render 512 MB (no plan change)**: the sign-in browser runs in low-memory mode
+  (`--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu --single-process --no-zygote
+  --js-flags=--max-old-space-size=256`, low-end-device mode, scale 1, no service workers, one login at a time).
+  Pocket Option's images, fonts, media, stylesheets and third-party trackers are not loaded during login
+  (Google sign-in / CAPTCHA pages load in full). The browser closes right after the Demo and Real sessions are
+  captured; every close step is time-boxed. If Chromium dies (out of memory) the page shows "The secure sign-in
+  browser stopped unexpectedly… try again" — never a blank screen. Busy/slow/unreachable cases have their own text.
+- **Real Demo + Real sessions**: each account's session is now captured from its own Pocket Option page
+  (live testing showed a Demo session derived from the Real one is rejected).
+- **Menu**: `/start` → category → asset → **📡 Receive Signals** (cards only) or **🤖 Start Auto-Trade**
+  (private chats). Auto-Trade users no longer get raw cards; the service sends *Trade opened* and *Trade closed*
+  alerts (WIN / LOSS / BREAK EVEN, profit/loss, updated balance) or a short note when a signal is skipped
+  (risk limit, payout too low, max open trades). If the auto-trade service can't take a signal, the user gets
+  the normal card instead so nothing is lost. New 💰 Balance and 📊 Stats buttons.
+- **Who is auto-trading**: the service keeps the list (`GET /trading/active`, service-only token); GBot refreshes
+  it at start-up and before signals once the copy is older than 20 s, and updates it instantly on start/stop, and only sends hand-offs to those users.
+- **Defaults**: max 2 open trades, 5 s cooldown (old saved defaults upgraded automatically; custom values kept).
+- **Balance**: last known balance per user and account is saved in `autotrade_balances` (created at start-up),
+  survives restarts. `/at_balance` (+ menu button) reads a fresh balance even when the bot is stopped.
+- **Security**: hand-off tokens are `scope=signal` (30 s, only `POST /trading/signal`); GBot's roster token is
+  `scope=service`; login links stay `scope=login`. Per-user limits: 6 login starts / 10 min, 5 password
+  submissions / 15 min, with a readable "wait N minutes" message.
+- **Cleanup**: `gap` setting, `/at_set gap` and the `gap` strategy alias removed; obsolete skipped tests for old
+  card formats deleted (`tests/test_live_test_signals.py`, `tests/test_serve.py` and skipped classes elsewhere).
+- Unchanged on purpose: `AUTOTRADE_ALLOW_LIVE=false` default, `WELCOME_IMAGE_URL`, Render plan.
+
+## Verified in this revision
+- Tests: GBot suite and autotrade suite pass (counts below), including new `tests/test_autotrade_mode.py` and
+  `autotrade/tests/test_autotrade_upgrades.py` (low-memory flags, asset blocking, crash message, defaults,
+  roster routing, alerts, saved balance, token scopes, rate limits).
+- **Live, real Pocket Option Demo account** (test login from Lovable secrets, never stored in the repo):
+  sign-in with the low-memory flags and asset blocking succeeded; genuine Demo and Real sessions captured;
+  one real Demo order placed — $1 CALL EURUSD_otc, 1 minute, payout 92% — settled LOSS −$1.00, balance
+  $10.00 → $9.00 read back from the broker.
+- The hosted sign-in page, driven in a real browser against the running service, ends on a readable result
+  panel (e.g. "Sign-in failed — Pocket Option did not respond in time") instead of a blank page.
+
+## Not verified
+- Memory on a real Render 512 MB instance: browser memory in the test machine is not comparable to Render's
+  limit. After deploying, watch Render's memory graph during `/at_login`.
+- Pocket Option temporarily stopped answering the test machine after repeated logins, so the full
+  service run (hosted page → `/at_start` → signal hand-off → alerts → stats) could not be completed live.
+  Logins from Render's shared address may hit the same protection; the new rate limits reduce that risk.
+- Docker image with Playwright 1.49 (tested with 1.59 here).
+
+## Environment variables to check on Render
+GBot service: `TELEGRAM_BOT_TOKEN`, `PO_SSID`, `TELEGRAM_ADMIN_CHAT_ID` (or `TELEGRAM_CHAT_ID`), `TELEGRAM_ADMIN_ID`,
+`DATABASE_URL`, `AUTOTRADE_API_URL` (https URL of the autotrade service), `AUTOTRADE_PUBLIC_URL` (https, optional),
+`AUTOTRADE_JWT_SECRET` (32+ chars, identical on both services); optional `ADMIN_IDS`, `ADMIN_TOKEN`, `REFERRAL_LINK`,
+`TIMEZONE`, `WELCOME_IMAGE_URL`.
+Autotrade service: `DATABASE_URL`, `AUTOTRADE_VAULT_KEY` (base64 of 32 bytes) or `AUTOTRADE_VAULT_KEYS`
+(`1:<b64>,2:<b64>`) + `AUTOTRADE_VAULT_ACTIVE`, `AUTOTRADE_JWT_SECRET`, `AUTOTRADE_FEED_SSID` (Demo SSID),
+**`TELEGRAM_BOT_TOKEN` (new here — same as GBot; needed for trade alerts)**, `AUTOTRADE_ALLOW_LIVE=false`;
+optional `AUTOTRADE_LOW_MEMORY=true`, `AUTOTRADE_MAX_HANDSHAKES=1`, `AUTOTRADE_BLOCK_LOGIN_ASSETS=true`,
+`AUTOTRADE_BLOCK_THIRD_PARTY=true`, `AUTOTRADE_HANDSHAKE_RATE=6/600`, `AUTOTRADE_CREDENTIALS_RATE=5/900`,
+`AUTOTRADE_TRUST_PROXY=true`, `FORWARDED_ALLOW_IPS=*`, `AUTOTRADE_MAX_STAKE`, `AUTOTRADE_LIVE_MAX_STAKE`,
+`AUTOTRADE_MAX_WORKERS`, `AUTOTRADE_CORS_ORIGINS`. Remove any old `gap` setting references (none are env vars).
+
+---
+
 # G-Bot status — 2026-11-21 (login, setup cards, signal auto-trade)
 
 ## Fixed / implemented in this revision

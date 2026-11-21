@@ -18,10 +18,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import config
 from autotrade_commands import ALL_COMMANDS as AUTOTRADE_COMMAND_NAMES
+from autotrade_client import AutotradeRoster
 from autotrade_commands import AutotradeCommands
 from market_assets import CATALOG, CATALOG_BY_ID, CATEGORIES
 from notifications import TelegramNotifier, TelegramSendError, format_signal_message
 from strategy.model import Signal
+from strategy.price_action import setup_label
 from subscriber_store import SubscriberStore
 
 logger = logging.getLogger("gbot.telegram")
@@ -253,11 +255,14 @@ class TelegramCommandHandler:
         clock: Callable[[], float] = time.monotonic,
         background_selection: bool = False,
         autotrade: Any = None,
+        roster: Any = None,
     ) -> None:
         self.client = client
         # Optional: AutotradeClient for the separate auto-trading service. None = commands say "not set up".
         self.autotrade_enabled = autotrade is not None
-        self.autotrade = AutotradeCommands(autotrade, self._autotrade_send)
+        # Who is auto-trading (shared with the fan-out): those users get trades instead of signal cards.
+        self.roster = roster if roster is not None else (AutotradeRoster(autotrade) if autotrade else None)
+        self.autotrade = AutotradeCommands(autotrade, self._autotrade_send, self.roster)
         self.subscribers = subscribers
         self.admin_id = admin_id
         self.referral_link = self._valid_referral(referral_link)
@@ -390,6 +395,22 @@ class TelegramCommandHandler:
             message_id = message.get("message_id") if isinstance(message, Mapping) else None
             if chat_id is not None and isinstance(message_id, int):
                 self.menu_message_ids[chat_id] = message_id
+            sender = callback.get("from")
+            sender_id: int | None = None
+            if isinstance(sender, Mapping) and sender.get("id") is not None:
+                try:
+                    sender_id = int(sender["id"])
+                except (TypeError, ValueError):
+                    sender_id = None
+            if chat_id is not None and (data.startswith("mode:") or data.startswith("at:")):
+                work = self._mode_or_account_button(chat_id, sender_id, data)
+                if self.background_selection:
+                    task = asyncio.create_task(work, name=f"mode-{chat_id}")
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                else:
+                    await work
+                return
             if chat_id is not None and data.startswith("asset:") and self.background_selection:
                 task = asyncio.create_task(
                     self._locked_select(chat_id, data.split(":", 1)[1]),
@@ -469,11 +490,11 @@ class TelegramCommandHandler:
                 changed = await asyncio.to_thread(
                     self.subscribers.set_subscribed, chat_id, False
                 )
-                await self._render_menu(
-                    chat_id,
-                    "Signals are off." if changed else "Signals are already off.",
-                    self._keyboard(chat_id),
-                )
+                text = "Signals are off." if changed else "Signals are already off."
+                if self.roster is not None and self.roster.is_active(chat_id):
+                    self._stop_autotrade_in_background(chat_id)
+                    text += " Auto-Trade is stopping; open trades finish first."
+                await self._render_menu(chat_id, text, self._keyboard(chat_id))
             elif command == "status":
                 if from_menu:
                     await self._render_menu(
@@ -593,6 +614,8 @@ class TelegramCommandHandler:
     def _keyboard(self, chat_id: int) -> dict[str, Any]:
         subscriber = self.subscribers.subscribers.get(chat_id)
         if subscriber is not None and subscriber.subscribed:
+            if getattr(subscriber, "selected_asset", None):
+                return self._mode_keyboard(chat_id)
             rows = [
                 [{"text": "Change asset", "callback_data": "assetback"}],
                 [{"text": "Stop", "callback_data": "signals:stop"}],
@@ -764,11 +787,117 @@ class TelegramCommandHandler:
                 chat_id, category_index, f"{name} isn't available right now.\n\n"
             )
             return
-        await self._render_menu(
-            chat_id,
-            f"Selected {name}. Signals are on for this asset.",
-            self._selected_keyboard(),
-        )
+        await self._render_mode_menu(chat_id, name)
+
+    # ---- mode: 📡 Receive Signals vs 🤖 Auto-Trade -------------------------------------------------
+    def _autotrade_allowed(self, chat_id: int) -> bool:
+        """Auto-trading is personal: only in a private chat (chat id == Telegram user id)."""
+        return self.autotrade_enabled and int(chat_id) > 0
+
+    def _is_auto(self, chat_id: int) -> bool:
+        return self.roster is not None and self.roster.is_active(chat_id)
+
+    def _mode_keyboard(self, chat_id: int) -> dict[str, Any]:
+        auto = self._is_auto(chat_id)
+        rows: list[list[dict[str, str]]] = []
+        if self._autotrade_allowed(chat_id):
+            rows.append([
+                {"text": "📡 Receive Signals" + ("" if auto else " ✅"), "callback_data": "mode:signals"},
+                {"text": "🤖 Auto-Trade ✅" if auto else "🤖 Start Auto-Trade", "callback_data": "mode:autotrade"},
+            ])
+            rows.append([
+                {"text": "💰 Balance", "callback_data": "at:balance"},
+                {"text": "📊 Stats", "callback_data": "at:stats"},
+            ])
+        rows.append([
+            {"text": "Change asset", "callback_data": "assetback"},
+            {"text": "Stop", "callback_data": "signals:stop"},
+        ])
+        return {"inline_keyboard": rows}
+
+    def _selected_name(self, chat_id: int) -> str | None:
+        subscriber = self.subscribers.subscribers.get(chat_id)
+        if subscriber is None or not getattr(subscriber, "selected_asset", None):
+            return None
+        return html.escape(self._asset_name(subscriber), quote=False)
+
+    async def _render_mode_menu(self, chat_id: int, name: str, notice: str = "", account: str = "") -> None:
+        if self._is_auto(chat_id):
+            text = (
+                f"🤖 Auto-Trade is on for {name}{f' ({account})' if account else ''}.\n"
+                "Signals for this asset are placed on your Pocket Option account automatically. "
+                "You get a message when each trade opens and when it closes (win/loss, profit, balance). "
+                "Signal cards are paused while Auto-Trade is on."
+            )
+        else:
+            text = (
+                f"Selected {name}.\n📡 Receive Signals is on: you get signal cards "
+                "(Setup, direction, expiration, payout). No trades are placed."
+            )
+            if self._autotrade_allowed(chat_id):
+                text += "\n🤖 Start Auto-Trade places these signals on your Pocket Option account instead."
+        await self._render_menu(chat_id, f"{notice}{text}", self._mode_keyboard(chat_id))
+
+    def _stop_autotrade_in_background(self, chat_id: int) -> None:
+        if self.roster is not None:
+            self.roster.discard(chat_id)        # signal cards resume at once; the bot drains in the background
+        task = asyncio.create_task(self.autotrade.disable(int(chat_id)), name=f"autotrade-stop-{chat_id}")
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _mode_or_account_button(self, chat_id: int, sender_id: int | None, data: str) -> None:
+        async with self._menu_lock(chat_id):
+            try:
+                await self._handle_mode_button(chat_id, sender_id, data)
+            except TelegramSendError:
+                logger.warning("Could not update the menu after a mode button.")
+            except Exception as exc:
+                logger.error("Mode button failed (%s).", type(exc).__name__)
+                try:
+                    await self._show_categories(
+                        chat_id, "Sorry, that request could not be completed. Try again.\n\n"
+                    )
+                except TelegramSendError:
+                    logger.warning("Could not update the menu after an error.")
+
+    async def _handle_mode_button(self, chat_id: int, sender_id: int | None, data: str) -> None:
+        private = sender_id is not None and int(sender_id) == int(chat_id)
+        if data.startswith("at:"):
+            command = {"at:balance": "at_balance", "at:stats": "at_stats"}.get(data)
+            if command and private:
+                await self._autotrade_safe(command, chat_id, int(sender_id), "", False)
+            return
+        name = self._selected_name(chat_id)
+        if name is None:
+            await self._show_categories(chat_id, "Choose an asset first.\n\n")
+            return
+        if data == "mode:signals":
+            was_auto = self._is_auto(chat_id)
+            if self._autotrade_allowed(chat_id) and private:
+                self._stop_autotrade_in_background(chat_id)    # also removes the chat from the roster now
+            await asyncio.to_thread(self.subscribers.set_subscribed, chat_id, True)
+            notice = "Auto-Trade is stopping; open trades finish first.\n\n" if was_auto else ""
+            await self._render_mode_menu(chat_id, name, notice)
+            return
+        if data == "mode:autotrade":
+            if not self._autotrade_allowed(chat_id) or not private:
+                await self._render_mode_menu(
+                    chat_id, name, "Auto-Trade only works in a private chat with the bot.\n\n"
+                    if self.autotrade_enabled else "Auto-Trade isn't set up on this bot yet.\n\n")
+                return
+            if self._is_auto(chat_id):
+                await self._render_mode_menu(chat_id, name)
+                return
+            await self._render_menu(chat_id, f"Starting 🤖 Auto-Trade for {name}…",
+                                    {"inline_keyboard": [[{"text": "Back", "callback_data": "assetback"}]]})
+            started, detail, markup = await self.autotrade.enable_follow(int(chat_id))
+            if started:
+                await asyncio.to_thread(self.subscribers.set_subscribed, chat_id, True)
+                await self._render_mode_menu(chat_id, name, account=detail)
+                return
+            rows = list((markup or {}).get("inline_keyboard", [])) + self._mode_keyboard(chat_id)["inline_keyboard"]
+            await self._render_menu(chat_id, f"{html.escape(detail, quote=False)}\n\nAsset: {name}",
+                                    {"inline_keyboard": rows})
 
     async def _pricecheck_reply(self, chat_id: int) -> None:
         subscriber = self.subscribers.subscribers.get(chat_id)
@@ -840,8 +969,12 @@ class TelegramCommandHandler:
         subscriber = self.subscribers.subscribers.get(chat_id)
         subscribed = bool(subscriber and subscriber.subscribed)
         symbol = getattr(subscriber, "selected_asset", None)
+        mode = ""
+        if subscribed and self._autotrade_allowed(chat_id):
+            mode = f"Mode: {'🤖 Auto-Trade' if self._is_auto(chat_id) else '📡 Receive Signals'}\n"
         return (
             f"Signals: {'on' if subscribed else 'off'}\n"
+            f"{mode}"
             f"Scanner: {self._scanner_status()}\n"
             f"Asset: {html.escape(self._asset_name(subscriber), quote=False)}\n"
             f"{await self._payout_line(symbol)}"
@@ -987,12 +1120,15 @@ class SubscriberFanoutNotifier:
         sleep: Callable[[float], Any] = asyncio.sleep,
         autotrade: Any | None = None,
         max_parallel_autotrade: int = 10,
+        roster: Any = None,
     ) -> None:
         if max_messages_per_second <= 0:
             raise ValueError("max_messages_per_second must be positive")
         self.client = client
         self.subscribers = subscribers
         self.autotrade = autotrade
+        # Only chats on the service's "who is auto-trading" list get hand-offs (and no card).
+        self.roster = roster if roster is not None else (AutotradeRoster(autotrade) if autotrade else None)
         self._autotrade_slots = asyncio.Semaphore(max(1, max_parallel_autotrade))
         self._autotrade_tasks: set[asyncio.Task] = set()
         self.autotrade_accepted = 0
@@ -1032,22 +1168,38 @@ class SubscriberFanoutNotifier:
             "asset": signal.pair,
             "direction": signal.direction.upper(),
             "expiry_seconds": 60,
-            "setup": str(signal.setup)[:48],
+            "setup": setup_label(signal.setup)[:48],     # card name, e.g. "Uptrend Pullback"
+            "asset_name": str(getattr(signal, "asset_name", "") or "")[:48],
             "valid_until": valid_until.isoformat(),
         }
 
-    async def _mirror_one(self, chat_id: Any, payload: dict[str, Any]) -> None:
+    async def _mirror_one(self, chat_id: Any, payload: dict[str, Any], signal: Signal | None = None) -> None:
         async with self._autotrade_slots:
             try:
                 result = await self.autotrade.submit_signal(chat_id, payload)
             except Exception as exc:   # service down/unauthorised: never affects Telegram delivery
                 logger.info("Auto-trade signal hand-off failed (%s).", getattr(exc, "code", type(exc).__name__))
-                return
+                result = {"accepted": False, "reason": "unreachable"}
             if isinstance(result, dict) and result.get("accepted"):
                 self.autotrade_accepted += 1
+                return
+            reason = result.get("reason") if isinstance(result, dict) else None
+            if reason in ("not_running", "follow_signals_off") and self.roster is not None:
+                self.roster.discard(chat_id)        # the bot stopped: back to signal cards
+            if reason in ("not_running", "follow_signals_off", "unreachable", "trading_halted") and signal is not None:
+                await self._send_card_late(chat_id, signal)   # nothing was traded: the user still gets the signal
+
+    async def _send_card_late(self, chat_id: Any, signal: Signal) -> None:
+        if self._is_stale(signal):
+            return
+        try:
+            await self._throttle()
+            await self.client.send_message(chat_id, format_signal_message(signal))
+        except Exception as exc:
+            logger.info("Fallback signal card failed (%s).", type(exc).__name__)
 
     def mirror_to_autotrade(self, chat_ids: Any, signal: Signal) -> int:
-        """Start background hand-offs for private chats (chat id == Telegram user id)."""
+        """Start background hand-offs for auto-trading private chats (chat id == Telegram user id)."""
         if self.autotrade is None:
             return 0
         payload = self.autotrade_payload(signal)
@@ -1058,7 +1210,7 @@ class SubscriberFanoutNotifier:
                     continue
             except (TypeError, ValueError):
                 continue
-            task = asyncio.create_task(self._mirror_one(chat_id, payload), name=f"autotrade-signal-{chat_id}")
+            task = asyncio.create_task(self._mirror_one(chat_id, payload, signal), name=f"autotrade-signal-{chat_id}")
             self._autotrade_tasks.add(task)
             task.add_done_callback(self._autotrade_tasks.discard)
             started += 1
@@ -1068,11 +1220,17 @@ class SubscriberFanoutNotifier:
         chat_ids = await asyncio.to_thread(
             self.subscribers.subscribed_chat_ids, signal.pair
         )
-        # Auto-trading users get the same signal placed at once, in parallel with the Telegram cards.
-        self.mirror_to_autotrade(chat_ids, signal)
+        # Auto-trading users get the signal placed at once (and trade alerts from the service) instead
+        # of the card; everyone else gets the card. Only users on the service's active list are called.
+        auto_ids: set[int] = set()
+        if self.autotrade is not None and self.roster is not None:
+            if self.roster.stale:
+                await self.roster.refresh(timeout=2.0)
+            auto_ids = {c for c in chat_ids if int(c) > 0 and self.roster.is_active(c)}
+        self.mirror_to_autotrade(sorted(auto_ids), signal)
         sent = 0
         text = format_signal_message(signal)
-        for chat_id in chat_ids:
+        for chat_id in [c for c in chat_ids if c not in auto_ids]:
             if self._is_stale(signal):
                 logger.info("Signal expired during subscriber fan-out.")
                 break

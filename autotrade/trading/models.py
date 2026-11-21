@@ -7,6 +7,10 @@ from typing import Any
 from ..config import Config
 from ..errors import SettingsError
 
+SETTINGS_DEFAULTS_VERSION = 2
+# v1 -> v2: follow-mode max_concurrent 1 -> 2 and cooldown 60 s -> 5 s; the "gap" setting was removed.
+_V1_DEFAULTS = {"max_concurrent": (1, 2), "cooldown_seconds": (60, 5)}
+
 DEMO = "demo"
 LIVE = "live"
 MODES = (DEMO, LIVE)
@@ -21,18 +25,19 @@ class TradingSettings:
     strategy: str = "price_action"
     symbol_real: str = "EURUSD"
     symbol_otc: str = "EURUSD_otc"
-    gap_threshold: float = 0.0015
     stake: float = 1.0
     expiry_seconds: int = 60
-    max_concurrent: int = 1
+    max_concurrent: int = 2            # follow mode: two back-to-back signals can both be placed
     daily_stop_loss: float = 10.0      # > 0 required: cannot be disabled
     daily_take_profit: float = 20.0    # > 0 required: cannot be disabled
-    cooldown_seconds: int = 60
+    cooldown_seconds: int = 5          # follow mode: a signal right after another one is not skipped
     min_payout: int = 80
     max_tick_age_seconds: float = 3.0
     # True: place exactly the GBot signals this user receives (no separate engine).
     # False: the service runs its own price-action engine on symbol_otc.
     follow_signals: bool = True
+    # Bumped when defaults change, so saved settings that still hold the old defaults get the new ones.
+    defaults_version: int = SETTINGS_DEFAULTS_VERSION
 
     def validate(self, cfg: Config) -> "TradingSettings":
         def bad(msg: str):
@@ -61,8 +66,6 @@ class TradingSettings:
             bad("min_payout must be between 50 and 100")
         if not (0.5 <= self.max_tick_age_seconds <= 30):
             bad("max_tick_age_seconds must be between 0.5 and 30")
-        if not (0 < self.gap_threshold <= 0.05):
-            bad("gap_threshold must be between 0 and 0.05")
         for name in ("symbol_real", "symbol_otc"):
             v = getattr(self, name)
             if not (isinstance(v, str) and 3 <= len(v) <= 32 and v.replace("_", "").replace("-", "").replace("#", "").isalnum()):
@@ -79,7 +82,15 @@ class TradingSettings:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TradingSettings":
         known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        values = {k: v for k, v in data.items() if k in known}     # drops removed keys such as gap_threshold
+        if int(values.get("defaults_version") or 1) < 2:
+            for name, (old, new) in _V1_DEFAULTS.items():
+                if values.get(name, old) == old:
+                    values[name] = new
+        if values.get("strategy") == "gap":                        # removed alias of price_action
+            values["strategy"] = "price_action"
+        values["defaults_version"] = SETTINGS_DEFAULTS_VERSION
+        return cls(**values)
 
     def with_changes(self, **changes: Any) -> "TradingSettings":
         return replace(self, **changes)

@@ -20,6 +20,7 @@ AUTOTRADE_COMMANDS = [
     {"command": "at_start", "description": "Start your auto-trading bot"},
     {"command": "at_stop", "description": "Stop your auto-trading bot"},
     {"command": "at_stats", "description": "Today's trades and results"},
+    {"command": "at_balance", "description": "Your Pocket Option balance (fresh reading)"},
     {"command": "at_set", "description": "Change stake, expiry, limits, cooldown"},
     {"command": "at_live", "description": "Switch to Live (real money)"},
     {"command": "at_demo", "description": "Switch back to Demo"},
@@ -42,7 +43,6 @@ SETTINGS: dict[str, tuple[str, type]] = {
     "take_profit": ("daily_take_profit", float),
     "cooldown": ("cooldown_seconds", int),
     "min_payout": ("min_payout", int),
-    "gap": ("gap_threshold", float),
     "follow": ("follow_signals", bool),
 }
 ON_WORDS, OFF_WORDS = {"on", "yes", "true", "1"}, {"off", "no", "false", "0"}
@@ -50,10 +50,10 @@ SET_USAGE = (
     "Usage: /at_set <name> <value>\n"
     "  stake 2         amount per trade\n"
     "  expiry 60       fixed 1-minute trade length\n"
-    "  max_trades 1    open trades at once (1-5)\n"
+    "  max_trades 2    open trades at once (1-5)\n"
     "  stop_loss 10    stop for the day after losing this much\n"
     "  take_profit 20  stop for the day after winning this much\n"
-    "  cooldown 60     seconds between trades (5-3600)\n"
+    "  cooldown 5      seconds between trades (5-3600)\n"
     "  min_payout 80   skip trades below this payout % (50-100)\n"
     "  follow on       place the GBot signals you receive (off = bot's own engine)"
 )
@@ -118,6 +118,35 @@ def _balance_line(bot: dict[str, Any]) -> str | None:
     return f"Balance ({account}): {float(value):,.2f}"
 
 
+def _when(iso: Any) -> str:
+    text = str(iso or "")
+    return f"{text[:10]} {text[11:16]} UTC" if len(text) >= 16 else ""
+
+
+def balance_text(data: dict[str, Any]) -> str:
+    account = "Real" if data.get("account") == "real" else "Demo"
+    value = data.get("balance")
+    if not isinstance(value, (int, float)):
+        reason = BALANCE_ERRORS.get(str(data.get("error")), "Try again in a minute.")
+        return f"💰 Balance ({account}): not available yet.\n{reason}"
+    if data.get("fresh"):
+        return f"💰 Balance ({account}): {float(value):,.2f}\nUpdated just now."
+    reason = BALANCE_ERRORS.get(str(data.get("error")), "")
+    when = _when(data.get("at"))
+    return (f"💰 Last known balance ({account}): {float(value):,.2f}" + (f"\nFrom {when}." if when else "")
+            + (f"\nA fresh reading wasn't possible: {reason}" if reason else ""))
+
+
+BALANCE_ERRORS = {
+    "no_session": "Your Pocket Option account isn't connected. Send /at_login first.",
+    "session_expired": "Your Pocket Option session has expired. Send /at_login to connect again.",
+    "session_unreadable": "Your saved session can't be read. Send /at_login to connect again.",
+    "broker_unreachable": "Pocket Option couldn't be reached. Try again in a minute.",
+    "bot_not_connected": "Your bot is reconnecting to Pocket Option. Try again in a minute.",
+    "balance_unavailable": "Pocket Option didn't report a balance. Try again in a minute.",
+}
+
+
 def results_line(label: str, counts: dict[str, Any], pnl: Any) -> str:
     return (f"{label}: {counts.get('trades', 0)} trades · {counts.get('wins', 0)} wins · "
             f"{counts.get('losses', 0)} losses · {counts.get('draws', 0)} break-even · P/L {_money(pnl)}")
@@ -170,9 +199,56 @@ def stats_text(stats: dict[str, Any]) -> str:
 
 
 class AutotradeCommands:
-    def __init__(self, client: AutotradeClient | None, send: Send) -> None:
+    def __init__(self, client: AutotradeClient | None, send: Send, roster: Any = None) -> None:
         self.client = client
         self._send = send
+        self.roster = roster          # AutotradeRoster: who gets trades instead of signal cards
+
+    def _roster_add(self, uid: int) -> None:
+        if self.roster is not None:
+            self.roster.add(uid)
+
+    def _roster_discard(self, uid: int) -> None:
+        if self.roster is not None:
+            self.roster.discard(uid)
+
+    def login_markup(self, uid: int) -> dict[str, Any]:
+        assert self.client is not None
+        link = self.client.login_link(uid)
+        button: dict[str, Any] = (
+            {"text": "Log in to Pocket Option", "web_app": {"url": link}} if link.startswith("https://")
+            else {"text": "Log in to Pocket Option", "url": link})
+        return {"inline_keyboard": [[button]]}
+
+    async def enable_follow(self, uid: int) -> tuple[bool, str, dict[str, Any] | None]:
+        """Menu "Start Auto-Trade": place GBot signals for this user automatically.
+        Returns (started, message, optional login button)."""
+        if self.client is None:
+            return False, NOT_SET_UP, None
+        try:
+            current = await self.client.settings(uid)
+            if not current.get("follow_signals", True):
+                await self.client.update_settings(uid, {"follow_signals": True})
+            await self.client.start(uid)
+            stats = await self.client.stats(uid)
+        except AutotradeError as exc:
+            logger.warning("Auto-trade start from the menu failed (%s %s).", exc.status, exc.code)
+            if exc.code == "reauth_required":
+                return False, ("Connect your Pocket Option account first: tap the button below, sign in, "
+                               "then tap 🤖 Start Auto-Trade again."), self.login_markup(uid)
+            return False, error_text(exc), None
+        self._roster_add(uid)
+        return True, str(stats.get("mode", "demo")).upper(), None
+
+    async def disable(self, uid: int) -> None:
+        """Back to signal cards at once; the bot stops in the background (open trades finish first)."""
+        self._roster_discard(uid)
+        if self.client is None:
+            return
+        try:
+            await self.client.stop(uid)
+        except AutotradeError as exc:
+            logger.warning("Auto-trade stop failed (%s %s).", exc.status, exc.code)
 
     async def reply(self, chat_id: int, text: str, markup: dict[str, Any] | None = None) -> None:
         await self._send(chat_id, text, reply_markup=markup)
@@ -199,27 +275,30 @@ class AutotradeCommands:
         if command == "autotrade":
             stats = await c.stats(uid)
             await self.reply(chat_id, overview_text(stats) + "\n\nCommands: /at_login /at_start /at_stop "
-                             "/at_stats /at_set /at_live /at_demo /at_logout")
+                             "/at_stats /at_balance /at_set /at_live /at_demo /at_logout")
         elif command == "at_login":
-            link = c.login_link(uid)
             # Inside Telegram as a Mini App when the service is on HTTPS; plain link otherwise (local testing).
-            button: dict[str, Any] = (
-                {"text": "Log in to Pocket Option", "web_app": {"url": link}} if link.startswith("https://")
-                else {"text": "Log in to Pocket Option", "url": link})
             await self.reply(chat_id, "Tap the button to log in to Pocket Option. The link works for 15 minutes "
-                             "and is only for you, so don't forward it. After logging in, send /at_start.",
-                             {"inline_keyboard": [[button]]})
+                             "and is only for you, so don't forward it. After logging in, pick an asset with "
+                             "/start and tap 🤖 Start Auto-Trade (or send /at_start).",
+                             self.login_markup(uid))
         elif command == "at_start":
             await c.start(uid)
             stats = await c.stats(uid)
+            if stats.get("settings", {}).get("follow_signals", True):
+                self._roster_add(uid)
             await self.reply(chat_id, f"Your bot is running in {str(stats.get('mode', 'demo')).upper()} mode.\n\n"
                              + settings_summary(stats.get("settings", {})))
         elif command == "at_stop":
+            self._roster_discard(uid)
             await self.reply(chat_id, "Stopping… open trades are allowed to finish first.")
             await c.stop(uid)
             await self.reply(chat_id, "Your bot is stopped.")
         elif command == "at_stats":
             await self.reply(chat_id, stats_text(await c.stats(uid)))
+        elif command == "at_balance":
+            await self.reply(chat_id, "Checking your balance…")
+            await self.reply(chat_id, balance_text(await c.balance(uid, fresh=True)))
         elif command == "at_set":
             await self._set(chat_id, uid, args)
         elif command == "at_live":
@@ -232,6 +311,7 @@ class AutotradeCommands:
             s = await c.update_settings(uid, {"mode": "demo"})
             await self.reply(chat_id, "Demo mode is on.\n\n" + settings_summary(s))
         elif command == "at_logout":
+            self._roster_discard(uid)
             await c.revoke(uid)
             await self.reply(chat_id, "Your bot is stopped and your Pocket Option session was deleted. "
                              "Send /at_login to connect again.")

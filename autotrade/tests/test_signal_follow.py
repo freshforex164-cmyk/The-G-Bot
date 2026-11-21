@@ -84,17 +84,27 @@ class SignalApiTests(unittest.TestCase):
         self.app = create_app(self.env.rt, background=False)
         self.full = {"Authorization": "Bearer " + token(self.env.cfg.jwt_secret)}
         self.login = {"Authorization": "Bearer " + token(self.env.cfg.jwt_secret, scope="login")}
+        self.signal = {"Authorization": "Bearer " + token(self.env.cfg.jwt_secret, scope="signal")}
 
-    def test_signal_endpoint_requires_a_full_token_and_validates_input(self):
+    def test_signal_endpoint_only_accepts_signal_tokens_and_validates_input(self):
         body = {"signal_id": "abc123", "asset": "DOGE_otc", "direction": "BUY", "expiry_seconds": 60,
                 "setup": "UP_CONTINUATION_BUY"}
         with TestClient(self.app, base_url="https://testserver") as c:
             self.assertEqual(c.post("/trading/signal", json=body, headers=self.login).status_code, 403)
-            ok = c.post("/trading/signal", json=body, headers=self.full)
+            self.assertEqual(c.post("/trading/signal", json=body, headers=self.full).status_code, 403)
+            ok = c.post("/trading/signal", json=body, headers=self.signal)
             self.assertEqual(ok.status_code, 200)
             self.assertEqual(ok.json(), {"accepted": False, "reason": "not_running"})
-            bad = c.post("/trading/signal", json={**body, "expiry_seconds": 120}, headers=self.full)
+            bad = c.post("/trading/signal", json={**body, "expiry_seconds": 120}, headers=self.signal)
             self.assertEqual(bad.status_code, 422)
+
+    def test_signal_tokens_cannot_use_any_other_route(self):
+        with TestClient(self.app, base_url="https://testserver") as c:
+            self.assertEqual(c.get("/trading/stats", headers=self.signal).status_code, 403)
+            self.assertEqual(c.post("/trading/start", headers=self.signal).status_code, 403)
+            self.assertEqual(c.get("/trading/balance", headers=self.signal).status_code, 403)
+            self.assertEqual(c.post("/auth/handshake", headers=self.signal).status_code, 403)
+            self.assertEqual(c.get("/trading/active", headers=self.signal).status_code, 403)
 
 
 class ProxyHttpsLoginTests(unittest.TestCase):

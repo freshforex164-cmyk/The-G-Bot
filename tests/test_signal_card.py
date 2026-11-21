@@ -6,6 +6,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from autotrade_client import AutotradeRoster
 from autotrade_commands import stats_text
 from notifications import format_signal_message
 from strategy.model import Signal
@@ -49,7 +50,7 @@ class FakeAutotrade:
 
 
 class AutotradeHandoffTests(unittest.IsolatedAsyncioTestCase):
-    async def test_delivered_signal_goes_to_each_private_subscriber_bot(self):
+    async def test_only_auto_traders_get_hand_offs_and_they_get_no_card(self):
         sent = []
 
         async def send_message(chat_id, text):
@@ -57,16 +58,41 @@ class AutotradeHandoffTests(unittest.IsolatedAsyncioTestCase):
         client = SimpleNamespace(send_message=send_message)
         store = SimpleNamespace(subscribed_chat_ids=lambda pair: [111, -100200, 222])
         autotrade = FakeAutotrade()
-        fanout = SubscriberFanoutNotifier(client, store, max_messages_per_second=1000, autotrade=autotrade)
+        roster = AutotradeRoster(autotrade)
+        roster._ids, roster._fetched_at = {222, -100200}, roster._clock()
+        fanout = SubscriberFanoutNotifier(client, store, max_messages_per_second=1000, autotrade=autotrade,
+                                          roster=roster)
         signal = make_signal("SELL", "DOWN_CONTINUATION_SELL")
         await fanout.send(signal)
         await asyncio.gather(*list(fanout._autotrade_tasks))
-        self.assertEqual(sent, [111, -100200, 222])
-        self.assertEqual(sorted(uid for uid, _ in autotrade.calls), [111, 222])   # never group chats
+        self.assertEqual(sent, [111, -100200])                          # 222 auto-trades: no raw card
+        self.assertEqual([uid for uid, _ in autotrade.calls], [222])    # never 111 (signals) or groups
         payload = autotrade.calls[0][1]
         self.assertEqual((payload["signal_id"], payload["asset"], payload["direction"], payload["expiry_seconds"]),
                          (signal.id, "DOGE_otc", "SELL", 60))
-        self.assertEqual(fanout.autotrade_accepted, 2)
+        self.assertEqual((payload["setup"], payload["asset_name"]), ("Downtrend Continuation", "Dogecoin OTC"))
+        self.assertEqual(fanout.autotrade_accepted, 1)
+
+    async def test_stopped_bot_falls_back_to_the_signal_card(self):
+        sent = []
+
+        async def send_message(chat_id, text):
+            sent.append(chat_id)
+
+        class NotRunning(FakeAutotrade):
+            async def submit_signal(self, uid, payload):
+                self.calls.append((uid, payload))
+                return {"accepted": False, "reason": "not_running"}
+        autotrade = NotRunning()
+        roster = AutotradeRoster(autotrade)
+        roster._ids, roster._fetched_at = {222}, roster._clock()
+        fanout = SubscriberFanoutNotifier(SimpleNamespace(send_message=send_message),
+                                          SimpleNamespace(subscribed_chat_ids=lambda pair: [222]),
+                                          max_messages_per_second=1000, autotrade=autotrade, roster=roster)
+        await fanout.send(make_signal())
+        await asyncio.gather(*list(fanout._autotrade_tasks))
+        self.assertEqual(sent, [222])
+        self.assertFalse(roster.is_active(222))
 
 
 class StatsTextTests(unittest.TestCase):

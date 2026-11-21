@@ -26,7 +26,7 @@ import re
 
 from ..clock import Clock
 from ..config import Config
-from .ssid import DEMO_KIND, KINDS, REAL_KIND, account_kind, build_ssid, parse_ssid, with_kind
+from .ssid import DEMO_KIND, KINDS, REAL_KIND, account_kind, build_ssid, parse_ssid
 from .session_state import broker_domain, sanitize_browser_session
 
 log = logging.getLogger("autotrade.handshake")
@@ -38,8 +38,24 @@ CABINET_URL = {  # which page makes the web app connect as that account type (ad
 }
 ALLOWED_HOSTS = ("pocketoption.com", "po.market", "po.cash", "google.com", "gstatic.com", "recaptcha.net",
                  "googleusercontent.com", "youtube.com")
+BROKER_HOSTS = ("pocketoption.com", "po.market", "po.cash")
+# Google sign-in and CAPTCHA must render fully, or the user cannot solve a challenge.
+VERIFICATION_HOSTS = ("google.com", "gstatic.com", "recaptcha.net", "googleusercontent.com")
+# Low-memory mode (Render 512 MB): one Chromium process, small JS heap, no GPU/shared-memory use.
+LOW_MEMORY_ARGS = (
+    "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+    "--single-process", "--no-zygote", "--js-flags=--max-old-space-size=256",
+    "--enable-low-end-device-mode", "--disable-software-rasterizer", "--disable-extensions",
+    "--disable-background-networking", "--disable-component-update", "--disable-default-apps",
+    "--disable-sync", "--mute-audio", "--no-first-run", "--disable-breakpad",
+    "--disable-features=site-per-process,IsolateOrigins,Translate,BackForwardCache,MediaRouter,OptimizationHints",
+    "--renderer-process-limit=1",
+)
+BLOCKED_RESOURCE_TYPES = frozenset({"image", "font", "media", "stylesheet"})
+CLOSE_TIMEOUT = 10.0
 VIEWPORT = {"width": 390, "height": 844}     # a phone: the site serves its mobile login layout
 DEVICE_SCALE = 2
+LOW_MEMORY_DEVICE_SCALE = 1
 MIN_VIEW, MAX_VIEW = (320, 480), (520, 1100)   # accepted phone screen sizes (CSS px)
 MOBILE_UA = ("Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) "
              "Chrome/130.0.0.0 Mobile Safari/537.36")
@@ -97,7 +113,9 @@ NOTICE_JS = """() => {
 }"""
 ERROR_MESSAGES = {
     "broker_unreachable": "Pocket Option did not respond in time. Try again in a minute.",
-    "browser_unavailable": "The secure sign-in browser could not start on the server. Please contact support.",
+    "browser_unavailable": "The secure sign-in browser could not start on the server. Try again in a minute.",
+    "browser_crashed": "The secure sign-in browser stopped unexpectedly (the server ran short of memory). "
+                       "Nothing was saved. Try again in a minute.",
     "login_timeout": "The sign-in took too long and was closed. Send /at_login for a new link.",
     "store_failed": "You signed in, but the session could not be saved. Send /at_login to try again.",
     "capture_failed": "The sign-in could not be completed. Send /at_login to try again.",
@@ -137,15 +155,47 @@ def host_allowed(url: str, *, navigation: bool, hosts: tuple[str, ...] = ALLOWED
     return True
 
 
+class BrowserCrashed(RuntimeError):
+    """Chromium died (usually out of memory) while the login was in progress."""
+
+
+def _host_in(host: str, hosts: tuple[str, ...]) -> bool:
+    return any(host == h or host.endswith("." + h) for h in hosts)
+
+
+def launch_args(low_memory: bool) -> list[str]:
+    args = ["--disable-blink-features=AutomationControlled"]
+    if low_memory:
+        args += list(LOW_MEMORY_ARGS)
+    return args
+
+
+def should_block(url: str, resource_type: str, *, block_assets: bool, block_third_party: bool) -> bool:
+    """Login only needs the broker's HTML and scripts. Pictures, fonts, media and stylesheets (and
+    third-party trackers) are dropped to keep Chromium small; Google/CAPTCHA pages stay complete."""
+    p = urlparse(url)
+    if p.scheme in ("data", "blob", "about"):
+        return False
+    host = (p.hostname or "").lower()
+    if _host_in(host, VERIFICATION_HOSTS):
+        return False
+    if block_assets and resource_type in BLOCKED_RESOURCE_TYPES:
+        return True
+    return block_third_party and not _host_in(host, BROKER_HOSTS)
+
+
 class PlaywrightBackend:
-    def __init__(self, headless: bool = True, hosts: tuple[str, ...] = ALLOWED_HOSTS, login_url: str = LOGIN_URL):
+    def __init__(self, headless: bool = True, hosts: tuple[str, ...] = ALLOWED_HOSTS, login_url: str = LOGIN_URL,
+                 *, low_memory: bool = True, block_assets: bool = True, block_third_party: bool = True):
         self._headless, self._hosts, self._login_url = headless, hosts, login_url
+        self._low_memory, self._block_assets, self._block_third_party = low_memory, block_assets, block_third_party
         self._vp = dict(VIEWPORT)
         self._pw = self._browser = self._context = None
         self._pages: list[Any] = []
         self._frames: dict[str, str] = {}
         self._event = asyncio.Event()
         self._credential_lock = asyncio.Lock()
+        self._crashed = False
 
     def set_viewport(self, width: int, height: int) -> None:
         """Match the user's own screen so the site fills the phone edge to edge. Before open()."""
@@ -157,12 +207,14 @@ class PlaywrightBackend:
 
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(
-            headless=self._headless, args=["--disable-blink-features=AutomationControlled"])
+            headless=self._headless, args=launch_args(self._low_memory), timeout=60000)
+        self._browser.on("disconnected", lambda _b: self._mark_crashed())
         # A fresh, non-persistent context per handshake: no shared cookies, nothing written to disk.
         # Phone emulation (touch, mobile user agent) makes the site serve its standard mobile web layout.
         self._context = await self._browser.new_context(
-            viewport=self._vp, device_scale_factor=DEVICE_SCALE, is_mobile=True, has_touch=True,
-            user_agent=MOBILE_UA, locale="en-US", accept_downloads=False)
+            viewport=self._vp, device_scale_factor=LOW_MEMORY_DEVICE_SCALE if self._low_memory else DEVICE_SCALE,
+            is_mobile=True, has_touch=True, user_agent=MOBILE_UA, locale="en-US", accept_downloads=False,
+            service_workers="block")
         await self._context.route("**/*", self._route)
         self._context.on("page", self._attach)
         page = await self._context.new_page()
@@ -175,13 +227,28 @@ class PlaywrightBackend:
 
     async def _route(self, route, request) -> None:
         nav = request.is_navigation_request()
-        if host_allowed(request.url, navigation=nav, hosts=self._hosts):
-            await route.continue_()
-        else:
-            await route.abort()
+        try:
+            if not host_allowed(request.url, navigation=nav, hosts=self._hosts) or (
+                    not nav and should_block(request.url, request.resource_type, block_assets=self._block_assets,
+                                             block_third_party=self._block_third_party)):
+                await route.abort()
+            else:
+                await route.continue_()
+        except Exception:       # page closed while routing: nothing left to do
+            pass
+
+    def _mark_crashed(self) -> None:
+        if self._browser is not None:     # close() clears it first, so a normal shutdown is not a crash
+            self._crashed = True
+            self._event.set()
+
+    def _check_alive(self) -> None:
+        if self._crashed:
+            raise BrowserCrashed("the browser stopped")
 
     def _attach(self, page) -> None:
         self._pages.append(page)
+        page.on("crash", lambda _p: self._mark_crashed())
         page.on("websocket", lambda ws: ws.on("framesent", self._on_frame))
         page.on("close", lambda _p=page: self._pages.remove(_p) if _p in self._pages else None)
 
@@ -208,7 +275,7 @@ class PlaywrightBackend:
         page = self._page
         if page is None:
             raise RuntimeError("browser is not open")
-        return await page.screenshot(type="jpeg", quality=60)
+        return await page.screenshot(type="jpeg", quality=50 if self._low_memory else 60)
 
     async def view(self) -> dict[str, Any]:
         """Phone viewport size, the focused input (if any) and which site is showing. Never a password."""
@@ -220,10 +287,12 @@ class PlaywrightBackend:
             inputs = await page.evaluate(INPUTS_JS)
         except Exception:      # page is navigating
             field, inputs = None, []
-        try:
-            notice = await page.evaluate(NOTICE_JS)
-        except Exception:
-            notice = None
+        notice = None
+        if "login" in (urlparse(page.url).path if page.url else ""):   # cabinet banners are not login feedback
+            try:
+                notice = await page.evaluate(NOTICE_JS)
+            except Exception:
+                notice = None
         host = (urlparse(page.url).hostname or "") if page.url else ""
         return {"width": self._vp["width"], "height": self._vp["height"], "field": field,
                 "inputs": inputs, "host": host, "notice": notice}
@@ -263,6 +332,7 @@ class PlaywrightBackend:
         deadline = loop.time() + timeout
         on_status("waiting_for_login")
         while not self._frames:
+            self._check_alive()
             remaining = deadline - loop.time()
             if remaining <= 0:
                 cookie = await self._session_cookie()
@@ -274,29 +344,30 @@ class PlaywrightBackend:
                 await asyncio.wait_for(self._event.wait(), timeout=min(remaining, 2.0))
             except asyncio.TimeoutError:
                 pass
+        self._check_alive()
         on_status("capturing")
         have = next(iter(self._frames))
         other = REAL_KIND if have == DEMO_KIND else DEMO_KIND
-        # Ask the web app to connect as the other account type to capture its genuine frame.
+        # Ask the web app to connect as the other account type to capture its genuine frame. Demo and Real
+        # use different session values (verified live), so the other kind can never be derived from this one.
         self._event.clear()
         try:
             await self._page.goto(CABINET_URL[other], wait_until="domcontentloaded", timeout=30000)
             end = loop.time() + 20
-            while other not in self._frames and loop.time() < end:
-                await asyncio.sleep(0.5)
+            while other not in self._frames and loop.time() < end and not self._crashed:
+                await asyncio.sleep(0.25)
         except Exception:
-            log.info("could not switch account type in the browser; deriving instead")
-        derived: list[str] = []
-        if other not in self._frames:
-            alt = with_kind(self._frames[have], other)   # same session, other isDemo flag
-            if alt:
-                self._frames[other] = alt
-                derived.append(other)
+            log.info("could not switch account type in the browser; keeping the %s session only", have)
+        if self._crashed and not self._frames:
+            raise BrowserCrashed("the browser stopped")
         tokens = {k: self._frames[k] for k in KINDS if k in self._frames}
-        return tokens, await self._capture_metadata("websocket", derived)
+        return tokens, await self._capture_metadata("websocket", [])
 
     async def _capture_metadata(self, method, derived):
-        state = {"cookies": await self._context.cookies()} if self._context else {"cookies": []}
+        try:
+            state = {"cookies": await self._context.cookies()} if self._context else {"cookies": []}
+        except Exception:      # browser already gone: the session frames are what matter
+            state = {"cookies": []}
         return {"method": method, "derived": derived, "_browser_session": sanitize_browser_session(state)}
 
     async def submit_credentials(self, email: str, password: str) -> None:
@@ -343,15 +414,20 @@ class PlaywrightBackend:
         return None
 
     async def close(self) -> None:
+        """Always frees Chromium, even if it hangs: every step is time-boxed and stopping Playwright
+        kills any browser process that is still alive."""
         self._frames.clear()
-        for obj, method in ((self._context, "close"), (self._browser, "close"), (self._pw, "stop")):
-            if obj is not None:
-                try:
-                    await getattr(obj, method)()
-                except Exception:
-                    pass
-        self._pw = self._browser = self._context = None
-        self._pages.clear()
+        context, browser, pw = self._context, self._browser, self._pw
+        self._pw = self._browser = self._context = None       # from here on a disconnect is not a crash
+        pages, self._pages = list(self._pages), []
+        steps = [(p, "close") for p in pages] + [(context, "close"), (browser, "close"), (pw, "stop")]
+        for obj, method in steps:
+            if obj is None:
+                continue
+            try:
+                await asyncio.wait_for(getattr(obj, method)(), timeout=CLOSE_TIMEOUT)
+            except Exception:
+                pass
 
 
 @dataclass
@@ -464,7 +540,9 @@ class HandshakeManager:
                 text = str(exc).lower()
                 # Playwright's TimeoutError is not the builtin one; network errors arrive as "net::ERR_*".
                 unreachable = "timeout" in name.lower() or "net::" in text or "err_" in text
-                s.state, s.error = "failed", "broker_unreachable" if unreachable else "browser_unavailable"
+                crashed = isinstance(exc, BrowserCrashed) or "crash" in text or "closed" in text
+                s.state, s.error = "failed", ("broker_unreachable" if unreachable else
+                                              "browser_crashed" if crashed else "browser_unavailable")
                 log.warning("handshake browser could not open the broker page: %s", name)
                 return
             s.state = "waiting_for_login"
@@ -472,11 +550,16 @@ class HandshakeManager:
         except asyncio.CancelledError:
             s.state = "cancelled"
             return
+        except BrowserCrashed:
+            s.state, s.error = "failed", "browser_crashed"
+            log.warning("handshake browser crashed (likely out of memory)")
+            return
         except TimeoutError:
             s.state, s.error = "timeout", "login_timeout"
             return
         except Exception as exc:
-            s.state, s.error = "failed", "capture_failed"
+            crashed = "closed" in str(exc).lower() or "crash" in str(exc).lower()
+            s.state, s.error = "failed", "browser_crashed" if crashed else "capture_failed"
             log.warning("handshake failed: %s", type(exc).__name__)
             return
         finally:

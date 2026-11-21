@@ -194,6 +194,11 @@
       msg("Signing in…");
       const r = await api(`auth/handshake/${sid}/credentials`, { method:"POST", body:payload });
       if (r.status === 401) return expired();
+      if (r.status === 429) {
+        const text = await errorText(r, "Too many sign-in attempts. Wait a few minutes and try again.");
+        const id = sid; sid = null; api(`auth/handshake/${id}`, { method: "DELETE" }).catch(() => null);
+        return showResult("bad", "Please wait", text, true);
+      }
       if (!r.ok) {
         msg(await errorText(r, "Could not submit sign-in.") + " You can finish on the Pocket Option page below.", "bad");
         return;
@@ -306,13 +311,21 @@
   stage.addEventListener("pointercancel", end);
 
   // ---- progress ---------------------------------------------------------------------------------------
+  let statusFailures = 0;
   async function refreshStatus() {
     if (!sid || ended) return;
     const r = await api(`auth/handshake/${sid}`).catch(() => null);
-    if (!r) return;
-    if (r.status === 401) return expired();
-    if (!r.ok) return;
-    const s = await r.json();
+    if (r && r.status === 401) return expired();
+    if (r && r.status === 404) {          // the server restarted (e.g. ran out of memory): the session is gone
+      return showResult("bad", "Sign-in interrupted", "The sign-in server restarted before your login finished. Nothing was saved. Try again.", true);
+    }
+    if (!r || !r.ok) {
+      if (++statusFailures >= 6) showResult("bad", "Sign-in server not responding", "The sign-in server stopped responding. Nothing was saved. Try again in a minute.", true);
+      return;
+    }
+    statusFailures = 0;
+    let s;
+    try { s = await r.json(); } catch (e) { return; }
     if (s.state === "starting") msg("Opening the login page…");
     else if (s.state === "waiting_for_login") { if (!submittedAt) msg("Log in as you normally would (email and password, or Google)."); }
     else if (s.state === "capturing") msg("Logged in. Saving your Demo and Real sessions…");

@@ -15,6 +15,7 @@ from ..trading.broker import TradeOutcome
 from ..trading.models import Decision, TradingSettings
 from unittest.mock import patch
 from ..vault.crypto import KeyRing
+from ..notify import RecordingNotifier
 
 
 class FakeClock(Clock):
@@ -123,6 +124,9 @@ class FakeBroker:
 
 
 
+SCRIPTED_GAP = 0.0015
+
+
 class ScriptedDecision:
     """Test-only order input for risk/session tests, independent of production strategy rules."""
     name = "scripted"
@@ -132,7 +136,7 @@ class ScriptedDecision:
 
     def on_tick(self, ticks, s):
         real, otc = ticks.get(s.symbol_real), ticks.get(s.symbol_otc)
-        if real is None or otc is None or abs(real.price - otc.price) < s.gap_threshold:
+        if real is None or otc is None or abs(real.price - otc.price) < SCRIPTED_GAP:
             return None
         return Decision(s.symbol_otc, "CALL" if real.price > otc.price else "PUT", 60, "scripted test decision")
 
@@ -155,10 +159,11 @@ class Env:
         os.environ["AUTOTRADE_FEED_SSID"] = ssid_for("feed")
         self.cfg = Config(jwt_secret="x" * 40, allow_live=allow_live, handshake_timeout=5)
         self.repo = EngineModeRepository() if engine_mode else InMemoryRepository()
+        self.alerts = RecordingNotifier()
         self.rt = build_runtime(
             self.cfg, repo=self.repo, keyring=KeyRing({1: os.urandom(32)}, 1),
             broker_factory=lambda ssid: FakeBroker(ssid, self.worlds, self.bus),
-            backend_factory=lambda: None, clock=self.clock, reconnect_base=0.02)
+            backend_factory=lambda: None, clock=self.clock, reconnect_base=0.02, notifier=self.alerts)
 
     def world(self, name: str) -> World:
         return self.worlds.setdefault(f"sess-{name}", World())

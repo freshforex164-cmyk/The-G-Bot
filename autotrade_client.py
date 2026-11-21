@@ -20,6 +20,9 @@ from typing import Any, Callable
 
 API_TOKEN_TTL_SECONDS = 120
 LOGIN_LINK_TTL_SECONDS = 900          # the /at_login link works for 15 minutes
+SIGNAL_TOKEN_TTL_SECONDS = 30         # a signal hand-off token only places that one signal
+SERVICE_SUBJECT = "service:gbot"      # GBot itself, for the "who is auto-trading" list
+ROSTER_MAX_AGE_SECONDS = 20.0
 
 
 def _b64(data: bytes) -> str:
@@ -75,10 +78,11 @@ class AutotradeClient:
             return None
         return cls(url, secret, public_url=os.environ.get("AUTOTRADE_PUBLIC_URL", "").strip() or None)
 
-    def token(self, telegram_user_id: int | str, *, scope: str = "full", admin: bool = False) -> str:
+    def token(self, telegram_user_id: int | str | None, *, scope: str = "full", admin: bool = False) -> str:
         now = int(self._clock())
-        ttl = LOGIN_LINK_TTL_SECONDS if scope == "login" else API_TOKEN_TTL_SECONDS
-        claims: dict[str, Any] = {"sub": service_user_id(telegram_user_id), "iat": now, "exp": now + ttl}
+        ttl = {"login": LOGIN_LINK_TTL_SECONDS, "signal": SIGNAL_TOKEN_TTL_SECONDS}.get(scope, API_TOKEN_TTL_SECONDS)
+        sub = SERVICE_SUBJECT if scope == "service" else service_user_id(telegram_user_id)  # type: ignore[arg-type]
+        claims: dict[str, Any] = {"sub": sub, "iat": now, "exp": now + ttl}
         if scope != "full":
             claims["scope"] = scope
         if admin and scope == "full":
@@ -121,9 +125,9 @@ class AutotradeClient:
         return AutotradeError(status, {401: "unauthorized", 403: "forbidden", 404: "not_found"}.get(status, "error"),
                               str(detail or ""))
 
-    async def _call(self, method: str, path: str, telegram_user_id: int | str, body: Any = None, *,
-                    admin: bool = False, timeout: float | None = None) -> Any:
-        token = self.token(telegram_user_id, admin=admin)
+    async def _call(self, method: str, path: str, telegram_user_id: int | str | None, body: Any = None, *,
+                    admin: bool = False, timeout: float | None = None, scope: str = "full") -> Any:
+        token = self.token(telegram_user_id, admin=admin, scope=scope)
         return await asyncio.to_thread(self._request_sync, method, path, token, body, timeout or self._timeout)
 
     async def start(self, uid: int | str) -> dict[str, Any]:
@@ -143,8 +147,23 @@ class AutotradeClient:
         return await self._call("GET", "/trading/stats", uid)
 
     async def submit_signal(self, uid: int | str, signal: dict[str, Any]) -> dict[str, Any]:
-        """Hand a signal this user just received to their running auto-trading bot (if any)."""
-        return await self._call("POST", "/trading/signal", uid, signal, timeout=6)
+        """Hand a signal to this user's running auto-trading bot. Uses a short-lived signal-only token."""
+        return await self._call("POST", "/trading/signal", uid, signal, timeout=6, scope="signal")
+
+    async def balance(self, uid: int | str, fresh: bool = True) -> dict[str, Any]:
+        return await self._call("GET", f"/trading/balance?fresh={'true' if fresh else 'false'}", uid, timeout=45)
+
+    async def active_users(self) -> set[int]:
+        """Telegram ids of users who are auto-trading GBot signals right now."""
+        data = await self._call("GET", "/trading/active", None, timeout=5, scope="service")
+        ids: set[int] = set()
+        for user in (data or {}).get("users", []):
+            if isinstance(user, str) and user.startswith("tg:"):
+                try:
+                    ids.add(int(user[3:]))
+                except ValueError:
+                    pass
+        return ids
 
     async def revoke(self, uid: int | str) -> None:
         await self._call("DELETE", "/auth/sessions", uid)
@@ -154,3 +173,49 @@ class AutotradeClient:
 
     async def resume(self, admin_uid: int | str) -> None:
         await self._call("POST", "/admin/resume", admin_uid, admin=True)
+
+
+class AutotradeRoster:
+    """GBot's cached copy of the service's "who is auto-trading" list.
+
+    Signals for chats on this list are handed to the auto-trade service (and their raw cards are not
+    sent); everyone else gets the normal card. Local start/stop updates apply at once; the list is
+    re-read from the service when older than ``max_age`` seconds. If the service cannot be reached,
+    the last known list is kept, so nobody is switched by a network hiccup."""
+
+    def __init__(self, client: AutotradeClient | None, *, max_age: float = ROSTER_MAX_AGE_SECONDS,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self.client, self.max_age, self._clock = client, max_age, clock
+        self._ids: set[int] = set()
+        self._fetched_at: float | None = None
+        self._lock = asyncio.Lock()
+
+    def active_ids(self) -> set[int]:
+        return set(self._ids)
+
+    def is_active(self, chat_id: int) -> bool:
+        return int(chat_id) in self._ids
+
+    def add(self, chat_id: int) -> None:
+        self._ids.add(int(chat_id))
+
+    def discard(self, chat_id: int) -> None:
+        self._ids.discard(int(chat_id))
+
+    @property
+    def stale(self) -> bool:
+        return self._fetched_at is None or self._clock() - self._fetched_at > self.max_age
+
+    async def refresh(self, timeout: float = 3.0) -> bool:
+        if self.client is None:
+            return False
+        async with self._lock:
+            if not self.stale:
+                return True
+            try:
+                ids = await asyncio.wait_for(self.client.active_users(), timeout=timeout)
+            except Exception:
+                self._fetched_at = self._clock() - self.max_age / 2    # retry soon, keep the old list
+                return False
+            self._ids, self._fetched_at = ids, self._clock()
+            return True

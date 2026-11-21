@@ -53,10 +53,11 @@ class FakeService:
         self.calls: list[tuple] = []
         self.fail: AutotradeError | None = None
         self.stop_gate: asyncio.Event | None = None
-        self.settings_data = {"mode": "demo", "stake": 1.0, "expiry_seconds": 60, "max_concurrent": 1,
-                              "cooldown_seconds": 60, "daily_stop_loss": 10.0, "daily_take_profit": 20.0,
-                              "min_payout": 80, "strategy": "gap", "symbol_otc": "EURUSD_otc",
-                              "gap_threshold": 0.0015}
+        self.settings_data = {"mode": "demo", "stake": 1.0, "expiry_seconds": 60, "max_concurrent": 2,
+                              "cooldown_seconds": 5, "daily_stop_loss": 10.0, "daily_take_profit": 20.0,
+                              "min_payout": 80, "strategy": "price_action", "symbol_otc": "EURUSD_otc",
+                              "follow_signals": True}
+        self.balance_data = {"account": "demo", "balance": 9.0, "fresh": True, "at": "2026-11-21T08:00:00+00:00"}
 
     def _record(self, *call):
         self.calls.append(call)
@@ -93,6 +94,14 @@ class FakeService:
 
     async def revoke(self, uid):
         self._record("revoke", uid)
+
+    async def balance(self, uid, fresh=True):
+        self._record("balance", uid, fresh)
+        return self.balance_data
+
+    async def active_users(self):
+        self._record("active_users")
+        return set()
 
     async def halt(self, uid):
         self._record("halt", uid)

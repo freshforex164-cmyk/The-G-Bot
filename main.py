@@ -11,7 +11,7 @@ from typing import Sequence
 
 import config
 from admin_http import AdminHttpServer
-from autotrade_client import AutotradeClient
+from autotrade_client import AutotradeClient, AutotradeRoster
 from autotrade_commands import AUTOTRADE_ADMIN_COMMANDS, AUTOTRADE_COMMANDS
 from broker.pocket_option import (
     PocketOptionAuthenticationError,
@@ -608,7 +608,11 @@ async def run_serve() -> None:
             exc.status_code or type(exc).__name__,
         )
     subscribers = await asyncio.to_thread(SubscriberStore)
-    fanout = SubscriberFanoutNotifier(bot, subscribers, autotrade=autotrade)
+    # Shared "who is auto-trading" list: those users get trades + trade alerts instead of signal cards.
+    roster = AutotradeRoster(autotrade) if autotrade is not None else None
+    if roster is not None:
+        await roster.refresh()
+    fanout = SubscriberFanoutNotifier(bot, subscribers, autotrade=autotrade, roster=roster)
     queue = NotificationQueue(fanout, max_age_seconds=10)
     outcomes = SignalOutcomeTracker("data/signals.csv")
 
@@ -642,6 +646,7 @@ async def run_serve() -> None:
         test_signal_provider=_test_signal_messages,
         background_selection=True,
         autotrade=autotrade,
+        roster=roster,
     )
     polling = TelegramPollingService(bot, handler)
     stop_event = asyncio.Event()
