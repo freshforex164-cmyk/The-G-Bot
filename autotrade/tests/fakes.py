@@ -12,7 +12,7 @@ from ..errors import Disconnected, SessionExpired
 from ..runtime import build_runtime
 from ..storage.repo import InMemoryRepository
 from ..trading.broker import TradeOutcome
-from ..trading.models import Decision
+from ..trading.models import Decision, TradingSettings
 from unittest.mock import patch
 from ..vault.crypto import KeyRing
 
@@ -98,6 +98,10 @@ class FakeBroker:
     async def payout(self, asset):
         return self.w.payout
 
+    async def balance(self):
+        settled = sum(1 for _ in self.w.placed)
+        return 10000.0 + settled   # changes after each trade so refreshes are observable
+
     async def place(self, asset, direction, amount, expiry):
         if self.w.place_exc:
             raise self.w.place_exc
@@ -132,14 +136,25 @@ class ScriptedDecision:
             return None
         return Decision(s.symbol_otc, "CALL" if real.price > otc.price else "PUT", 60, "scripted test decision")
 
+class EngineModeRepository(InMemoryRepository):
+    """Settings default to the bot's own engine (follow_signals=False) for engine/risk tests."""
+
+    async def get_settings(self, user_id):
+        s = self.settings.get(user_id)
+        return s if s is not None else TradingSettings(follow_signals=False)
+
+    async def save_settings(self, user_id, settings):
+        self.settings[user_id] = settings.with_changes(follow_signals=False)
+
+
 class Env:
-    def __init__(self, *, allow_live: bool = False):
+    def __init__(self, *, allow_live: bool = False, engine_mode: bool = False):
         self.worlds: dict[str, World] = {}
         self.bus = Bus()
         self.clock = FakeClock()
         os.environ["AUTOTRADE_FEED_SSID"] = ssid_for("feed")
         self.cfg = Config(jwt_secret="x" * 40, allow_live=allow_live, handshake_timeout=5)
-        self.repo = InMemoryRepository()
+        self.repo = EngineModeRepository() if engine_mode else InMemoryRepository()
         self.rt = build_runtime(
             self.cfg, repo=self.repo, keyring=KeyRing({1: os.urandom(32)}, 1),
             broker_factory=lambda ssid: FakeBroker(ssid, self.worlds, self.bus),

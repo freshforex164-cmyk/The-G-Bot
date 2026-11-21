@@ -25,6 +25,7 @@ class BrokerClient(Protocol):
     async def is_demo(self) -> bool: ...
     async def is_alive(self) -> bool: ...
     async def payout(self, asset: str) -> int | None: ...
+    async def balance(self) -> float | None: ...
     async def place(self, asset: str, direction: str, amount: float, expiry_seconds: int) -> str: ...
     async def outcome(self, trade_id: str, timeout: float) -> TradeOutcome: ...
     def ticks(self, symbol: str) -> AsyncIterator[float | dict]: ...
@@ -108,6 +109,16 @@ class PocketOptionBroker:
     async def is_alive(self) -> bool:
         api = self._api
         return bool(api is not None and api.is_responsive())
+
+    async def balance(self) -> float | None:
+        """Balance of the connected account (Demo or Real, whichever this SSID belongs to)."""
+        try:
+            value = self._need().balance()
+            if asyncio.iscoroutine(value):
+                value = await value
+            return float(value) if value is not None else None
+        except Exception as exc:
+            raise map_exception(exc) from None
 
     async def payout(self, asset: str) -> int | None:
         try:

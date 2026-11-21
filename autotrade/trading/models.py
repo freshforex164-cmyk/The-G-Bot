@@ -30,6 +30,9 @@ class TradingSettings:
     cooldown_seconds: int = 60
     min_payout: int = 80
     max_tick_age_seconds: float = 3.0
+    # True: place exactly the GBot signals this user receives (no separate engine).
+    # False: the service runs its own price-action engine on symbol_otc.
+    follow_signals: bool = True
 
     def validate(self, cfg: Config) -> "TradingSettings":
         def bad(msg: str):
@@ -64,6 +67,8 @@ class TradingSettings:
             v = getattr(self, name)
             if not (isinstance(v, str) and 3 <= len(v) <= 32 and v.replace("_", "").replace("-", "").replace("#", "").isalnum()):
                 bad(f"{name} is not a valid symbol")
+        if not isinstance(self.follow_signals, bool):
+            bad("follow_signals must be true or false")
         if self.symbol_real == self.symbol_otc:
             bad("symbol_real and symbol_otc must differ")
         return self
@@ -95,6 +100,8 @@ class Decision:
     expiry_seconds: int
     reason: str
     meta: dict[str, Any] = field(default_factory=dict)
+    signal_id: str | None = None          # set for GBot signals pushed to the service
+    valid_until: datetime | None = None   # pushed signals are never placed after this moment
 
 
 @dataclass

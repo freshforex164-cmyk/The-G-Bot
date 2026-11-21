@@ -15,6 +15,7 @@ from typing import Protocol
 
 from config import PAYOUT_DISCLAIMER
 from strategy.model import Signal
+from strategy.price_action import setup_label
 
 logger = logging.getLogger("gbot.notifications")
 
@@ -31,9 +32,11 @@ def format_signal_message(signal: Signal) -> str:
         raise ValueError("Signals require BUY/SELL direction and 1-minute expiry.")
     direction = "🔴 SELL / PUT" if signal.direction.upper() == "SELL" else "🟢 BUY / CALL"
     asset = html.escape(signal.asset_name, quote=False)
+    setup = html.escape(setup_label(signal.setup), quote=False)
     payout = f"{signal.payout:g}%" if signal.payout is not None else "unavailable"
     return (
         f"<b>{direction}</b>\n"
+        f"<b>Setup:</b> {setup}\n"
         f"<b>Asset:</b> {asset}\n"
         f"<b>Expiration:</b> 1 minute\n"
         f"<b>Payout:</b> {payout}\n"

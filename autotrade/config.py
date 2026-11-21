@@ -33,6 +33,7 @@ class Config:
     headless: bool = True
     recheck_seconds: float = 6 * 3600
     cors_origins: tuple[str, ...] = field(default_factory=tuple)
+    trust_proxy: bool = True          # TLS terminated by the host's proxy (Render)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -51,6 +52,7 @@ class Config:
             headless=_bool("AUTOTRADE_HEADLESS", True),
             recheck_seconds=_num("AUTOTRADE_RECHECK_SECONDS", 6 * 3600),
             cors_origins=origins,
+            trust_proxy=_bool("AUTOTRADE_TRUST_PROXY", True),
         )
 
     def feed_ssid(self) -> str | None:

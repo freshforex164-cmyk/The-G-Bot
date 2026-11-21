@@ -54,7 +54,8 @@ repo root (GBot side, standard library only, no new GBot dependencies)
 | POST | /trading/start | Start the user's bot (409 `reauth_required` if the session is missing/expired) |
 | POST | /trading/stop | Stop; `{"drain":false}` skips waiting for open trades |
 | PATCH | /trading/settings | Change settings. Live needs `{"mode":"live","confirm_live":true}` |
-| GET | /trading/settings, /trading/stats | Settings; status, today's P/L, win rate, recent trades, session status |
+| GET | /trading/settings, /trading/stats | Settings; status, balance, today's wins/losses/break-even and P/L, win rate, recent trades, session status |
+| POST | /trading/signal | GBot hands over a signal the user just received; a running bot with `follow_signals` places it (risk rules apply, duplicates/expired ignored) |
 | GET/POST/DELETE | /auth/status, /auth/handshake[...] | Login capture; `DELETE /auth/sessions` revokes tokens and stops the bot |
 | POST | /auth/handshake/{session_id}/credentials | Validated email/password submission, restricted to the login-session owner; HTTPS required outside localhost tests |
 | POST | /admin/halt, /admin/resume | Operator kill switch (JWT claim `role=admin`) |
@@ -96,7 +97,8 @@ python -c "from autotrade.vault.crypto import KeyRing; print(KeyRing.generate_ke
 ```
 Environment: `DATABASE_URL`, `AUTOTRADE_VAULT_KEY` (or `AUTOTRADE_VAULT_KEYS` + `AUTOTRADE_VAULT_ACTIVE`),
 `AUTOTRADE_JWT_SECRET` (32+ chars, shared with your auth), `AUTOTRADE_FEED_SSID` (Demo account),
-optional `AUTOTRADE_ALLOW_LIVE`, `AUTOTRADE_MAX_STAKE`, `AUTOTRADE_MAX_WORKERS`, `AUTOTRADE_CORS_ORIGINS`.
+optional `AUTOTRADE_ALLOW_LIVE`, `AUTOTRADE_MAX_STAKE`, `AUTOTRADE_MAX_WORKERS`, `AUTOTRADE_CORS_ORIGINS`,
+`AUTOTRADE_TRUST_PROXY` (default true: trust `X-Forwarded-Proto` from Render's HTTPS proxy) and `FORWARDED_ALLOW_IPS` (default `*`).
 Run `AUTOTRADE_APPLY_SCHEMA=1 python -m autotrade.main` once (applies `schema.sql`), then without the flag.
 Keep the vault key out of the database and out of git. Run as its own service (needs Chromium and a
 long-lived process, so not a serverless function and not the Render GBot service).

@@ -35,13 +35,24 @@ class Regime:
 
 
 SETUP_LABELS = {
-    "UP_PULLBACK_SELL": "Uptrend pullback",
-    "UP_CONTINUATION_BUY": "Uptrend continuation",
-    "DOWN_PULLBACK_BUY": "Downtrend pullback",
-    "DOWN_CONTINUATION_SELL": "Downtrend continuation",
-    "RANGE_HIGH_SELL": "Consolidation high rejection",
-    "RANGE_LOW_BUY": "Consolidation low rejection",
+    "UP_CONTINUATION_BUY": "Uptrend Continuation",
+    "UP_PULLBACK_SELL": "Uptrend Pullback",
+    "RANGE_HIGH_SELL": "Consolidation High Rejection",
+    "RANGE_LOW_BUY": "Consolidation Low Rejection",
+    "DOWN_CONTINUATION_SELL": "Downtrend Continuation",
+    "DOWN_PULLBACK_BUY": "Downtrend Pullback",
 }
+
+
+def setup_label(setup: str | None) -> str:
+    """Card name of the market setup that produced a signal."""
+    if not setup:
+        return "Price Action"
+    if setup in SETUP_LABELS:
+        return SETUP_LABELS[setup]
+    if setup in SETUP_LABELS.values():
+        return setup
+    return " ".join(word.capitalize() for word in str(setup).replace("_", " ").split())[:48] or "Price Action"
 
 
 def confirmed_swings(

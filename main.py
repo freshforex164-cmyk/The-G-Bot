@@ -608,7 +608,7 @@ async def run_serve() -> None:
             exc.status_code or type(exc).__name__,
         )
     subscribers = await asyncio.to_thread(SubscriberStore)
-    fanout = SubscriberFanoutNotifier(bot, subscribers)
+    fanout = SubscriberFanoutNotifier(bot, subscribers, autotrade=autotrade)
     queue = NotificationQueue(fanout, max_age_seconds=10)
     outcomes = SignalOutcomeTracker("data/signals.csv")
 

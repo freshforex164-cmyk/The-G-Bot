@@ -39,6 +39,12 @@
   .password-field input { min-width:0; }
   #credentials button.primary { width:100%; min-height:46px; margin-top:24px; }
   #credentials p { color:var(--muted); font-size:12px; }
+  #result { width:100%; max-width:420px; margin:auto; padding:24px; text-align:center; }
+  #result h2 { margin:0 0 12px; font-size:22px; }
+  #result h2.good { color:var(--accent); } #result h2.bad { color:var(--bad); }
+  #result p { color:var(--fg); margin:0 0 20px; }
+  #result button { width:100%; min-height:46px; margin-top:10px; }
+  #formError { color:var(--bad); font-size:13px; min-height:18px; margin:12px 0 0; }
   button:disabled { opacity:.6; }
   [hidden] { display:none !important; }
 </style>
@@ -58,10 +64,17 @@
     <input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required>
     <button id="showPassword" type="button" aria-label="Show password" title="Show password">◉</button>
   </div>
+  <p id="formError" role="alert"></p>
   <button class="primary" id="connectBtn" type="submit">Connect account</button>
   <p>Passwords are used for broker sign-in only and are never saved. Connected sessions are encrypted.</p>
   <button id="openBroker" type="button">Open broker page</button>
 </form>
+<div id="result" hidden role="status" aria-live="polite">
+  <h2 id="resultTitle"></h2>
+  <p id="resultText"></p>
+  <button class="primary" id="retryBtn" type="button">Try again</button>
+  <button id="closeBtn" type="button">Return to Telegram</button>
+</div>
 <div id="start" hidden>
   <p>Complete any broker verification on this page. Only your connected sessions are saved, encrypted.</p>
   <button class="primary" id="startBtn">Open Pocket Option login</button>
@@ -86,7 +99,7 @@
   const stage = $("stage"), img = $("screen"), proxy = $("proxy");
   let sid = null, looping = false, lastUrl = null, statusTimer = null;
   let vw = 390, vh = 844, inputs = [], field = null, boostUntil = 0, lastTap = 0, nullCount = 0;
-  let fieldKey = "", pending = null, sending = false, ended = false;
+  let fieldKey = "", pending = null, sending = false, ended = false, submittedAt = 0, lastNotice = "";
 
   if (!token) { $("credentials").hidden = true; msg("This link is missing its login code. Send /at_login in Telegram to get a new one.", "bad"); return; }
   if (location.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(location.hostname)) {
@@ -96,20 +109,47 @@
   function stopAll() { ended = true; looping = false; clearInterval(statusTimer); statusTimer = null; blurProxy();
     $("password").value = ""; proxy.value = ""; pending = null;
     if (lastUrl) { URL.revokeObjectURL(lastUrl); lastUrl = null; img.removeAttribute("src"); } }
-  function expired() { stopAll(); msg("This login link has expired. Send /at_login in Telegram to get a new one.", "bad"); }
+  // Every outcome ends on a visible panel with a next step, never on an empty screen.
+  function showResult(kind, title, text, retry) {
+    stopAll(); stage.style.display = "none"; $("cancel").hidden = true; $("site").hidden = true;
+    $("credentials").hidden = true; $("start").hidden = true;
+    $("resultTitle").textContent = title; $("resultTitle").className = kind;
+    $("resultText").textContent = text || ""; $("retryBtn").hidden = !retry; $("result").hidden = false;
+    msg(kind === "good" ? "Connected" : "Connect Pocket Option", kind === "good" ? "good" : "");
+  }
+  function showForm(error) {
+    $("result").hidden = true; $("start").hidden = true; stage.style.display = "none";
+    $("cancel").hidden = true; $("site").hidden = true; $("credentials").hidden = false;
+    $("connectBtn").disabled = false; $("formError").textContent = error || ""; sid = null; ended = false;
+    msg("Connect Pocket Option");
+  }
+  async function errorText(r, fallback) {
+    try { const d = (await r.json()).detail; if (d && typeof d === "object" && d.message) return String(d.message);
+          if (typeof d === "string" && d) return d; } catch (e) {}
+    return fallback;
+  }
+  function expired() { showResult("bad", "Login link expired", "Send /at_login in Telegram to get a new link.", false); }
+  $("retryBtn").onclick = async () => {
+    if (sid) { const id = sid; sid = null; await api(`auth/handshake/${id}`, { method: "DELETE" }).catch(() => null); }
+    showForm("");
+  };
+  $("closeBtn").onclick = () => { if (tg) { try { tg.close(); return; } catch (e) {} } window.close(); };
 
   // ---- start ------------------------------------------------------------------------------------
   async function begin() {
-    $("credentials").hidden = true;
+    $("credentials").hidden = true; $("result").hidden = true; submittedAt = 0; lastNotice = "";
     $("start").hidden = true; msg("Opening the login page… (this can take ~10 seconds)");
     stage.style.display = "block";            // so we can measure it: the site is rendered at exactly this size
     const w = Math.round(stage.clientWidth), h = Math.round(stage.clientHeight);
     let r;
     try { r = await api("auth/handshake", { method: "POST", body: JSON.stringify({ width: w, height: h }) }); }
     catch (e) { r = null; }
-    if (r && r.status === 401) return expired();
-    if (!r || !r.ok) { stage.style.display = "none"; $("start").hidden = false; $("startBtn").textContent = "Try again";
-                       msg("Could not open the login page right now. Try again in a minute.", "bad"); return false; }
+    if (r && r.status === 401) { expired(); return false; }
+    if (!r || !r.ok) {
+      const text = r ? await errorText(r, "") : "";
+      showResult("bad", "Could not open Pocket Option", text || "The sign-in page could not be opened right now. Try again in a minute.", true);
+      return false;
+    }
     sid = (await r.json()).session_id; ended = false;
     $("cancel").hidden = false;
     looping = true; loop(); statusTimer = setInterval(refreshStatus, 1500);
@@ -133,24 +173,36 @@
     if (!$("credentials").reportValidity()) return;
     let payload = JSON.stringify({ email, password: $("password").value });
     $("password").value = ""; $("password").type = "password"; $("connectBtn").disabled = true;
+    $("formError").textContent = "";
     try {
       if (!await begin()) return;
-      let ready = false;
-      for (let i = 0; i < 50 && !ended; i++) {
+      msg("Opening Pocket Option securely… (up to a minute)");
+      let status = null;
+      for (let i = 0; i < 90 && !ended; i++) {          // the broker page can be slow to answer
         const r = await api(`auth/handshake/${sid}`);
         if (r.status === 401) return expired();
         if (!r.ok) break;
-        const state = (await r.json()).state;
-        if (state === "waiting_for_login") { ready = true; break; }
-        if (state !== "starting") break;
+        status = await r.json();
+        if (status.state !== "starting") break;
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
-      if (!ready || ended) { msg("The broker page is not ready. Try a new login link.", "bad"); return; }
+      if (ended) return;
+      if (!status || status.state !== "waiting_for_login") {
+        if (status && !["starting", "waiting_for_login"].includes(status.state)) return refreshStatus();
+        return showResult("bad", "Pocket Option is not responding", "Try again in a minute.", true);
+      }
+      msg("Signing in…");
       const r = await api(`auth/handshake/${sid}/credentials`, { method:"POST", body:payload });
       if (r.status === 401) return expired();
-      if (!r.ok) { msg("Could not submit sign-in. Complete it on the broker page below.", "bad"); return; }
-      msg("Sign-in submitted. Complete any verification on the broker page.");
-    } catch (e) { msg("Connection interrupted. Use the broker page or a new login link.", "bad"); }
+      if (!r.ok) {
+        msg(await errorText(r, "Could not submit sign-in.") + " You can finish on the Pocket Option page below.", "bad");
+        return;
+      }
+      submittedAt = Date.now();
+      msg("Sign-in submitted. Complete any verification shown below.");
+    } catch (e) {
+      if (!ended) showResult("bad", "Connection interrupted", "Check your internet connection and try again.", true);
+    }
     finally { payload = ""; $("connectBtn").disabled = false; }
   });
 
@@ -173,6 +225,8 @@
   function applyView(v) {
     vw = v.width; vh = v.height; inputs = v.inputs || []; field = v.field || null;
     if (v.host) { $("site").hidden = false; $("site").textContent = "🔒 " + v.host; }
+    // After our sign-in: surface Pocket Option's own feedback (wrong password, verification needed).
+    if (submittedAt && v.notice && v.notice !== lastNotice) { lastNotice = v.notice; msg(v.notice, "bad"); }
     if (field) { nullCount = 0; placeProxy(field); }
     else if (++nullCount >= 2 && Date.now() - lastTap > 900) blurProxy();
   }
@@ -260,20 +314,21 @@
     if (!r.ok) return;
     const s = await r.json();
     if (s.state === "starting") msg("Opening the login page…");
-    else if (s.state === "waiting_for_login") msg("Log in as you normally would (email and password, or Google).");
+    else if (s.state === "waiting_for_login") { if (!submittedAt) msg("Log in as you normally would (email and password, or Google)."); }
     else if (s.state === "capturing") msg("Logged in. Saving your Demo and Real sessions…");
-    else {
-      stopAll(); stage.style.display = "none"; $("cancel").hidden = true; $("site").hidden = true;
-      if (s.state === "done") { msg("Connected. Go back to Telegram and send /at_start (your bot starts in Demo mode).", "good"); if (tg) setTimeout(() => tg.close(), 2500); }
-      else if (s.state === "timeout") msg("The login took too long and was closed. Send /at_login for a new link.", "bad");
-      else if (s.state === "cancelled") msg("Login cancelled.", "bad");
-      else msg("The login could not be completed. Send /at_login to try again.", "bad");
+    else if (s.state === "done") {
+      const kinds = (s.kinds || []).map(k => k === "real" ? "Real" : "Demo").join(" and ") || "Pocket Option";
+      showResult("good", "Account connected", `${kinds} account connected and encrypted. Go back to Telegram and send /at_start — your bot starts in Demo mode.`, false);
+      if (tg) setTimeout(() => { try { tg.close(); } catch (e) {} }, 4000);
     }
+    else if (s.state === "timeout") showResult("bad", "Sign-in timed out", s.message || "Send /at_login for a new link.", false);
+    else if (s.state === "cancelled") showResult("bad", "Sign-in cancelled", "", true);
+    else showResult("bad", "Sign-in failed", s.message || "The sign-in could not be completed. Try again.", true);
   }
   $("cancel").onclick = async () => {
-    const id = sid; stopAll(); stage.style.display = "none"; $("cancel").hidden = true; $("site").hidden = true;
+    const id = sid; sid = null;
+    showResult("bad", "Sign-in cancelled", "", true);
     await api(`auth/handshake/${id}`, { method: "DELETE" }).catch(() => null);
-    msg("Login cancelled. Send /at_login to start again.", "bad");
   };
 })();
 </script>

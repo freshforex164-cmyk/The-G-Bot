@@ -12,7 +12,7 @@ from ..market.feed import SharedMarketFeed
 from ..storage.repo import Repository
 from ..vault.service import TokenVault
 from .broker import BrokerClient
-from .models import DEMO, LIVE, TradingSettings
+from .models import DEMO, LIVE, Decision, TradingSettings
 from .risk import RiskManager
 from .strategy import STRATEGIES
 from .worker import UserWorker, WorkerStatus
@@ -155,6 +155,18 @@ class TradingManager:
             if worker and self.is_running(user_id):
                 worker.apply_settings(new)
             await self.repo.audit(user_id, "reset_to_demo", {"reason": reason})
+
+    # -- GBot signals -------------------------------------------------------------------------
+    async def submit_signal(self, user_id: str, decision: Decision) -> dict[str, Any]:
+        """Hand a signal the user just received in Telegram to their running bot. Never raises for
+        users without a running bot: most subscribers do not auto-trade."""
+        worker = self._workers.get(user_id)
+        if worker is None or not self.is_running(user_id):
+            return {"accepted": False, "reason": "not_running"}
+        if self.halted:
+            return {"accepted": False, "reason": "trading_halted"}
+        reason = worker.submit_signal(decision)
+        return {"accepted": reason == "queued", "reason": reason}
 
     # -- reporting ----------------------------------------------------------------------------
     async def stats(self, user_id: str) -> dict[str, Any]:

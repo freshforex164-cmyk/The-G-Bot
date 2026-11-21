@@ -11,7 +11,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Awaitable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -985,11 +985,17 @@ class SubscriberFanoutNotifier:
         *,
         max_messages_per_second: int = 25,
         sleep: Callable[[float], Any] = asyncio.sleep,
+        autotrade: Any | None = None,
+        max_parallel_autotrade: int = 10,
     ) -> None:
         if max_messages_per_second <= 0:
             raise ValueError("max_messages_per_second must be positive")
         self.client = client
         self.subscribers = subscribers
+        self.autotrade = autotrade
+        self._autotrade_slots = asyncio.Semaphore(max(1, max_parallel_autotrade))
+        self._autotrade_tasks: set[asyncio.Task] = set()
+        self.autotrade_accepted = 0
         self.interval = 1.0 / max_messages_per_second
         self._sleep = sleep
         self._lock = asyncio.Lock()
@@ -1015,10 +1021,55 @@ class SubscriberFanoutNotifier:
             or (signal.valid_until is not None and signal.valid_until <= now)
         )
 
+    @staticmethod
+    def autotrade_payload(signal: Signal) -> dict[str, Any]:
+        signal_time = signal.time if signal.time.tzinfo else signal.time.replace(tzinfo=timezone.utc)
+        valid_until = signal.valid_until or (signal_time + timedelta(seconds=10))
+        if valid_until.tzinfo is None:
+            valid_until = valid_until.replace(tzinfo=timezone.utc)
+        return {
+            "signal_id": signal.id,
+            "asset": signal.pair,
+            "direction": signal.direction.upper(),
+            "expiry_seconds": 60,
+            "setup": str(signal.setup)[:48],
+            "valid_until": valid_until.isoformat(),
+        }
+
+    async def _mirror_one(self, chat_id: Any, payload: dict[str, Any]) -> None:
+        async with self._autotrade_slots:
+            try:
+                result = await self.autotrade.submit_signal(chat_id, payload)
+            except Exception as exc:   # service down/unauthorised: never affects Telegram delivery
+                logger.info("Auto-trade signal hand-off failed (%s).", getattr(exc, "code", type(exc).__name__))
+                return
+            if isinstance(result, dict) and result.get("accepted"):
+                self.autotrade_accepted += 1
+
+    def mirror_to_autotrade(self, chat_ids: Any, signal: Signal) -> int:
+        """Start background hand-offs for private chats (chat id == Telegram user id)."""
+        if self.autotrade is None:
+            return 0
+        payload = self.autotrade_payload(signal)
+        started = 0
+        for chat_id in chat_ids:
+            try:
+                if int(chat_id) <= 0:     # groups/channels are not personal accounts
+                    continue
+            except (TypeError, ValueError):
+                continue
+            task = asyncio.create_task(self._mirror_one(chat_id, payload), name=f"autotrade-signal-{chat_id}")
+            self._autotrade_tasks.add(task)
+            task.add_done_callback(self._autotrade_tasks.discard)
+            started += 1
+        return started
+
     async def send(self, signal: Signal) -> str:
         chat_ids = await asyncio.to_thread(
             self.subscribers.subscribed_chat_ids, signal.pair
         )
+        # Auto-trading users get the same signal placed at once, in parallel with the Telegram cards.
+        self.mirror_to_autotrade(chat_ids, signal)
         sent = 0
         text = format_signal_message(signal)
         for chat_id in chat_ids:

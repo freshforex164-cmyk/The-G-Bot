@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections import deque
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable
 
@@ -22,6 +24,8 @@ log = logging.getLogger("autotrade.worker")
 
 MAX_RECONNECTS = 8
 MAX_UNEXPECTED = 3
+MAX_PENDING_SIGNALS = 20
+SEEN_SIGNAL_IDS = 500
 
 
 class WorkerStatus(str, Enum):
@@ -69,6 +73,13 @@ class UserWorker:
         self._last_trade_at: float | None = None
         self._trackers: dict[str, asyncio.Task] = {}
         self._client_is_demo = True
+        self._pending: deque[Decision] = deque(maxlen=MAX_PENDING_SIGNALS)
+        self._seen: deque[str] = deque(maxlen=SEEN_SIGNAL_IDS)
+        self._wake: asyncio.Event | None = None
+        self.balance: float | None = None
+        self.balance_kind: str | None = None
+        self.balance_at: datetime | None = None
+        self.signals_received = 0
 
     # -- control ------------------------------------------------------------------------------
     def request_stop(self, drain: bool = True) -> None:
@@ -85,7 +96,34 @@ class UserWorker:
 
     def snapshot(self) -> dict:
         return {"status": self.status.value, "last_error": self.last_error, "last_skip_reason": self.last_reject,
-                "open_trades": self.open_count}
+                "open_trades": self.open_count, "follow_signals": self.settings.follow_signals,
+                "signals_received": self.signals_received,
+                "balance": self.balance, "balance_account": self.balance_kind,
+                "balance_at": self.balance_at.isoformat() if self.balance_at else None}
+
+    def submit_signal(self, d: Decision) -> str:
+        """Queue a GBot signal for this user. Returns 'queued' or why it was ignored."""
+        if not self.desired or self.status not in (WorkerStatus.RUNNING, WorkerStatus.PAUSED):
+            return "not_running"
+        if not self.settings.follow_signals:
+            return "follow_signals_off"
+        if d.signal_id and d.signal_id in self._seen:
+            return "duplicate"
+        if self._expired(d):
+            return "expired"
+        if d.signal_id:
+            self._seen.append(d.signal_id)
+        self.signals_received += 1
+        self._pending.append(d)
+        if self._wake is not None:
+            self._wake.set()
+        return "queued"
+
+    def _expired(self, d: Decision) -> bool:
+        if d.valid_until is None:
+            return False
+        until = d.valid_until if d.valid_until.tzinfo else d.valid_until.replace(tzinfo=timezone.utc)
+        return self._clock.utcnow() >= until
 
     # -- main loop ----------------------------------------------------------------------------
     async def run(self) -> None:
@@ -175,24 +213,42 @@ class UserWorker:
 
     # -- one connected session ----------------------------------------------------------------
     async def _session(self, broker: BrokerClient, strategy: Strategy, s0: TradingSettings) -> None:
-        symbols = strategy.required_symbols(s0)
+        follow = s0.follow_signals
+        symbols = () if follow else strategy.required_symbols(s0)
         await self._adopt_open_trades(broker, s0.mode)
-        await self._feed.acquire(symbols)
-        ev = self._feed.register()
+        await self._refresh_balance(broker)
+        if symbols:
+            await self._feed.acquire(symbols)
+            ev = self._feed.register()
+        else:
+            ev = asyncio.Event()      # woken by submit_signal()
+        self._wake = ev
+        if self._pending:
+            ev.set()
         try:
             while not self._stop.is_set():
                 s = self.settings
-                if s.mode != s0.mode or s.strategy != s0.strategy or strategy.required_symbols(s) != symbols:
+                if s.mode != s0.mode or s.strategy != s0.strategy or s.follow_signals != follow or \
+                        (not follow and strategy.required_symbols(s) != symbols):
                     await self._drain(broker)
                     return  # run() reconnects with the new account / strategy
                 try:
                     wake = getattr(strategy, "next_wake_seconds", None)
-                    await asyncio.wait_for(ev.wait(), timeout=wake() if callable(wake) else 1.0)
+                    timeout = 1.0 if follow or not callable(wake) else wake()
+                    await asyncio.wait_for(ev.wait(), timeout=timeout)
                 except asyncio.TimeoutError:
                     pass
                 ev.clear()
                 if not await broker.is_alive():
                     raise Disconnected("connection is not receiving data")
+                if follow:
+                    while self._pending and not self._stop.is_set():
+                        d = self._pending.popleft()
+                        if self._expired(d):
+                            self._note("signal_expired")
+                            continue
+                        await self._try_trade(broker, d, s, (), pushed=True)
+                    continue
                 ticks = {sym: self._feed.latest(sym) for sym in symbols}
                 decision = strategy.on_tick(ticks, s)
                 if decision is not None:
@@ -200,8 +256,26 @@ class UserWorker:
             if self._drain_on_stop:
                 await self._drain(broker)
         finally:
-            self._feed.unregister(ev)
-            await self._feed.release(symbols)
+            self._wake = None
+            if symbols:
+                self._feed.unregister(ev)
+                await self._feed.release(symbols)
+
+    async def _refresh_balance(self, broker: BrokerClient) -> None:
+        """Best effort: a balance read never stops trading."""
+        fn = getattr(broker, "balance", None)
+        if not callable(fn):
+            return
+        try:
+            value = await asyncio.wait_for(fn(), timeout=5.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
+        if value is not None:
+            self.balance = round(float(value), 2)
+            self.balance_kind = "demo" if self._client_is_demo else "real"
+            self.balance_at = self._clock.utcnow()
 
     async def _drain(self, broker: BrokerClient) -> None:
         """Let open trades settle so their results are logged before the connection closes."""
@@ -217,11 +291,14 @@ class UserWorker:
             log.info("user %s: order skipped (%s)", self.user_id, reason)
         self.last_reject = reason
 
-    async def _try_trade(self, broker: BrokerClient, d: Decision, s: TradingSettings, symbols: tuple[str, ...]) -> None:
+    async def _try_trade(self, broker: BrokerClient, d: Decision, s: TradingSettings, symbols: tuple[str, ...],
+                         *, pushed: bool = False) -> None:
         now = self._clock.monotonic()
         pnl = await self._repo.realized_pnl_since(self.user_id, utc_day_start(self._clock.utcnow()), s.mode)
+        # A pushed GBot signal was produced from a fresh closed candle; its freshness is its valid_until.
+        ages = [0.0] if pushed else [self._feed.age(sym) for sym in symbols]
         state = RiskState(now=now, last_trade_at=self._last_trade_at, open_count=self.open_count, daily_pnl=pnl,
-                          tick_ages=[self._feed.age(sym) for sym in symbols], client_is_demo=self._client_is_demo,
+                          tick_ages=ages, client_is_demo=self._client_is_demo,
                           halted=self._is_halted())
         verdict = self._risk.check(s, d, state)
         if not verdict.ok:
@@ -240,8 +317,9 @@ class UserWorker:
         self.last_reject = None
         self._last_trade_at = now          # cooldown starts before the order, so a failure cannot cause rapid retries
         ref = uuid.uuid4().hex
+        meta = {**d.meta, **({"signal_id": d.signal_id, "source": "gbot_signal"} if d.signal_id else {})}
         rec = TradeRecord(self.user_id, ref, s.mode, d.asset, d.direction, s.stake, d.expiry_seconds,
-                          payout=payout, reason=d.reason, meta=d.meta, opened_at=self._clock.utcnow())
+                          payout=payout, reason=d.reason, meta=meta, opened_at=self._clock.utcnow())
         await self._repo.insert_trade(rec)
         try:
             trade_id = await broker.place(d.asset, d.direction, s.stake, d.expiry_seconds)
@@ -272,6 +350,7 @@ class UserWorker:
             else:
                 await self._repo.update_trade(self.user_id, ref, status="settled", outcome=out.result,
                                               profit=profit, settled_at=self._clock.utcnow())
+                await self._refresh_balance(broker)
         except asyncio.CancelledError:
             raise  # left 'open'; the next session adopts it
         except Exception as exc:

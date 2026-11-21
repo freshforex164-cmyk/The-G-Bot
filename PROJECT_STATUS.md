@@ -1,3 +1,60 @@
+# G-Bot status — 2026-11-21 (login, setup cards, signal auto-trade)
+
+## Fixed / implemented in this revision
+- **Hosted login submission (`/at_login` → `/login`)**: Render terminates TLS at its proxy, so the service saw
+  plain `http` and refused every email/password submission ("HTTPS is required"). The service now honours the
+  proxy's `X-Forwarded-Proto` (uvicorn `proxy_headers`, `FORWARDED_ALLOW_IPS`, `AUTOTRADE_TRUST_PROXY`, default on).
+  Plain HTTP from the internet is still refused, and never echoes the password.
+- Credential submission never returns a bare 500: browser/page failures become a 409 with a fixed, safe message.
+- The isolated sign-in browser waits for the broker's first response (`commit`) instead of the full page load,
+  so slow Pocket Option pages no longer fail the login; open failures are reported as `broker_unreachable` or
+  `browser_unavailable` with a user-facing `message` in `GET /auth/handshake/{id}`.
+- Login page: every outcome ends on a visible panel (Account connected / Sign-in failed / timed out / cancelled /
+  link expired) with **Try again** and **Return to Telegram**; Pocket Option's own error text (wrong password,
+  verification) is shown after submitting. No blank screens.
+- Verified Pocket Option's live mobile login form (redirects to `m.pocketoption.com`): one `type=email name=email`
+  field and one password field inside the form — matches the submission selectors.
+- **Signal cards** now show the market setup:
+  `🟢 BUY / CALL` or `🔴 SELL / PUT` · Setup · Asset · Expiration 1 minute · Payout · `Payouts may vary.`
+  Setup names: Uptrend Continuation, Uptrend Pullback, Consolidation High Rejection, Consolidation Low Rejection,
+  Downtrend Continuation, Downtrend Pullback.
+- **Auto-trade follows GBot signals**: every signal delivered to a private subscriber is handed to the autotrade
+  service (`POST /trading/signal`, in parallel with the Telegram cards). A user's running bot places it on their
+  own Demo/Real account through the existing risk manager and payout check. Duplicates and expired signals are
+  ignored; group chats never trade. New setting `follow_signals` (default on; `/at_set follow off` returns to the
+  service's own price-action engine on `symbol_otc`).
+- **Results and balance**: wins, losses, break-even (draws) and P/L are recorded per trade; the connected account's
+  balance (Demo or Real) is read after connecting and after every settled trade. `/autotrade` and `/at_stats` show
+  balance, wins, losses, break-even, P/L and win rate.
+- `autotrade/requirements.txt` pins Playwright to the Dockerfile base image version (1.49.0) so Chromium matches.
+
+## Verified in this revision — offline / local only
+- Full suite: 229 passed, 33 skipped (legacy + PostgreSQL integration without `AUTOTRADE_TEST_DATABASE_URL`).
+- New tests (`autotrade/tests/test_signal_follow.py`, `tests/test_signal_card.py`): signal placement on the
+  user's account, CALL/PUT mapping, duplicate/expired/not-running/follow-off handling, win/draw recording,
+  balance in stats, signal endpoint auth/validation, proxy HTTPS acceptance, plain-HTTP refusal, unreachable
+  broker message, exact card layout, the six setup names, hand-off to private chats only, stats text.
+- Browser check of the hosted page with a simulated broker: successful sign-in ends on "Account connected"
+  with the password field cleared; an unreachable broker ends on "Sign-in failed" with a working Try again.
+
+## Not live verified
+- A real Pocket Option sign-in (real credentials, CAPTCHA/2FA), real orders, real balance reads and the deployed
+  Render services were not exercised from this environment.
+- Deploy both services, then: `/at_login` → sign in → `/at_start` (Demo) → wait for a signal on your selected
+  asset → `/at_stats` should show the trade, result and balance.
+
+## Environment variables
+- GBot (Render `gbot`): `TELEGRAM_BOT_TOKEN`, `PO_SSID`, `TELEGRAM_ADMIN_CHAT_ID` (or `TELEGRAM_CHAT_ID`),
+  `TELEGRAM_ADMIN_ID`, `ADMIN_IDS`, `DATABASE_URL` (subscribers), optional `ADMIN_TOKEN`, `REFERRAL_LINK`, `WELCOME_IMAGE_URL`,
+  `TIMEZONE`; for auto-trading `AUTOTRADE_API_URL`, `AUTOTRADE_PUBLIC_URL` (HTTPS), `AUTOTRADE_JWT_SECRET`.
+- Autotrade service: `DATABASE_URL`, `AUTOTRADE_VAULT_KEY` (or `AUTOTRADE_VAULT_KEYS` + `AUTOTRADE_VAULT_ACTIVE`),
+  `AUTOTRADE_JWT_SECRET` (same value as GBot), `AUTOTRADE_FEED_SSID`, optional `AUTOTRADE_ALLOW_LIVE`,
+  `AUTOTRADE_LIVE_MAX_STAKE`, `AUTOTRADE_MAX_STAKE`, `AUTOTRADE_MAX_WORKERS`, `AUTOTRADE_CORS_ORIGINS`,
+  `AUTOTRADE_TRUST_PROXY` (default true), `FORWARDED_ALLOW_IPS` (default `*`), `AUTOTRADE_APPLY_SCHEMA=1` once.
+  No new secrets are required; no database schema change (settings are JSON).
+
+---
+
 # G-Bot refinement status — 2026-11-21
 
 ## Implemented in this revision

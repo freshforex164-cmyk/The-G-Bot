@@ -43,7 +43,9 @@ SETTINGS: dict[str, tuple[str, type]] = {
     "cooldown": ("cooldown_seconds", int),
     "min_payout": ("min_payout", int),
     "gap": ("gap_threshold", float),
+    "follow": ("follow_signals", bool),
 }
+ON_WORDS, OFF_WORDS = {"on", "yes", "true", "1"}, {"off", "no", "false", "0"}
 SET_USAGE = (
     "Usage: /at_set <name> <value>\n"
     "  stake 2         amount per trade\n"
@@ -53,7 +55,7 @@ SET_USAGE = (
     "  take_profit 20  stop for the day after winning this much\n"
     "  cooldown 60     seconds between trades (5-3600)\n"
     "  min_payout 80   skip trades below this payout % (50-100)\n"
-    "  gap 0.0015      price gap that triggers a trade"
+    "  follow on       place the GBot signals you receive (off = bot's own engine)"
 )
 NOT_SET_UP = "Auto-trading isn't set up on this bot yet."
 PRIVATE_ONLY = "For your account's safety, auto-trading commands only work in a private chat with the bot."
@@ -97,13 +99,28 @@ def error_text(exc: AutotradeError) -> str:
 
 
 def settings_summary(s: dict[str, Any]) -> str:
+    source = ("Trades: the GBot signals you receive" if s.get("follow_signals", True)
+              else f"Trades: own price-action engine on {s.get('symbol_otc')}")
     return (
         f"Stake {_num(s.get('stake'))} · expiry {_num(s.get('expiry_seconds'))} s · "
         f"max open {_num(s.get('max_concurrent'))} · cooldown {_num(s.get('cooldown_seconds'))} s\n"
         f"Daily stop-loss {_num(s.get('daily_stop_loss'))} · take-profit {_num(s.get('daily_take_profit'))} · "
         f"min payout {_num(s.get('min_payout'))}%\n"
-        f"Strategy {s.get('strategy')} on {s.get('symbol_otc')} (gap {_num(s.get('gap_threshold'))})"
+        f"{source}"
     )
+
+
+def _balance_line(bot: dict[str, Any]) -> str | None:
+    value = bot.get("balance")
+    if not isinstance(value, (int, float)):
+        return None
+    account = "Real" if bot.get("balance_account") == "real" else "Demo"
+    return f"Balance ({account}): {float(value):,.2f}"
+
+
+def results_line(label: str, counts: dict[str, Any], pnl: Any) -> str:
+    return (f"{label}: {counts.get('trades', 0)} trades · {counts.get('wins', 0)} wins · "
+            f"{counts.get('losses', 0)} losses · {counts.get('draws', 0)} break-even · P/L {_money(pnl)}")
 
 
 def overview_text(stats: dict[str, Any]) -> str:
@@ -117,9 +134,11 @@ def overview_text(stats: dict[str, Any]) -> str:
         f"Bot: {status} (open trades: {bot.get('open_trades', 0)})",
         f"Sessions: Demo {sessions.get('demo', {}).get('status', 'missing')} · "
         f"Real {sessions.get('real', {}).get('status', 'missing')}",
-        f"Today: {today.get('trades', 0)} trades, {today.get('wins', 0)} won, {today.get('losses', 0)} lost, "
-        f"P/L {_money(today.get('realized_pnl'))}",
+        results_line("Today", today, today.get("realized_pnl")),
     ]
+    balance = _balance_line(bot)
+    if balance:
+        lines.insert(2, balance)
     if bot.get("halted_by_operator"):
         lines.append("New trades are paused by the operator.")
     if bot.get("last_error"):
@@ -135,14 +154,15 @@ def stats_text(stats: dict[str, Any]) -> str:
     lines = [overview_text(stats)]
     total = stats.get("all_time", {})
     rate = total.get("win_rate")
-    lines += ["", f"All time: {total.get('trades', 0)} trades, win rate "
-                  f"{f'{rate}%' if rate is not None else 'n/a'}, P/L {_money(total.get('net_profit'))}"]
+    lines += ["", results_line("All time", total, total.get("net_profit")),
+              f"Win rate: {f'{rate}%' if rate is not None else 'n/a'}"]
     recent = stats.get("recent_trades") or []
     if recent:
         lines += ["", "Recent trades:"]
         for t in recent[:5]:
             when = str(t.get("opened_at") or "")[11:16]
             result = t.get("outcome") or t.get("status")
+            result = {"win": "win", "loss": "loss", "draw": "break-even"}.get(str(result), result)
             profit = f" {_money(t['profit'])}" if t.get("profit") is not None else ""
             lines.append(f"{when} {str(t.get('mode', '')).upper()} {t.get('asset')} {t.get('direction')} "
                          f"{_num(t.get('stake'))} → {result}{profit}")
@@ -233,6 +253,14 @@ class AutotradeCommands:
             await self.reply(chat_id, f"Unknown setting '{name[:20]}'.\n\n" + SET_USAGE)
             return
         field, kind = SETTINGS[name]
+        if kind is bool:
+            word = raw.lower()
+            if word not in ON_WORDS | OFF_WORDS:
+                await self.reply(chat_id, f"Use '/at_set {name} on' or '/at_set {name} off'.")
+                return
+            s = await self.client.update_settings(uid, {field: word in ON_WORDS})  # type: ignore[union-attr]
+            await self.reply(chat_id, f"Saved: {name} = {'on' if word in ON_WORDS else 'off'}.\n\n" + settings_summary(s))
+            return
         try:
             value = kind(raw)
             if not math.isfinite(value):

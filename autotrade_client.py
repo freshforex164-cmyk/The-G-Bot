@@ -142,6 +142,10 @@ class AutotradeClient:
     async def stats(self, uid: int | str) -> dict[str, Any]:
         return await self._call("GET", "/trading/stats", uid)
 
+    async def submit_signal(self, uid: int | str, signal: dict[str, Any]) -> dict[str, Any]:
+        """Hand a signal this user just received to their running auto-trading bot (if any)."""
+        return await self._call("POST", "/trading/signal", uid, signal, timeout=6)
+
     async def revoke(self, uid: int | str) -> None:
         await self._call("DELETE", "/auth/sessions", uid)
 

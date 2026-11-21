@@ -16,7 +16,7 @@ class EngineBase(unittest.IsolatedAsyncioTestCase):
         strategy_patch = patch.dict("autotrade.trading.strategy.STRATEGIES", {"price_action": ScriptedDecision})
         strategy_patch.start()
         self.addCleanup(strategy_patch.stop)
-        self.env = Env(allow_live=self.allow_live)
+        self.env = Env(allow_live=self.allow_live, engine_mode=True)
         self.m = self.env.rt.manager
         self.repo = self.env.repo
 

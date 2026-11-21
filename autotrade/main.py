@@ -32,4 +32,7 @@ if __name__ == "__main__":
     import uvicorn
 
     os.environ["AUTOTRADE_BOOT"] = "1"
-    uvicorn.run(build_app(), host=os.environ.get("HOST", "0.0.0.0"), port=int(os.environ.get("PORT", "8100")))
+    # Render/Fly terminate TLS at their proxy: honour X-Forwarded-Proto/For from it, otherwise
+    # every request looks like plain HTTP and broker sign-in is refused.
+    uvicorn.run(build_app(), host=os.environ.get("HOST", "0.0.0.0"), port=int(os.environ.get("PORT", "8100")),
+                proxy_headers=True, forwarded_allow_ips=os.environ.get("FORWARDED_ALLOW_IPS", "*"))

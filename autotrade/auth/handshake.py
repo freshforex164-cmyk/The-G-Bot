@@ -80,6 +80,28 @@ INPUTS_JS = """() => {
   }
   return out;
 }"""
+# Visible broker-side feedback after a sign-in attempt (wrong password, CAPTCHA, blocked account).
+# Text only, from alert/error elements; never input values.
+NOTICE_JS = """() => {
+  const sel = '.alert, .error, .errors, .invalid-feedback, .help-block, .form-error, [role=alert], [class*="error"], [class*="alert"]';
+  for (const el of document.querySelectorAll(sel)) {
+    if (el.closest('input, textarea, select, script, style')) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) continue;
+    const st = getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.display === 'none' || Number(st.opacity) === 0) continue;
+    const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+    if (t.length >= 4) return t.slice(0, 160);
+  }
+  return null;
+}"""
+ERROR_MESSAGES = {
+    "broker_unreachable": "Pocket Option did not respond in time. Try again in a minute.",
+    "browser_unavailable": "The secure sign-in browser could not start on the server. Please contact support.",
+    "login_timeout": "The sign-in took too long and was closed. Send /at_login for a new link.",
+    "store_failed": "You signed in, but the session could not be saved. Send /at_login to try again.",
+    "capture_failed": "The sign-in could not be completed. Send /at_login to try again.",
+}
 ALLOWED_KEYS = {"Enter", "Tab", "Backspace", "Delete", "Escape", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Space"}
 
 
@@ -144,7 +166,12 @@ class PlaywrightBackend:
         await self._context.route("**/*", self._route)
         self._context.on("page", self._attach)
         page = await self._context.new_page()
-        await page.goto(self._login_url, wait_until="domcontentloaded", timeout=45000)
+        # "commit" returns as soon as the broker answers; slow scripts/ads must not fail the login.
+        await page.goto(self._login_url, wait_until="commit", timeout=60000)
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        except Exception:
+            log.info("broker login page is still loading; continuing")
 
     async def _route(self, route, request) -> None:
         nav = request.is_navigation_request()
@@ -193,9 +220,13 @@ class PlaywrightBackend:
             inputs = await page.evaluate(INPUTS_JS)
         except Exception:      # page is navigating
             field, inputs = None, []
+        try:
+            notice = await page.evaluate(NOTICE_JS)
+        except Exception:
+            notice = None
         host = (urlparse(page.url).hostname or "") if page.url else ""
         return {"width": self._vp["width"], "height": self._vp["height"], "field": field,
-                "inputs": inputs, "host": host}
+                "inputs": inputs, "host": host, "notice": notice}
 
     async def interact(self, event: dict[str, Any]) -> None:
         page = self._page
@@ -338,6 +369,15 @@ class HandshakeSession:
     def active(self) -> bool:
         return self.state in ("starting", "waiting_for_login", "capturing")
 
+    @property
+    def message(self) -> str | None:
+        """User-facing explanation of a failed/timed-out login (never internal details)."""
+        if self.state == "timeout":
+            return ERROR_MESSAGES["login_timeout"]
+        if self.state == "failed":
+            return ERROR_MESSAGES.get(self.error or "", ERROR_MESSAGES["capture_failed"])
+        return None
+
 
 TokenSink = Callable[[str, dict[str, str], dict[str, Any]], Awaitable[None]]
 
@@ -415,17 +455,28 @@ class HandshakeManager:
         tokens: dict[str, str] = {}
         meta: dict[str, Any] = {}
         try:
-            await backend.open()
+            try:
+                await backend.open()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                name = type(exc).__name__
+                text = str(exc).lower()
+                # Playwright's TimeoutError is not the builtin one; network errors arrive as "net::ERR_*".
+                unreachable = "timeout" in name.lower() or "net::" in text or "err_" in text
+                s.state, s.error = "failed", "broker_unreachable" if unreachable else "browser_unavailable"
+                log.warning("handshake browser could not open the broker page: %s", name)
+                return
             s.state = "waiting_for_login"
             tokens, meta = await backend.capture_tokens(self._cfg.handshake_timeout, lambda st: setattr(s, "state", st))
         except asyncio.CancelledError:
             s.state = "cancelled"
             return
         except TimeoutError:
-            s.state, s.error = "timeout", "login was not completed in time"
+            s.state, s.error = "timeout", "login_timeout"
             return
         except Exception as exc:
-            s.state, s.error = "failed", type(exc).__name__
+            s.state, s.error = "failed", "capture_failed"
             log.warning("handshake failed: %s", type(exc).__name__)
             return
         finally:
@@ -435,7 +486,7 @@ class HandshakeManager:
             await self._sink(s.user_id, tokens, meta)
             s.kinds, s.state = sorted(tokens), "done"
         except Exception as exc:
-            s.state, s.error = "failed", type(exc).__name__
+            s.state, s.error = "failed", "store_failed"
             log.warning("could not store captured tokens: %s", type(exc).__name__)
         finally:
             tokens.clear()

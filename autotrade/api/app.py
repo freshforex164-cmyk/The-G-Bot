@@ -5,6 +5,7 @@ import contextlib
 import logging
 import secrets
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -20,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from ..errors import ReauthRequired, SettingsError
 from ..runtime import Runtime
 from ..trading.manager import CapacityError, LiveDisabled, ServiceUnavailable, TradingHalted
+from ..trading.models import Decision
 
 log = logging.getLogger("autotrade.api")
 
@@ -34,6 +36,14 @@ class Principal:
 
 
 SCOPES = ("full", "login")
+SUBMIT_FAILED = "The sign-in could not be submitted. Use the Pocket Option page to continue."
+SAFE_SUBMIT_MESSAGES = frozenset({
+    "The broker login page is not ready.",
+    "Use the broker page to complete this login.",
+    "Could not submit the broker login. Use the broker page to continue.",
+    "Enter a valid email address.",
+    "Enter a valid password.",
+})
 LOGIN_PAGE = Path(__file__).with_name("login_page.html")
 
 
@@ -79,6 +89,18 @@ class SettingsPatch(BaseModel):
     cooldown_seconds: int | None = None
     min_payout: int | None = None
     max_tick_age_seconds: float | None = None
+    follow_signals: bool | None = None
+
+
+class SignalIn(BaseModel):
+    """A signal GBot just delivered to this user in Telegram."""
+    model_config = ConfigDict(extra="forbid")
+    signal_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    asset: str = Field(min_length=3, max_length=32, pattern=r"^[A-Za-z0-9_#-]+$")
+    direction: Literal["BUY", "SELL", "CALL", "PUT"]
+    expiry_seconds: Literal[60] = 60
+    setup: str = Field("", max_length=48)
+    valid_until: datetime | None = None
 
 
 class HandshakeStart(BaseModel):
@@ -113,6 +135,17 @@ class InputEvent(BaseModel):
     value: str | None = Field(None, max_length=256)   # "value": whole text of the focused field (may be "")
     key: str | None = Field(None, max_length=16)
     dy: int | None = Field(None, ge=-5000, le=5000)
+
+
+def is_secure_request(request: Request, trust_proxy: bool) -> bool:
+    """True for HTTPS, including TLS terminated by the hosting proxy (Render, Fly, etc.)."""
+    if request.url.scheme == "https":
+        return True
+    if trust_proxy:
+        proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+        if proto == "https":
+            return True
+    return request.client is not None and request.client.host in {"127.0.0.1", "::1", "testclient"}
 
 
 def _http(exc: Exception) -> HTTPException:
@@ -228,6 +261,15 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
     async def stats(p: Principal = Depends(full)):
         return await rt.manager.stats(p.user_id)
 
+    @app.post("/trading/signal")
+    async def signal(body: SignalIn, p: Principal = Depends(full)):
+        """GBot pushes each signal a user receives; their running bot places it (risk rules apply)."""
+        direction = "CALL" if body.direction in ("BUY", "CALL") else "PUT"
+        decision = Decision(asset=body.asset, direction=direction, expiry_seconds=60,
+                            reason=body.setup or "gbot_signal", signal_id=body.signal_id,
+                            valid_until=body.valid_until)
+        return await rt.manager.submit_signal(p.user_id, decision)
+
     # ---- session handshake ---------------------------------------------------------------
     @app.get("/auth/status")
     async def auth_status(p: Principal = Depends(full)):
@@ -251,7 +293,7 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
     @app.get("/auth/handshake/{session_id}")
     async def handshake_status(session_id: str, p: Principal = Depends(auth)):
         s = _get(session_id, p)
-        return {"session_id": s.id, "state": s.state, "error": s.error, "kinds": s.kinds}
+        return {"session_id": s.id, "state": s.state, "error": s.error, "message": s.message, "kinds": s.kinds}
 
     @app.get("/auth/handshake/{session_id}/screen")
     async def handshake_screen(session_id: str, p: Principal = Depends(auth)):
@@ -287,13 +329,20 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
     async def handshake_credentials(session_id: str, body: BrokerCredentials, request: Request,
                                     p: Principal = Depends(auth)):
         _get(session_id, p)
-        # TLS is mandatory outside local tests/development; configure the host's trusted proxy correctly.
-        if request.url.scheme != "https" and (request.client is None or request.client.host not in {"127.0.0.1", "::1", "testclient"}):
-            raise HTTPException(400, "HTTPS is required for broker login.")
+        # TLS is mandatory outside local tests. Behind Render's proxy TLS ends at the proxy, so the
+        # forwarded protocol is trusted (AUTOTRADE_TRUST_PROXY, default on).
+        if not is_secure_request(request, rt.cfg.trust_proxy):
+            body.password = SecretStr("")
+            raise HTTPException(400, {"error": "https_required", "message": "A secure HTTPS connection is required."})
         try:
             await rt.handshakes.submit_credentials(session_id, p.user_id, body.email, body.password.get_secret_value())
-        except RuntimeError:
-            raise HTTPException(409, "The broker login could not be submitted. Use the broker page to continue.") from None
+        except RuntimeError as exc:
+            # Only our own fixed texts are shown; anything else could echo user input.
+            text = str(exc) if str(exc) in SAFE_SUBMIT_MESSAGES else SUBMIT_FAILED
+            raise HTTPException(409, {"error": "submit_failed", "message": text}) from None
+        except Exception as exc:   # browser crashed/navigated: never a bare 500 page
+            log.warning("credential submission failed: %s", type(exc).__name__)
+            raise HTTPException(409, {"error": "submit_failed", "message": SUBMIT_FAILED}) from None
         finally:
             body.password = SecretStr("")
         return Response(status_code=204)
