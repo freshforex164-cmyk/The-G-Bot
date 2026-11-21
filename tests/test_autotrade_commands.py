@@ -209,7 +209,7 @@ class AutotradeCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_login_menu_offers_direct_ssid_login(self):
         await self.send("/at_login")
-        self.assertEqual(self.chat.sent[-1][2]["inline_keyboard"][1][0]["text"], "🔑 Direct SSID Login")
+        self.assertEqual(self.chat.sent[-1][2]["inline_keyboard"][1][0]["text"], "🔑 Advanced: Direct SSID Login")
 
     async def test_direct_ssid_is_saved_and_the_message_deleted(self):
         ssid = '42["auth",{"session":"abc","isDemo":0,"uid":1,"platform":2}]'

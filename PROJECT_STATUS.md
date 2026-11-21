@@ -1,3 +1,26 @@
+# G-Bot status — login connects right away, account-true balances, memory cap (2026-11-21)
+
+## Fixed / implemented in this revision
+- **Email/password login is the main path**: "Log in to Pocket Option" stays first; the SSID paste button is
+  now "🔑 Advanced: Direct SSID Login". Pocket Option has no public login API, so the email/password is
+  still entered on its own page in the isolated browser (CAPTCHA/2FA need that page) — autotrade_commands.py.
+- **Connect right after login**: each captured Demo/Real session opens a WebSocket at once, is confirmed by
+  the broker and its own balance is saved; a rejected session is marked expired. Never places a trade;
+  a slow broker does not fail the login — autotrade/runtime.py, autotrade/trading/manager.py.
+- **Balances/status from the user's own session**: if the running bot is on the other account (Demo vs Real),
+  its balance is never shown; a fresh read uses the user's saved session for the selected mode. The shared
+  feed account is never used for balances — autotrade/trading/manager.py.
+- **Memory**: autotrade image sets `NODE_OPTIONS=--max-old-space-size=256` (Playwright's Node driver) to
+  stay under Render's 512 MB. 4096 was not used: it exceeds the instance memory. render.yaml unchanged
+  (GBot service is Python only) — autotrade/Dockerfile.
+
+## Verified in this revision (offline)
+- GBot suite: 170 passed. Autotrade suite: 141 run, 3 new tests in `autotrade/tests/test_account_sync.py`
+  pass, 4 skipped (Postgres); `test_secure_login` browser test NOT RUN (Chromium not installed here).
+- Live Pocket Option login and live balance read: NOT RUN.
+
+---
+
 # G-Bot status — asset-first menu, Auto-Trade setup screen & trade amounts (2026-11-21)
 
 ## Fixed / implemented in this revision

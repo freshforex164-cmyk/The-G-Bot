@@ -1,6 +1,7 @@
 """Wires the components together. ``build_runtime`` is the one place to change when integrating."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -15,6 +16,8 @@ from .trading.broker import BrokerClient, PocketOptionBroker
 from .trading.manager import TradingManager
 from .vault.crypto import KeyRing
 from .vault.service import TokenVault
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -59,6 +62,11 @@ def build_runtime(cfg: Config, *, repo: Repository | None = None, keyring: KeyRi
         await repo.save_settings(user_id, await repo.get_settings(user_id))  # creates the Demo default for new users
         await manager.reset_to_demo(user_id, "new login")
         await repo.audit(user_id, "tokens_captured", {"kinds": sorted(tokens), "method": meta.get("method")})
+        # Connect each new session over WebSocket now, so balance and status come from this user's account.
+        try:
+            await manager.connect_new_sessions(user_id, sorted(tokens))
+        except Exception as exc:   # a slow broker must not fail the login; checked again before trading
+            log.warning("post-login connection check failed: %s", type(exc).__name__)
 
     def default_backend() -> PlaywrightBackend:
         return PlaywrightBackend(cfg.headless, low_memory=cfg.low_memory, block_assets=cfg.block_login_assets,

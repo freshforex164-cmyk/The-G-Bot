@@ -9,6 +9,7 @@ COPY autotrade autotrade
 COPY data data
 COPY strategy strategy
 COPY config.py strategy.json ./
-ENV PYTHONUNBUFFERED=1 PORT=8100
+# Caps the Playwright driver's (Node) heap so it collects garbage before Render's 512 MB limit.
+ENV PYTHONUNBUFFERED=1 PORT=8100 NODE_OPTIONS="--max-old-space-size=256"
 EXPOSE 8100
 CMD ["python", "-m", "autotrade.main"]

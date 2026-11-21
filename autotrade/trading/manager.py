@@ -223,8 +223,10 @@ class TradingManager:
             worker = self._workers.get(user_id)
             if worker is not None and self.is_running(user_id):
                 value = await worker.refresh_balance_now()
+                if value is not None and worker.balance_kind != kind:
+                    value = None            # bot is on the other account: never report its balance
                 if value is None:
-                    error = "bot_not_connected"
+                    value, error = await self._read_balance_once(user_id, kind)
             else:
                 value, error = await self._read_balance_once(user_id, kind)
         saved = (await self.repo.get_balances(user_id)).get(kind)
@@ -234,6 +236,15 @@ class TradingManager:
         return {"account": kind, "balance": saved.balance if saved else None, "fresh": False,
                 "at": saved.updated_at.isoformat() if saved and saved.updated_at else None,
                 "error": error}
+
+    async def connect_new_sessions(self, user_id: str, kinds: list[str]) -> dict[str, Any]:
+        """Right after a login: open a WebSocket with each newly captured session, confirm the broker
+        accepts it and read that account's own balance. Never places a trade."""
+        out: dict[str, Any] = {}
+        for kind in kinds:
+            value, error = await self._read_balance_once(user_id, kind)
+            out[kind] = {"balance": value, "error": error}
+        return out
 
     async def _read_balance_once(self, user_id: str, kind: str) -> tuple[float | None, str | None]:
         from ..errors import VaultError
@@ -277,6 +288,9 @@ class TradingManager:
         bot = worker.snapshot() if worker and (running or worker.status in _TERMINAL) else \
             {"status": state.status if state else "stopped", "last_error": state.last_error if state else None,
              "open_trades": 0, "last_skip_reason": None}
+        mode_kind = "demo" if s.mode == DEMO else "real"
+        if bot.get("balance") is not None and bot.get("balance_account") not in (None, mode_kind):
+            bot = {**bot, "balance": None}      # running bot's balance belongs to the other account
         if bot.get("balance") is None:          # stopped or restarted: last saved balance for this mode
             saved = (await self.repo.get_balances(user_id)).get("demo" if s.mode == DEMO else "real")
             if saved is not None:

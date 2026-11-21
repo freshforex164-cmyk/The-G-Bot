@@ -258,7 +258,7 @@ class AutotradeCommands:
         button: dict[str, Any] = (
             {"text": "Log in to Pocket Option", "web_app": {"url": link}} if link.startswith("https://")
             else {"text": "Log in to Pocket Option", "url": link})
-        return {"inline_keyboard": [[button], [{"text": "🔑 Direct SSID Login", "callback_data": "at:ssid"}]]}
+        return {"inline_keyboard": [[button], [{"text": "🔑 Advanced: Direct SSID Login", "callback_data": "at:ssid"}]]}
 
     @staticmethod
     def ssid_menu_markup() -> dict[str, Any]:
