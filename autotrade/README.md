@@ -98,7 +98,7 @@ Follow-mode defaults: stake 1, max 2 open trades, 5 s cooldown, min payout 80%, 
 take-profit 20. Saved settings still holding the old defaults (1 open trade, 60 s) are upgraded on read.
 stake, expiry, max concurrent, daily stop-loss and take-profit (both mandatory, UTC day, realized P/L
 plus open-trade exposure), cooldown, minimum payout (read live before each order), max tick age.
-New users are **Demo**. Live needs: `AUTOTRADE_ALLOW_LIVE=true` on the service (default false), an active
+New users are **Demo**. Live needs: `AUTOTRADE_ALLOW_LIVE=true` on the service (default true since this revision), an active
 Real session, an explicit `confirm_live`, and a lower stake cap (`AUTOTRADE_LIVE_MAX_STAKE`, default 10).
 A new login resets the user to Demo. Orders are never retried; an order that fails mid-flight is stored
 as `unknown` for review. Errors in one worker never reach another.

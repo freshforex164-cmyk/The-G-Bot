@@ -28,6 +28,7 @@ SKIP_REASONS = {
     "payout_unavailable": "the payout could not be read",
     "payout_below_minimum": "the payout is below your minimum",
     "signal_expired": "the signal expired before it could be placed",
+    "balance_unavailable": "your account balance could not be read, so no money was risked",
 }
 
 
@@ -68,6 +69,13 @@ def settled_text(*, mode: str, asset: str, direction: str, stake: float, outcome
 def skipped_text(*, asset: str, direction: str, reason: str) -> str:
     why = SKIP_REASONS.get(reason, reason.replace("_", " "))
     return f"⏭ Auto-Trade skipped a signal: {asset} {direction_line(direction)[2:]}\nReason: {why}."
+
+
+def low_balance_text(*, mode: str, asset: str, direction: str, stake: float, balance: float) -> str:
+    account = "Real" if mode == "live" else "Demo"
+    return (f"⚠️ Low balance: Auto-Trade skipped {asset} {direction_line(direction)[2:]}.\n"
+            f"Your {account} balance is {_money(balance)}, below the {_money(stake)} stake. "
+            "Top up your account or lower the stake with /at_set stake <amount>.")
 
 
 def failed_text(*, asset: str, direction: str) -> str:

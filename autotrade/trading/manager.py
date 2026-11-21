@@ -158,6 +158,44 @@ class TradingManager:
                 worker.apply_settings(new)
             await self.repo.audit(user_id, "reset_to_demo", {"reason": reason})
 
+    # -- session reuse -------------------------------------------------------------------------
+    async def reusable_session(self, user_id: str) -> dict[str, Any] | None:
+        """The saved session for the selected mode, if it can still be used: no new browser sign-in then.
+        A running bot proves its session (a second connection could kick it). Otherwise one WebSocket
+        check; only an explicit broker rejection (auth_error) means a fresh browser login is needed.
+        Network trouble keeps the token: launching Chromium then would only add more login traffic."""
+        status = await self.vault.status(user_id)
+        mode = (await self.repo.get_settings(user_id)).mode
+        kind = "demo" if mode == DEMO else "real"
+        if status.get(kind, {}).get("status") != "active":
+            return None
+        active = sorted(k for k, v in status.items() if v.get("status") == "active")
+        if self.is_running(user_id):
+            return {"kinds": active, "verified": True}
+        res = await self.health.check(user_id, kind)
+        if res.status in ("missing", "expired"):
+            return None
+        return {"kinds": sorted(k for k, v in (await self.vault.status(user_id)).items()
+                                if v.get("status") == "active"), "verified": res.ok}
+
+    async def store_direct_ssid(self, user_id: str, ssid: str) -> dict[str, Any]:
+        """Direct SSID login: the user pastes their own Pocket Option ``42["auth",...]`` value. The
+        account type comes from its isDemo flag (never converted). Checked over WebSocket once."""
+        from ..auth.ssid import account_kind
+        kind = account_kind(ssid)
+        if kind is None:
+            raise SettingsError("not a Pocket Option SSID")
+        await self.vault.store(user_id, kind, ssid, {"method": "direct", "derived": False})
+        await self.repo.save_settings(user_id, await self.repo.get_settings(user_id))  # Demo default for new users
+        if self.is_running(user_id):
+            return {"kind": kind, "verified": False, "status": "saved"}
+        res = await self.health.check(user_id, kind)
+        if res.status in ("missing", "expired"):
+            await self.repo.audit(user_id, "direct_ssid_rejected", {"kind": kind})
+            return {"kind": kind, "verified": False, "status": "rejected"}
+        await self.repo.audit(user_id, "direct_ssid_saved", {"kind": kind})
+        return {"kind": kind, "verified": res.ok, "status": "active" if res.ok else "saved"}
+
     # -- GBot signals -------------------------------------------------------------------------
     async def submit_signal(self, user_id: str, decision: Decision) -> dict[str, Any]:
         """Hand a signal the user just received in Telegram to their running bot. Never raises for

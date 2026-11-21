@@ -114,6 +114,13 @@ class HandshakeStart(BaseModel):
     width: int | None = Field(None, ge=200, le=4000)
     height: int | None = Field(None, ge=200, le=4000)
     full_view: bool = False     # the user will sign in on the broker page itself (styles and pictures load)
+    force: bool = False         # sign in again even though a saved session still works
+
+
+class DirectSsid(BaseModel):
+    """Direct SSID login: the user's own ``42["auth",{...}]`` value; no browser is started."""
+    model_config = ConfigDict(extra="forbid")
+    ssid: SecretStr = Field(min_length=20, max_length=4096)
 
 
 class StopBody(BaseModel):
@@ -319,6 +326,15 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
     @app.post("/auth/handshake", status_code=201)
     async def handshake_start(body: HandshakeStart | None = None, p: Principal = Depends(login)):
         limited(handshake_limit, p.user_id)
+        if not (body and body.force):
+            # Reuse the saved session: every extra browser login from the server's IP risks a broker block.
+            try:
+                reused = await rt.manager.reusable_session(p.user_id)
+            except Exception as exc:
+                log.warning("saved-session check failed: %s", type(exc).__name__)
+                reused = None
+            if reused:
+                return JSONResponse({"reused": True, "state": "done", **reused}, status_code=200)
         vp = (body.width, body.height) if body and body.width and body.height else None
         try:
             s = await rt.handshakes.start(p.user_id, vp, full_view=bool(body and body.full_view))
@@ -335,6 +351,27 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
             return rt.handshakes.get(session_id, p.user_id)
         except KeyError:
             raise HTTPException(404, "unknown login session") from None
+
+    @app.post("/auth/ssid")
+    async def direct_ssid(body: DirectSsid, p: Principal = Depends(full)):
+        """Store a pasted SSID (Demo or Real by its isDemo flag) after one WebSocket check."""
+        try:
+            limited(credentials_limit, p.user_id)
+        except HTTPException:
+            body.ssid = SecretStr("")
+            raise
+        try:
+            res = await rt.manager.store_direct_ssid(p.user_id, body.ssid.get_secret_value().strip())
+        except Exception as exc:          # malformed: never echo the value back
+            log.info("direct SSID refused: %s", type(exc).__name__)
+            raise HTTPException(422, {"error": "invalid_ssid",
+                                      "message": "That is not a valid Pocket Option SSID."}) from None
+        finally:
+            body.ssid = SecretStr("")
+        if res["status"] == "rejected":
+            raise HTTPException(409, {"error": "ssid_rejected", "kind": res["kind"],
+                                      "message": "Pocket Option rejected this SSID (expired or logged out)."})
+        return res
 
     @app.get("/auth/handshake/{session_id}")
     async def handshake_status(session_id: str, p: Principal = Depends(login)):

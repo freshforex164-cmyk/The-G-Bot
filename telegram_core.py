@@ -451,6 +451,11 @@ class TelegramCommandHandler:
         parts = text.split(maxsplit=1)
         command = parts[0][1:].split("@", 1)[0].lower()
         args = parts[1] if len(parts) > 1 else ""
+        if command == "at_ssid" and args and isinstance(message.get("message_id"), int):
+            try:  # the pasted SSID is a login secret: remove it from the chat at once
+                await self.client.delete_message(chat_id, message["message_id"])
+            except Exception:
+                logger.warning("Could not delete the pasted SSID message.")
         await self._dispatch(command, chat_id, sender_id=sender_id, args=args)
 
     async def _dispatch(
@@ -809,6 +814,11 @@ class TelegramCommandHandler:
                 {"text": "💰 Balance", "callback_data": "at:balance"},
                 {"text": "📊 Stats", "callback_data": "at:stats"},
             ])
+            rows.append([
+                {"text": "🧪 Demo", "callback_data": "at:demo"},
+                {"text": "💵 Real", "callback_data": "at:live"},
+                {"text": "🔑 Login", "callback_data": "at:login"},
+            ])
         rows.append([
             {"text": "Change asset", "callback_data": "assetback"},
             {"text": "Stop", "callback_data": "signals:stop"},
@@ -863,9 +873,12 @@ class TelegramCommandHandler:
     async def _handle_mode_button(self, chat_id: int, sender_id: int | None, data: str) -> None:
         private = sender_id is not None and int(sender_id) == int(chat_id)
         if data.startswith("at:"):
-            command = {"at:balance": "at_balance", "at:stats": "at_stats"}.get(data)
+            command, args = {"at:balance": ("at_balance", ""), "at:stats": ("at_stats", ""),
+                             "at:demo": ("at_demo", ""), "at:live": ("at_live", ""),
+                             "at:liveconfirm": ("at_live", "confirm"), "at:ssid": ("at_ssid", ""),
+                             "at:login": ("at_login", "")}.get(data, ("", ""))
             if command and private:
-                await self._autotrade_safe(command, chat_id, int(sender_id), "", False)
+                await self._autotrade_safe(command, chat_id, int(sender_id), args, False)
             return
         name = self._selected_name(chat_id)
         if name is None:

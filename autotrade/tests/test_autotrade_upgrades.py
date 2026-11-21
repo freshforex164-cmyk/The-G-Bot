@@ -25,7 +25,7 @@ class LowMemoryBrowserTests(unittest.TestCase):
     def test_low_memory_launch_flags(self):
         args = launch_args(True)
         for flag in ("--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                     "--single-process", "--no-zygote", "--js-flags=--max-old-space-size=256"):
+                     "--single-process", "--no-zygote", "--js-flags=--max-old-space-size=128"):
             self.assertIn(flag, args)
         self.assertNotIn("--single-process", launch_args(False))
         self.assertEqual(len(set(LOW_MEMORY_ARGS)), len(LOW_MEMORY_ARGS))

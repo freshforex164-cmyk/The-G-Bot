@@ -13,7 +13,7 @@ from typing import Callable
 from ..clock import Clock, utc_day_start
 from ..errors import (BrokerError, Disconnected, ModeMismatch, RateLimited, SessionExpired, VaultError)
 from ..market.feed import SharedMarketFeed
-from ..notify import NullNotifier, Notifier, failed_text, opened_text, settled_text, skipped_text
+from ..notify import NullNotifier, Notifier, failed_text, low_balance_text, opened_text, settled_text, skipped_text
 from ..storage.repo import BalanceRow, BotState, Repository
 from ..vault.service import TokenVault
 from .broker import BrokerClient, TradeOutcome, map_exception
@@ -355,6 +355,20 @@ class UserWorker:
         if not pv.ok:
             self._note(pv.reason)
             self._alert_skip(d, pv.reason)
+            return
+        # Demo and Real alike: only trade money that is there. A fresh reading; the last known one if the
+        # broker does not answer; no reading at all -> skip (never trade blind).
+        balance = await self._refresh_balance(broker)
+        if balance is None:
+            balance = self.balance
+        if balance is None or balance < s.stake:
+            reason = "balance_unavailable" if balance is None else "insufficient_balance"
+            self._note(reason)
+            if balance is None:
+                self._alert_skip(d, reason)
+            else:
+                self._alert(low_balance_text(mode=s.mode, asset=self._asset_name(d), direction=d.direction,
+                                             stake=s.stake, balance=balance))
             return
         self.last_reject = None
         self._last_trade_at = now          # cooldown starts before the order, so a failure cannot cause rapid retries

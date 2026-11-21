@@ -37,10 +37,14 @@ def decode(token: str) -> dict:
 class Chat:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str, dict | None]] = []
+        self.deleted: list[tuple[int, int]] = []
 
     async def send_message(self, chat_id, text, *, reply_markup=None, parse_mode="HTML"):
         self.sent.append((chat_id, text, reply_markup))
         return {"message_id": len(self.sent)}
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
 
     def last(self) -> str:
         return self.sent[-1][1]
@@ -63,6 +67,16 @@ class FakeService:
         self.calls.append(call)
         if self.fail:
             raise self.fail
+
+    sessions = {"demo": {"status": "missing"}, "real": {"status": "missing"}}
+
+    async def auth_status(self, uid):
+        self._record("auth_status", uid)
+        return self.sessions
+
+    async def submit_ssid(self, uid, ssid):
+        self._record("submit_ssid", uid, ssid)
+        return {"kind": "real" if '"isDemo":0' in ssid else "demo", "verified": True, "status": "active"}
 
     def login_link(self, uid):
         return "https://trade.example/login#t=abc"
@@ -185,6 +199,31 @@ class AutotradeCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.send("/at_login")
         markup = self.chat.sent[-1][2]
         self.assertEqual(markup["inline_keyboard"][0][0]["web_app"]["url"], "https://trade.example/login#t=abc")
+
+    async def test_login_reuses_a_saved_session_instead_of_a_new_sign_in(self):
+        self.service.sessions = {"demo": {"status": "active"}, "real": {"status": "active"}}
+        await self.send("/at_login")
+        self.assertIn("Already connected (Demo ✅ · Real ✅)", self.chat.last())
+        rows = self.chat.sent[-1][2]["inline_keyboard"]
+        self.assertEqual(rows[1][0]["callback_data"], "at:ssid")
+
+    async def test_login_menu_offers_direct_ssid_login(self):
+        await self.send("/at_login")
+        self.assertEqual(self.chat.sent[-1][2]["inline_keyboard"][1][0]["text"], "🔑 Direct SSID Login")
+
+    async def test_direct_ssid_is_saved_and_the_message_deleted(self):
+        ssid = '42["auth",{"session":"abc","isDemo":0,"uid":1,"platform":2}]'
+        update = message(f"/at_ssid {ssid}")
+        update["message"]["message_id"] = 77
+        await self.handler.handle_update(update)
+        self.assertIn(("submit_ssid", USER, ssid), self.service.calls)
+        self.assertEqual(self.chat.deleted, [(USER, 77)])
+        self.assertIn("Real session saved", self.chat.last())
+
+    async def test_ssid_without_value_shows_help(self):
+        await self.send("/at_ssid")
+        self.assertIn("Direct SSID Login", self.chat.last())
+        self.assertFalse(any(c[0] == "submit_ssid" for c in self.service.calls))
 
     async def test_kill_switch_only_for_admin_in_admin_chat(self):
         await self.send("/at_halt")                                     # normal user

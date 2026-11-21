@@ -44,7 +44,7 @@ VERIFICATION_HOSTS = ("google.com", "gstatic.com", "recaptcha.net", "googleuserc
 # Low-memory mode (Render 512 MB): one Chromium process, small JS heap, no GPU/shared-memory use.
 LOW_MEMORY_ARGS = (
     "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-    "--single-process", "--no-zygote", "--js-flags=--max-old-space-size=256",
+    "--single-process", "--no-zygote", "--js-flags=--max-old-space-size=128",
     "--enable-low-end-device-mode", "--disable-software-rasterizer", "--disable-extensions",
     "--disable-background-networking", "--disable-component-update", "--disable-default-apps",
     "--disable-sync", "--mute-audio", "--no-first-run", "--disable-breakpad",
@@ -53,6 +53,7 @@ LOW_MEMORY_ARGS = (
 )
 BLOCKED_RESOURCE_TYPES = frozenset({"image", "font", "media", "stylesheet"})
 CLOSE_TIMEOUT = 10.0
+CABINET_SWITCH_DELAY = 3.5   # seconds between Real and Demo cabinet pages (rapid switching -> "Error. Please try later.")
 VIEWPORT = {"width": 390, "height": 844}     # a phone: the site serves its mobile login layout
 DEVICE_SCALE = 2
 LOW_MEMORY_DEVICE_SCALE = 1
@@ -186,8 +187,10 @@ def should_block(url: str, resource_type: str, *, block_assets: bool, block_thir
 
 class PlaywrightBackend:
     def __init__(self, headless: bool = True, hosts: tuple[str, ...] = ALLOWED_HOSTS, login_url: str = LOGIN_URL,
-                 *, low_memory: bool = True, block_assets: bool = True, block_third_party: bool = True):
+                 *, low_memory: bool = True, block_assets: bool = True, block_third_party: bool = True,
+                 switch_delay: float = CABINET_SWITCH_DELAY):
         self._headless, self._hosts, self._login_url = headless, hosts, login_url
+        self._switch_delay = max(0.0, float(switch_delay))
         self._low_memory, self._block_assets, self._block_third_party = low_memory, block_assets, block_third_party
         # Login-page assets are dropped only while the user is not looking at the broker page (email/password
         # form). Once they must see it (verification after submit, or "finish on the Pocket Option page"),
@@ -369,6 +372,9 @@ class PlaywrightBackend:
         # use different session values (verified live), so the other kind can never be derived from this one.
         self._event.clear()
         try:
+            # A natural pause first: switching cabinets within a second triggers the broker's rate limit.
+            await asyncio.sleep(self._switch_delay)
+            self._check_alive()
             await self._page.goto(CABINET_URL[other], wait_until="domcontentloaded", timeout=30000)
             end = loop.time() + 20
             while other not in self._frames and loop.time() < end and not self._crashed:

@@ -2,7 +2,8 @@
 
 Signals stay read-only. These commands only work in a private chat with the bot and only when
 AUTOTRADE_API_URL and AUTOTRADE_JWT_SECRET are set; otherwise they answer "not set up".
-New users always start in Demo; Live needs /at_live confirm (and the service must allow Live).
+New users always start in Demo; Real (Live) needs /at_live confirm. /at_login reuses a saved session
+instead of a new browser sign-in; /at_ssid stores a pasted SSID without any browser.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 AUTOTRADE_COMMANDS = [
     {"command": "autotrade", "description": "Auto-trading overview (Demo by default)"},
     {"command": "at_login", "description": "Connect your Pocket Option account"},
+    {"command": "at_ssid", "description": "Direct SSID login (paste your Pocket Option SSID)"},
     {"command": "at_start", "description": "Start your auto-trading bot"},
     {"command": "at_stop", "description": "Stop your auto-trading bot"},
     {"command": "at_stats", "description": "Today's trades and results"},
@@ -65,6 +67,15 @@ LIVE_WARNING = (
     "Your daily stop-loss and stake limits still apply. To switch, send:\n/at_live confirm"
 )
 
+SSID_HELP = (
+    "🔑 Direct SSID Login (no browser sign-in)\n"
+    "1. Open Pocket Option in a desktop browser and log in (Demo or Real cabinet).\n"
+    "2. Developer tools → Network → WS → the frame starting with 42[\"auth\",\n"
+    "3. Copy the whole frame and send it here as:\n/at_ssid 42[\"auth\",{...}]\n\n"
+    "Demo and Real are separate SSIDs (isDemo 1 or 0): send each one you want to use. "
+    "Your message is deleted right away and the SSID is stored encrypted."
+)
+
 Send = Callable[..., Awaitable[Any]]
 
 
@@ -83,6 +94,10 @@ def error_text(exc: AutotradeError) -> str:
     if exc.code == "reauth_required":
         which = "Real" if exc.kind == "real" else "Demo"
         return f"Your Pocket Option {which} session is missing or has expired. Send /at_login to connect again."
+    if exc.code == "invalid_ssid":
+        return "That isn't a valid Pocket Option SSID. It must start with 42[\"auth\",. Send /at_ssid for help."
+    if exc.code == "ssid_rejected":
+        return "Pocket Option rejected that SSID (expired or logged out). Copy a fresh one, or use /at_login."
     if exc.code == "live_disabled":
         return "Live trading is switched off on this service. You can keep trading in Demo."
     if exc.code == "invalid_settings":
@@ -218,7 +233,19 @@ class AutotradeCommands:
         button: dict[str, Any] = (
             {"text": "Log in to Pocket Option", "web_app": {"url": link}} if link.startswith("https://")
             else {"text": "Log in to Pocket Option", "url": link})
-        return {"inline_keyboard": [[button]]}
+        return {"inline_keyboard": [[button], [{"text": "🔑 Direct SSID Login", "callback_data": "at:ssid"}]]}
+
+    @staticmethod
+    def live_markup() -> dict[str, Any]:
+        return {"inline_keyboard": [[{"text": "✅ Yes, switch to Real", "callback_data": "at:liveconfirm"},
+                                     {"text": "Stay in Demo", "callback_data": "at:demo"}]]}
+
+    @staticmethod
+    def connected_text(status: dict[str, Any]) -> str | None:
+        """Saved sessions that are still active, e.g. "Demo ✅ · Real ✅"; None when there are none."""
+        marks = [f"{name} ✅" for kind, name in (("demo", "Demo"), ("real", "Real"))
+                 if (status.get(kind) or {}).get("status") == "active"]
+        return " · ".join(marks) or None
 
     async def enable_follow(self, uid: int) -> tuple[bool, str, dict[str, Any] | None]:
         """Menu "Start Auto-Trade": place GBot signals for this user automatically.
@@ -274,14 +301,35 @@ class AutotradeCommands:
         assert c is not None
         if command == "autotrade":
             stats = await c.stats(uid)
-            await self.reply(chat_id, overview_text(stats) + "\n\nCommands: /at_login /at_start /at_stop "
+            await self.reply(chat_id, overview_text(stats) + "\n\nCommands: /at_login /at_ssid /at_start /at_stop "
                              "/at_stats /at_balance /at_set /at_live /at_demo /at_logout")
         elif command == "at_login":
+            # Saved session first: a new browser login per /at_login gets the server's IP blocked.
+            connected = None
+            try:
+                connected = self.connected_text(await c.auth_status(uid))
+            except Exception:              # status unknown: offer the normal sign-in
+                connected = None
+            if connected:
+                await self.reply(chat_id, f"✅ Already connected ({connected}). Your saved session is reused, "
+                                 "so no new sign-in is needed: tap 🤖 Start Auto-Trade or send /at_start.\n\n"
+                                 "Only if Pocket Option logged you out, sign in again or paste an SSID:",
+                                 self.login_markup(uid))
+                return
             # Inside Telegram as a Mini App when the service is on HTTPS; plain link otherwise (local testing).
             await self.reply(chat_id, "Tap the button to log in to Pocket Option. The link works for 15 minutes "
                              "and is only for you, so don't forward it. After logging in, pick an asset with "
                              "/start and tap 🤖 Start Auto-Trade (or send /at_start).",
                              self.login_markup(uid))
+        elif command == "at_ssid":
+            if not args:
+                await self.reply(chat_id, SSID_HELP)
+                return
+            res = await c.submit_ssid(uid, args)
+            which = "Real" if res.get("kind") == "real" else "Demo"
+            note = "" if res.get("verified") else " (Pocket Option couldn't be reached to check it; it will be used next time)"
+            await self.reply(chat_id, f"✅ {which} session saved{note}. No browser sign-in needed: "
+                             "tap 🤖 Start Auto-Trade or send /at_start.")
         elif command == "at_start":
             await c.start(uid)
             stats = await c.stats(uid)
@@ -303,7 +351,7 @@ class AutotradeCommands:
             await self._set(chat_id, uid, args)
         elif command == "at_live":
             if args.lower() != "confirm":
-                await self.reply(chat_id, LIVE_WARNING)
+                await self.reply(chat_id, LIVE_WARNING, self.live_markup())
                 return
             s = await c.update_settings(uid, {"mode": "live", "confirm_live": True})
             await self.reply(chat_id, "Live mode is on: trades now use REAL money.\n\n" + settings_summary(s))

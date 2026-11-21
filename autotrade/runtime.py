@@ -62,7 +62,7 @@ def build_runtime(cfg: Config, *, repo: Repository | None = None, keyring: KeyRi
 
     def default_backend() -> PlaywrightBackend:
         return PlaywrightBackend(cfg.headless, low_memory=cfg.low_memory, block_assets=cfg.block_login_assets,
-                                 block_third_party=cfg.block_third_party)
+                                 block_third_party=cfg.block_third_party, switch_delay=cfg.cabinet_switch_delay)
 
     handshakes = HandshakeManager(cfg, backend_factory or default_backend, sink, clock)
     return Runtime(cfg, repo, vault, health, feed, manager, handshakes, notifier)

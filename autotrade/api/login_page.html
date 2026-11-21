@@ -73,6 +73,7 @@
   <h2 id="resultTitle"></h2>
   <p id="resultText"></p>
   <button class="primary" id="retryBtn" type="button">Try again</button>
+  <button id="forceBtn" type="button" hidden>Sign in again anyway</button>
   <button id="closeBtn" type="button">Return to Telegram</button>
 </div>
 <div id="start" hidden>
@@ -115,6 +116,7 @@
     $("credentials").hidden = true; $("start").hidden = true;
     $("resultTitle").textContent = title; $("resultTitle").className = kind;
     $("resultText").textContent = text || ""; $("retryBtn").hidden = !retry; $("result").hidden = false;
+    $("forceBtn").hidden = true;
     msg(kind === "good" ? "Connected" : "Connect Pocket Option", kind === "good" ? "good" : "");
   }
   function showForm(error) {
@@ -129,6 +131,7 @@
     return fallback;
   }
   function expired() { showResult("bad", "Login link expired", "Send /at_login in Telegram to get a new link.", false); }
+  $("forceBtn").onclick = () => { forceLogin = true; showForm(""); };
   $("retryBtn").onclick = async () => {
     if (sid) { const id = sid; sid = null; await api(`auth/handshake/${id}`, { method: "DELETE" }).catch(() => null); }
     showForm("");
@@ -136,13 +139,14 @@
   $("closeBtn").onclick = () => { if (tg) { try { tg.close(); return; } catch (e) {} } window.close(); };
 
   // ---- start ------------------------------------------------------------------------------------
+  let forceLogin = false;
   async function begin(fullView = false) {
     $("credentials").hidden = true; $("result").hidden = true; submittedAt = 0; lastNotice = "";
     $("start").hidden = true; msg("Opening the login page… (this can take ~10 seconds)");
     stage.style.display = "block";            // so we can measure it: the site is rendered at exactly this size
     const w = Math.round(stage.clientWidth), h = Math.round(stage.clientHeight);
     let r;
-    try { r = await api("auth/handshake", { method: "POST", body: JSON.stringify({ width: w, height: h, full_view: fullView === true }) }); }
+    try { r = await api("auth/handshake", { method: "POST", body: JSON.stringify({ width: w, height: h, full_view: fullView === true, force: forceLogin }) }); }
     catch (e) { r = null; }
     if (r && r.status === 401) { expired(); return false; }
     if (!r || !r.ok) {
@@ -150,7 +154,15 @@
       showResult("bad", "Could not open Pocket Option", text || "The sign-in page could not be opened right now. Try again in a minute.", true);
       return false;
     }
-    sid = (await r.json()).session_id; ended = false;
+    const started = await r.json();
+    if (started.reused) {      // saved session still works: no new browser sign-in (avoids broker IP blocks)
+      showResult("good", "Already connected",
+        "Your saved Pocket Option session (" + (started.kinds || []).join(" + ") + ") is reused. " +
+        "No new sign-in was needed. Return to Telegram and tap 🤖 Start Auto-Trade.", false);
+      $("forceBtn").hidden = false;
+      return false;
+    }
+    sid = started.session_id; ended = false;
     $("cancel").hidden = false;
     looping = true; loop(); statusTimer = setInterval(refreshStatus, 1500);
     return true;

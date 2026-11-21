@@ -1,4 +1,52 @@
-# G-Bot status — 512 MB login, Signals vs Auto-Trade, reliability upgrades
+# G-Bot status — saved-session reuse, Direct SSID login, Real + Demo auto-trade (2026-11-21)
+
+## Fixed / implemented in this revision
+- **No repeated browser logins (prevents Pocket Option IP blocks)**: `POST /auth/handshake` first checks the
+  vault. If the saved session for the selected mode works, it is reused and **no Chromium is started**
+  (`{"reused": true}`; the sign-in page says "Already connected"). A running bot counts as proof; otherwise one
+  WebSocket check. Only an explicit broker rejection (`auth_error` → session expired) opens a fresh browser
+  login; network trouble keeps the token. "Sign in again anyway" on the page (`force: true`) is the only bypass.
+  `/at_start` already connected with the saved SSID over WebSocket only (unchanged), so it survives restarts.
+- **/at_login**: when a session is saved it answers "✅ Already connected (Demo ✅ · Real ✅)" instead of
+  pushing a new sign-in. The sub-menu now has **🔑 Direct SSID Login**.
+- **Direct SSID Login**: `/at_ssid 42["auth",{...}]` (or the button → instructions). The bot deletes the
+  message at once; the service (`POST /auth/ssid`, full-scope token, 5/15 min limit) detects Demo/Real from
+  `isDemo` (never converted), stores it encrypted, checks it once over WebSocket, and refuses rejected or
+  malformed values without echoing them. No browser is used.
+- **Demo/Real capture**: `capture_tokens()` waits 3.5 s (`AUTOTRADE_CABINET_SWITCH_DELAY`, default 3.5)
+  before opening the other cabinet, so both genuine frames are captured and stored separately.
+- **Real + Demo auto-trading**: `AUTOTRADE_ALLOW_LIVE` now defaults to **true**. The asset menu has
+  🧪 Demo / 💵 Real / 🔑 Login buttons; 💵 Real asks for one confirmation (button or `/at_live confirm`) and
+  needs a saved Real session. A fresh browser login still resets to Demo (Real must be re-confirmed).
+- **Balance check before every auto-trade (Demo and Real)**: fresh balance read (last known one if the broker
+  is slow). Balance below the stake → trade skipped + "⚠️ Low balance … Top up or lower the stake" alert.
+  No balance at all → skipped with an explanation (never trades blind).
+- **512 MB**: Chromium JS heap lowered to `--js-flags=--max-old-space-size=128` (plus `--no-sandbox`,
+  `--disable-dev-shm-usage`, single-process, asset blocking, close right after capture — unchanged). Session
+  reuse means most `/at_login` taps start no browser at all.
+- Unchanged: `WELCOME_IMAGE_URL`, Render plan (512 MB), signal card format and the six Setup names,
+  max 2 open trades / 5 s cooldown, rate limits.
+
+## Verified in this revision
+- GBot suite: 158 tests OK. Autotrade suite: 136 tests OK (3 skipped, need Postgres) — includes new
+  `autotrade/tests/test_session_reuse.py` (reuse without browser, unreachable keeps session, auth_error opens
+  browser, force, Direct SSID Demo/Real/rejected/malformed/scope, 3.5 s cabinet pause, 128 MB heap, Real
+  allowed by default, low-balance skip, balance == stake trades, unreadable balance skips) and new
+  `/at_login` / `/at_ssid` tests in `tests/test_autotrade_commands.py`. No test starts a real browser login.
+
+## Not verified
+- No new live Pocket Option login was run (on purpose: repeated logins caused the earlier IP block).
+- Render memory use under the 128 MB heap flag is not measured on Render itself.
+- A real-money (Real account) trade was not placed.
+
+## Needs your action on Render (The-G-Bot-autotrade)
+- If `AUTOTRADE_ALLOW_LIVE=false` is set explicitly, change it to `true` (or delete it) — an explicit value
+  overrides the new default.
+- Optional: `AUTOTRADE_CABINET_SWITCH_DELAY` (default 3.5 seconds).
+
+---
+
+# Previous revision — 512 MB login, Signals vs Auto-Trade, reliability upgrades
 
 ## Fixed / implemented in this revision
 - **Login on Render 512 MB (no plan change)**: the sign-in browser runs in low-memory mode
