@@ -30,19 +30,40 @@
   #proxy.on { opacity:.01; pointer-events:auto; }
   #start { margin:auto; text-align:center; padding:24px; max-width:360px; }
   #start p { color:var(--muted); }
+  #credentials { width:100%; max-width:420px; margin:auto; padding:24px; }
+  #credentials h1 { margin:0 0 24px; font-size:26px; }
+  #credentials label { display:block; margin:16px 0 8px; }
+  #credentials input { width:100%; min-height:46px; border:1px solid var(--muted); border-radius:6px;
+    background:var(--card); color:var(--fg); padding:10px 12px; font:16px system-ui,sans-serif; }
+  .password-field { display:flex; gap:8px; align-items:stretch; }
+  .password-field input { min-width:0; }
+  #credentials button.primary { width:100%; min-height:46px; margin-top:24px; }
+  #credentials p { color:var(--muted); font-size:12px; }
+  button:disabled { opacity:.6; }
   [hidden] { display:none !important; }
 </style>
 </head>
 <body>
 <header>
   <span id="site" hidden></span>
-  <div id="msg">Preparing…</div>
+  <div id="msg">Connect Pocket Option</div>
   <button id="cancel" hidden>Cancel</button>
 </header>
+<form id="credentials">
+  <h1>Pocket Option</h1>
+  <label for="email">Email</label>
+  <input id="email" name="email" type="email" autocomplete="username" inputmode="email" maxlength="254" required>
+  <label for="password">Password</label>
+  <div class="password-field">
+    <input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required>
+    <button id="showPassword" type="button" aria-label="Show password" title="Show password">◉</button>
+  </div>
+  <button class="primary" id="connectBtn" type="submit">Connect account</button>
+  <p>Passwords are used for broker sign-in only and are never saved. Connected sessions are encrypted.</p>
+  <button id="openBroker" type="button">Open broker page</button>
+</form>
 <div id="start" hidden>
-  <p>This opens the Pocket Option login page in a private browser on our server, shown here like a normal phone
-     website. We never read your password: once you are logged in we keep only the session for your Demo and
-     Real accounts (encrypted) and close the browser.</p>
+  <p>Complete any broker verification on this page. Only your connected sessions are saved, encrypted.</p>
   <button class="primary" id="startBtn">Open Pocket Option login</button>
 </div>
 <div id="stage">
@@ -67,13 +88,19 @@
   let vw = 390, vh = 844, inputs = [], field = null, boostUntil = 0, lastTap = 0, nullCount = 0;
   let fieldKey = "", pending = null, sending = false, ended = false;
 
-  if (!token) { msg("This link is missing its login code. Send /at_login in Telegram to get a new one.", "bad"); return; }
+  if (!token) { $("credentials").hidden = true; msg("This link is missing its login code. Send /at_login in Telegram to get a new one.", "bad"); return; }
+  if (location.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(location.hostname)) {
+    $("credentials").hidden = true; msg("A secure HTTPS connection is required.", "bad"); return;
+  }
 
-  function stopAll() { ended = true; looping = false; clearInterval(statusTimer); statusTimer = null; blurProxy(); }
+  function stopAll() { ended = true; looping = false; clearInterval(statusTimer); statusTimer = null; blurProxy();
+    $("password").value = ""; proxy.value = ""; pending = null;
+    if (lastUrl) { URL.revokeObjectURL(lastUrl); lastUrl = null; img.removeAttribute("src"); } }
   function expired() { stopAll(); msg("This login link has expired. Send /at_login in Telegram to get a new one.", "bad"); }
 
   // ---- start ------------------------------------------------------------------------------------
   async function begin() {
+    $("credentials").hidden = true;
     $("start").hidden = true; msg("Opening the login page… (this can take ~10 seconds)");
     stage.style.display = "block";            // so we can measure it: the site is rendered at exactly this size
     const w = Math.round(stage.clientWidth), h = Math.round(stage.clientHeight);
@@ -82,13 +109,50 @@
     catch (e) { r = null; }
     if (r && r.status === 401) return expired();
     if (!r || !r.ok) { stage.style.display = "none"; $("start").hidden = false; $("startBtn").textContent = "Try again";
-                       msg("Could not open the login page right now. Try again in a minute.", "bad"); return; }
+                       msg("Could not open the login page right now. Try again in a minute.", "bad"); return false; }
     sid = (await r.json()).session_id; ended = false;
     $("cancel").hidden = false;
     looping = true; loop(); statusTimer = setInterval(refreshStatus, 1500);
+    return true;
   }
   $("startBtn").onclick = begin;
-  begin();
+  $("openBroker").onclick = () => { $("password").value = ""; begin(); };
+  $("showPassword").onclick = () => {
+    const visible = $("password").type === "password";
+    $("password").type = visible ? "text" : "password";
+    $("showPassword").setAttribute("aria-label", visible ? "Hide password" : "Show password");
+    $("showPassword").title = visible ? "Hide password" : "Show password";
+  };
+  $("email").addEventListener("input", () => $("email").setCustomValidity(""));
+  $("credentials").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const email = $("email").value.trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      $("email").setCustomValidity("Enter a valid email address."); $("email").reportValidity(); return;
+    }
+    if (!$("credentials").reportValidity()) return;
+    let payload = JSON.stringify({ email, password: $("password").value });
+    $("password").value = ""; $("password").type = "password"; $("connectBtn").disabled = true;
+    try {
+      if (!await begin()) return;
+      let ready = false;
+      for (let i = 0; i < 50 && !ended; i++) {
+        const r = await api(`auth/handshake/${sid}`);
+        if (r.status === 401) return expired();
+        if (!r.ok) break;
+        const state = (await r.json()).state;
+        if (state === "waiting_for_login") { ready = true; break; }
+        if (state !== "starting") break;
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      if (!ready || ended) { msg("The broker page is not ready. Try a new login link.", "bad"); return; }
+      const r = await api(`auth/handshake/${sid}/credentials`, { method:"POST", body:payload });
+      if (r.status === 401) return expired();
+      if (!r.ok) { msg("Could not submit sign-in. Complete it on the broker page below.", "bad"); return; }
+      msg("Sign-in submitted. Complete any verification on the broker page.");
+    } catch (e) { msg("Connection interrupted. Use the broker page or a new login link.", "bad"); }
+    finally { payload = ""; $("connectBtn").disabled = false; }
+  });
 
   // ---- live view: picture + where the focused input is --------------------------------------------
   async function loop() {

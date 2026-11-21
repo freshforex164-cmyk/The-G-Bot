@@ -11,9 +11,11 @@ from typing import Any, Callable, Literal
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from ..errors import ReauthRequired, SettingsError
 from ..runtime import Runtime
@@ -91,6 +93,17 @@ class StopBody(BaseModel):
     drain: bool = True
 
 
+class BrokerCredentials(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    email: str = Field(min_length=3, max_length=254, pattern=r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+    password: SecretStr = Field(min_length=1, max_length=256)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def trim_email(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
 class InputEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
     type: Literal["click", "value", "text", "key", "scroll"]
@@ -149,6 +162,13 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
                 await after_stop()
 
     app = FastAPI(title="Autotrade service", lifespan=lifespan, docs_url=None, redoc_url=None)
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_request, exc):
+        # FastAPI's default errors include the rejected input, which may contain a password/token.
+        return JSONResponse(status_code=422, content={"detail": [
+            {"type": error["type"], "loc": list(error["loc"]), "msg": "Invalid input."}
+            for error in exc.errors()
+        ]})
     if rt.cfg.cors_origins:
         app.add_middleware(CORSMiddleware, allow_origins=list(rt.cfg.cors_origins), allow_credentials=False,
                            allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Authorization", "Content-Type"])
@@ -158,6 +178,8 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
+        if request.url.path.startswith(("/login", "/auth/handshake")):
+            response.headers["Referrer-Policy"] = "no-referrer"
         return response
 
     @app.get("/healthz")
@@ -259,6 +281,21 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
             await rt.handshakes.interact(session_id, p.user_id, ev.model_dump(exclude_none=True))
         except RuntimeError as exc:
             raise HTTPException(409, str(exc)) from None
+        return Response(status_code=204)
+
+    @app.post("/auth/handshake/{session_id}/credentials", status_code=204)
+    async def handshake_credentials(session_id: str, body: BrokerCredentials, request: Request,
+                                    p: Principal = Depends(auth)):
+        _get(session_id, p)
+        # TLS is mandatory outside local tests/development; configure the host's trusted proxy correctly.
+        if request.url.scheme != "https" and (request.client is None or request.client.host not in {"127.0.0.1", "::1", "testclient"}):
+            raise HTTPException(400, "HTTPS is required for broker login.")
+        try:
+            await rt.handshakes.submit_credentials(session_id, p.user_id, body.email, body.password.get_secret_value())
+        except RuntimeError:
+            raise HTTPException(409, "The broker login could not be submitted. Use the broker page to continue.") from None
+        finally:
+            body.password = SecretStr("")
         return Response(status_code=204)
 
     @app.delete("/auth/handshake/{session_id}", status_code=204)

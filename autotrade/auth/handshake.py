@@ -4,7 +4,8 @@ The user logs in themselves (email/password, Google, CAPTCHA, 2FA) on the real P
 rendered as a phone-sized page by an isolated browser on the server. The frontend shows it edge to
 edge through ``screen`` (picture) + ``view`` (where the focused input is) + ``input`` endpoints, and
 puts a real native <input> over whichever field is focused, so the phone's own keyboard, autofill and
-password manager work directly in the site's email/password fields. We never read the password field: we only watch the WebSocket auth frame the Pocket Option page sends
+password manager work directly in the site's email/password fields. The standard hosted form forwards
+credentials transiently to that broker page; passwords are never logged, returned, or persisted. We watch the WebSocket auth frame the Pocket Option page sends
 after login (``42["auth",{...}]``), extract the Demo and Real SSIDs, close the browser, and hand
 the tokens to the vault.
 
@@ -21,10 +22,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Protocol
 from urllib.parse import unquote, urlparse
+import re
 
 from ..clock import Clock
 from ..config import Config
 from .ssid import DEMO_KIND, KINDS, REAL_KIND, account_kind, build_ssid, parse_ssid, with_kind
+from .session_state import broker_domain, sanitize_browser_session
 
 log = logging.getLogger("autotrade.handshake")
 
@@ -85,6 +88,7 @@ class CaptureBackend(Protocol):
     async def screenshot(self) -> bytes: ...
     async def view(self) -> dict[str, Any]: ...
     async def interact(self, event: dict[str, Any]) -> None: ...
+    async def submit_credentials(self, email: str, password: str) -> None: ...
     async def capture_tokens(self, timeout: float, on_status: Callable[[str], None]) -> tuple[dict[str, str], dict[str, Any]]: ...
     async def close(self) -> None: ...
 
@@ -119,6 +123,7 @@ class PlaywrightBackend:
         self._pages: list[Any] = []
         self._frames: dict[str, str] = {}
         self._event = asyncio.Event()
+        self._credential_lock = asyncio.Lock()
 
     def set_viewport(self, width: int, height: int) -> None:
         """Match the user's own screen so the site fills the phone edge to edge. Before open()."""
@@ -232,7 +237,7 @@ class PlaywrightBackend:
                 cookie = await self._session_cookie()
                 if cookie:  # fallback: same method as BinaryOptionsToolsV2.login()
                     return ({DEMO_KIND: build_ssid(cookie, DEMO_KIND), REAL_KIND: build_ssid(cookie, REAL_KIND)},
-                            {"method": "cookie", "derived": list(KINDS)})
+                            await self._capture_metadata("cookie", list(KINDS)))
                 raise TimeoutError("login was not completed in time")
             try:
                 await asyncio.wait_for(self._event.wait(), timeout=min(remaining, 2.0))
@@ -257,13 +262,52 @@ class PlaywrightBackend:
                 self._frames[other] = alt
                 derived.append(other)
         tokens = {k: self._frames[k] for k in KINDS if k in self._frames}
-        return tokens, {"method": "websocket", "derived": derived}
+        return tokens, await self._capture_metadata("websocket", derived)
+
+    async def _capture_metadata(self, method, derived):
+        state = {"cookies": await self._context.cookies()} if self._context else {"cookies": []}
+        return {"method": method, "derived": derived, "_browser_session": sanitize_browser_session(state)}
+
+    async def submit_credentials(self, email: str, password: str) -> None:
+        """Submit only to the existing HTTPS broker page. CAPTCHA/2FA remain interactive."""
+        if not (isinstance(email, str) and len(email) <= 254 and re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email)):
+            raise RuntimeError("Enter a valid email address.")
+        if not isinstance(password, str) or not 1 <= len(password) <= MAX_VALUE_LEN:
+            raise RuntimeError("Enter a valid password.")
+        async with self._credential_lock:
+            page = self._page
+            url = urlparse(page.url) if page is not None else None
+            if url is None or url.scheme != "https" or not broker_domain(url.hostname or ""):
+                raise RuntimeError("The broker login page is not ready.")
+            passwords = page.locator('input[type="password"]:visible')
+            if await passwords.count() != 1:
+                raise RuntimeError("Use the broker page to complete this login.")
+            password_field = passwords.first
+            form = password_field.locator("xpath=ancestor::form[1]")
+            if await form.count() != 1:
+                raise RuntimeError("Use the broker page to complete this login.")
+            emails = form.locator('input[type="email"]:visible, input[name="email"]:visible, input[name="login"]:visible, input[name="username"]:visible')
+            if await emails.count() != 1:
+                raise RuntimeError("Use the broker page to complete this login.")
+            try:
+                await emails.fill(email)
+                await password_field.fill(password)
+                await password_field.press("Enter")
+            except Exception:
+                raise RuntimeError("Could not submit the broker login. Use the broker page to continue.") from None
+            finally:
+                password = ""
+                try:
+                    if not page.is_closed() and await password_field.count():
+                        await password_field.fill("", timeout=1000)
+                except Exception:
+                    pass
 
     async def _session_cookie(self) -> str | None:
         if self._context is None:
             return None
         for c in await self._context.cookies():
-            if c.get("name") == "po_session" and c.get("value"):
+            if c.get("name") == "po_session" and c.get("value") and broker_domain(c.get("domain", "")):
                 return unquote(c["value"]) if "%" in c["value"] else c["value"]
         return None
 
@@ -347,6 +391,12 @@ class HandshakeManager:
         if not s.active or s.backend is None:
             raise RuntimeError("login session is not active")
         await s.backend.interact(event)
+
+    async def submit_credentials(self, session_id: str, user_id: str, email: str, password: str) -> None:
+        s = self.get(session_id, user_id)
+        if s.state != "waiting_for_login" or s.backend is None:
+            raise RuntimeError("The broker login page is not ready.")
+        await s.backend.submit_credentials(email, password)
 
     async def cancel(self, session_id: str, user_id: str) -> None:
         s = self.get(session_id, user_id)

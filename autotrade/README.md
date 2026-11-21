@@ -10,14 +10,14 @@ set `AUTOTRADE_API_URL` + `AUTOTRADE_JWT_SECRET` on GBot.
 autotrade/
   schema.sql                 Postgres tables (credentials, settings, trades, bot_state, audit)
   config.py  clock.py  errors.py  logging_utils.py  runtime.py  main.py
-  auth/      ssid.py (parse/validate) | handshake.py (Playwright capture) | health.py (session check + worker)
+  auth/      ssid.py (parse/validate) | handshake.py (Playwright capture) | session_state.py (broker cookies) | health.py
   vault/     crypto.py (AES-256-GCM, key ring) | service.py (TokenVault)
   market/    feed.py                 ONE shared tick listener, fan-out to all workers
   trading/   models.py (settings) | strategy.py (plug-ins) | risk.py | broker.py (BinaryOptionsTools-v2 adapter)
              worker.py (one task + one WebSocket per user) | manager.py (supervisor)
   storage/   repo.py (interface + in-memory) | postgres.py
   api/       app.py (FastAPI) | login_page.html (remote-browser login page, opened from Telegram)
-  tests/     72 offline tests (+3 Postgres tests when AUTOTRADE_TEST_DATABASE_URL is set)
+  tests/     80 offline tests (+3 Postgres tests when AUTOTRADE_TEST_DATABASE_URL is set)
   Dockerfile                 image with Chromium (build from repo root)
 
 repo root (GBot side, standard library only, no new GBot dependencies)
@@ -27,16 +27,21 @@ repo root (GBot side, standard library only, no new GBot dependencies)
 ```
 
 ## How it fits together
-1. `POST /auth/handshake` (body `{"width","height"}` = the phone's screen in CSS px) starts an isolated
-   Chromium on the server that emulates that phone (touch, mobile user agent), so Pocket Option serves its
-   standard mobile login page with its own email/password fields and "Log in with Google" button.
-   `/login` shows that page edge to edge (`GET .../screen`). `GET .../view` says where the site's text
+1. `/login#t=<login token>` starts with a standard email/password form. A validated, owner-authenticated
+   `POST /auth/handshake/{id}/credentials` forwards credentials only to the HTTPS Pocket Option login
+   page in an isolated browser; no separate broker API keys or OAuth application are used. Passwords
+   are cleared after submission and never persisted. The user completes CAPTCHA, 2FA, or any provider
+   steps on the interactive broker page. `POST /auth/handshake` (body `{"width","height"}`) starts that
+   phone-sized browser. `/login` can also show its page (`GET .../screen`). `GET .../view` says where the site's text
    boxes are and which one is focused; the page puts a real native `<input>` over it, so the phone's own
    keyboard, autofill and password manager type straight into the site's field (`POST .../input`
-   `{"type":"value"}`). Taps are taps, drags scroll. The user completes login, CAPTCHA and 2FA there. We read only the WebSocket `42["auth",{...}]` frame,
+   `{"type":"value"}`). Taps are taps, drags scroll. We capture the WebSocket `42["auth",{...}]` frame,
    take the Demo and Real SSIDs, **close the browser**, then hand both to the vault.
-2. Vault: each SSID is AES-256-GCM encrypted; the user id and account kind are bound as associated data.
-   Key ring supports rotation (`TokenVault.rewrap`).
+2. Vault: each SSID and validated broker-cookie snapshot are AES-256-GCM encrypted together; user id
+   and account kind are bound as associated data. Google-domain cookies, passwords, and unrelated
+   browser state are excluded. Existing SSID-only ciphertext remains readable. The existing
+   `autotrade_credentials` table stores the versioned encrypted payload; no schema migration is needed.
+   Key rotation (`TokenVault.rewrap`), expired-session handling, and disconnect deletion cover the whole payload.
 3. `POST /trading/start` health-checks the chosen account's SSID (live connect). Rejected ->
    `409 reauth_required` (frontend re-runs the handshake). Network trouble -> `503`, token kept.
 4. One shared feed (`AUTOTRADE_FEED_SSID`, a dedicated Demo account) streams each symbol once. Each user
@@ -51,6 +56,7 @@ repo root (GBot side, standard library only, no new GBot dependencies)
 | PATCH | /trading/settings | Change settings. Live needs `{"mode":"live","confirm_live":true}` |
 | GET | /trading/settings, /trading/stats | Settings; status, today's P/L, win rate, recent trades, session status |
 | GET/POST/DELETE | /auth/status, /auth/handshake[...] | Login capture; `DELETE /auth/sessions` revokes tokens and stops the bot |
+| POST | /auth/handshake/{session_id}/credentials | Validated email/password submission, restricted to the login-session owner; HTTPS required outside localhost tests |
 | POST | /admin/halt, /admin/resume | Operator kill switch (JWT claim `role=admin`) |
 | GET | /healthz | Feed state |
 | GET | /login | Login page. Token in the URL fragment `#t=...`; a `scope=login` token works only on `/auth/handshake*` |
@@ -103,10 +109,12 @@ The commands are registered in Telegram's menu only when these are set.
 ## Integrating with your codebase
 - Auth: set the same JWT secret, or pass your own dependency: `create_app(rt, auth=your_dependency)`
   returning `Principal(user_id, is_admin)`.
-- Frontend: easiest is to open `/login#t=<login token>` (phone web view / Telegram Mini App). Own UI:
+- Frontend: open `/login#t=<login token>` (standard form / Telegram Mini App). Own UI:
   `POST /auth/handshake` with the screen size, draw `/screen`, place a native input over `view.field`,
   send taps (`click`), whole field text (`value`), `Enter` (`key`) and drags (`scroll`) to `/input`,
   poll the handshake state until `done`; then show Demo/Live, settings and `/trading/stats`.
+  A standard form may instead submit `{email,password}` to the authenticated `/credentials` endpoint
+  once the handshake reports `waiting_for_login`. Never store or log the password.
 - Why not load pocketoption.com directly in our page: the site cannot be embedded in another site, and
   its login cookies and WebSocket belong to its own domain, so no page of ours could read the session.
   The phone view above is the closest to "direct" that still lets us capture the SSID automatically.
@@ -117,6 +125,9 @@ The commands are registered in Telegram's menu only when these are set.
 - Typed login text passes through the server to the isolated browser; it is never logged or stored.
   `/view` never returns the value of a password field.
   Tokens are redacted from logs (`logging_utils`). Do not enable library debug logging.
+- Serve login over HTTPS and configure trusted proxy forwarding correctly. Validation failures never
+  return rejected input values. Capture and status endpoints never expose saved cookies or passwords;
+  `TokenVault.get_browser_session` is internal-only and enforces the existing user/account binding.
 - The capture browser blocks private/local addresses and limits top-level navigation to login hosts.
   Also run it with no access to your internal network.
 - Anyone holding a user's SSID controls their session. Only the vault, the broker adapter and the
@@ -126,7 +137,7 @@ The commands are registered in Telegram's menu only when these are set.
 
 ## Verified vs not verified
 Verified offline: encryption, risk rules, workers, isolation, reconnect, API, handshake logic with a fake
-browser, Postgres schema/queries, GBot's client against the real API app, the Telegram commands, and the
+browser, encrypted cookie persistence and PostgreSQL repository wiring (live PostgreSQL tests need a test database), GBot's client against the real API app, the Telegram commands, and the
 phone login page in a real Chromium (phone size: native keyboard fills the site's email/password
 fields, taps reach the Google button) against a fake login screen. NOT VERIFIED: the Docker image
 build, the real Pocket Option mobile login page (its layout, the Google pop-up, CAPTCHA), the real login flow (URLs, allowed hosts, account switching in `auth/handshake.py`), the Telegram

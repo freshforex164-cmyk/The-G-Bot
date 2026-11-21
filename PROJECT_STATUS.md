@@ -11,16 +11,22 @@
 - Auto-trading uses the same price-action engine, timestamped feed ticks, minute-boundary wake-ups, and 60-second expiry. Saved `gap` settings are a compatibility alias to price action, not the former gap strategy.
 - Independent HTML signal cards show BUY/CALL or SELL/PUT, asset, one-minute expiration, live payout (or unavailable), and only `Payouts may vary.` Telegram supports bold text and colored emoji, not arbitrary font sizes or colored text.
 - Existing database structures, encrypted broker-session vault, private hosted login, heartbeat/reconnect checks, risk limits, and open-trade recovery remain intact. CSV stores preserve existing headers/rows.
+- Hosted `/login` now presents a standard email/password form. A validated, owner-authenticated submission fills and submits the existing HTTPS broker form in an isolated browser; no separate broker keys or OAuth application are required for this path.
+- Broker cookies and account tokens are stored together in a versioned AES-256-GCM encrypted payload inside existing credential rows. Legacy token-only rows remain readable; no database schema changes or additional profiles are introduced. Google-domain cookies, passwords, and unrelated browser state are excluded.
+- Passwords are transient, never persisted or returned by API responses, and cleared after submission. Invalid request responses omit rejected values; nonlocal plain HTTP credential submission is rejected. CAPTCHA/2FA remain on the interactive broker page.
 
 ## Verified in this revision — offline only
 - Bot suite: 163 tests run, 133 passed, 30 previously skipped legacy tests, no failures.
-- Auto-trading suite: 75 tests run, 72 passed, 3 skipped PostgreSQL integration tests, no failures.
+- Auto-trading suite: 83 tests run, 80 passed, 3 skipped PostgreSQL integration tests, no failures.
+- Eight new secure-login tests cover form submission, session-owner/bearer checks, password-safe validation/errors, HTTPS enforcement, cookie encryption and per-user isolation, legacy compatibility, Google-cookie exclusion, and disconnect deletion.
+- Browser end-to-end check: actual hosted form → isolated Chromium broker-page simulation → account-token/cookie capture → two encrypted account rows → connected status; cleared password input, no browser errors, no phone-width overflow. Fake credentials and broker responses only.
 - New concrete tests cover closed-minute timing at :00, first next-minute tick after :00, rejected 15/35-second candles, required 60-second expiry, bearish/bullish range confirmation, monotonic broker clock, scheduled auto-trading decisions, and administrator IDs.
 - Existing regression coverage includes single-menu behavior, broker-symbol filtering, Telegram delivery/rate-limit handling, login-link permissions, encrypted session handling, reconnection, demo/live boundaries, and risk enforcement.
 - Order/risk tests use a clearly test-only scripted decision provider; production price action is verified separately. No real orders, real credentials, paid AI calls, or production database writes were used.
 
 ## Not implemented / not live verified
-- Direct password collection in Telegram chat is not added: deleting a message does not make Telegram bot chats a private credential channel. The existing broker-hosted browser login remains the supported path.
+- Direct password collection in Telegram chat is not added: use the hosted email/password form instead. Its real broker page, credential selectors, CAPTCHA/2FA and resulting live account sessions still need deployment verification.
+- Live PostgreSQL persistence has not been rerun: no `AUTOTRADE_TEST_DATABASE_URL` is configured. Offline tests verify encrypted payload persistence through the repository interface and vault recreation, not a production database.
 - A dedicated Google OAuth flow requires documented broker-supported authorization endpoints, client registration, and redirect approval. A Google button in the existing broker page is not a verified SSO integration.
 - Multi-hour live session continuity, broker master-clock accuracy/network latency, live payouts/signals, real Telegram photo/submenu behavior, and the autotrade Docker image have not been verified on the deployed services. Tick-derived synchronization is not an independent server-time API check or a hard real-time guarantee.
 - The Python bot still runs on its separate Python host; the Lovable page is a repository status view, not an operating Telegram bot or trading terminal.
