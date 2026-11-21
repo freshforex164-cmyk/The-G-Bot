@@ -147,11 +147,11 @@ class AutotradeCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.calls, [("update_settings", USER, {"mode": "demo"})])
 
     async def test_set_maps_names_and_types(self):
-        for text in ("/at_set stake 2.5", "/at_set expiry 120", "/at_set max_trades 2",
+        for text in ("/at_set stake 2.5", "/at_set expiry 60", "/at_set max_trades 2",
                      "/at_set stop_loss 15", "/at_set take_profit 30", "/at_set cooldown 45"):
             await self.send(text)
         patches = [c[2] for c in self.service.calls]
-        self.assertEqual(patches, [{"stake": 2.5}, {"expiry_seconds": 120}, {"max_concurrent": 2},
+        self.assertEqual(patches, [{"stake": 2.5}, {"expiry_seconds": 60}, {"max_concurrent": 2},
                                    {"daily_stop_loss": 15.0}, {"daily_take_profit": 30.0},
                                    {"cooldown_seconds": 45}])
         self.assertIsInstance(patches[1]["expiry_seconds"], int)
@@ -253,7 +253,7 @@ class RegisterCommandsTests(unittest.IsolatedAsyncioTestCase):
         await Bot("t").register_commands(ADMIN, extra_public=AUTOTRADE_COMMANDS, extra_admin=AUTOTRADE_ADMIN_COMMANDS)
         public = [c["command"] for c in calls[0][1]["commands"]]
         admin = [c["command"] for c in calls[1][1]["commands"]]
-        self.assertIn("at_start", public)
+        self.assertEqual(public, ["start"])
         self.assertNotIn("at_halt", public)
         self.assertIn("at_halt", admin)
-        self.assertIn("at_start", admin)
+        self.assertIn("at_resume", admin)

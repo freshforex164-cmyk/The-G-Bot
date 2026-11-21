@@ -13,24 +13,24 @@ from config import (
 )
 from data.candles import CandleBuilder, CandleDataError
 
-FIXED_TIME = 1_760_000_000
+FIXED_TIME = 1_760_000_040
 FAKE_SSID = '42["auth",{"session":"not-a-real-session","uid":123,"isDemo":1}]'
 
 
 class CandleBuilderTests(unittest.TestCase):
     def test_builds_closed_candles_from_ticks_and_retains_history(self) -> None:
-        builder = CandleBuilder(period_seconds=10, max_candles=3)
+        builder = CandleBuilder(period_seconds=60, max_candles=3)
         offset = POCKET_OPTION_TIME_OFFSET_SECONDS
         history = [
             {
-                "time": FIXED_TIME - 20 + offset,
+                "time": FIXED_TIME - 120 + offset,
                 "open": 1.0,
                 "high": 1.2,
                 "low": 0.9,
                 "close": 1.1,
             },
             {
-                "time": FIXED_TIME - 10 + offset,
+                "time": FIXED_TIME - 60 + offset,
                 "open": 1.1,
                 "high": 1.3,
                 "low": 1.0,
@@ -49,7 +49,7 @@ class CandleBuilderTests(unittest.TestCase):
                 )
             )
         closed = builder.update(
-            {"timestamp": FIXED_TIME + offset + 10, "price": 1.6}
+            {"timestamp": FIXED_TIME + offset + 60, "price": 1.6}
         )
         self.assertIsNotNone(closed)
         assert closed is not None
@@ -60,11 +60,11 @@ class CandleBuilderTests(unittest.TestCase):
         self.assertEqual(len(builder.closed), 3)
 
     def test_seed_keeps_only_most_recent_candles(self) -> None:
-        builder = CandleBuilder(period_seconds=10, max_candles=3)
+        builder = CandleBuilder(period_seconds=60, max_candles=3)
         offset = POCKET_OPTION_TIME_OFFSET_SECONDS
         rows = [
             {
-                "time": FIXED_TIME - (50 - index * 10) + offset,
+                "time": FIXED_TIME - (300 - index * 60) + offset,
                 "open": 1.0,
                 "high": 1.0,
                 "low": 1.0,
@@ -76,7 +76,7 @@ class CandleBuilderTests(unittest.TestCase):
             self.assertEqual(builder.seed(rows), 3)
         self.assertEqual(
             [candle.time for candle in builder.closed],
-            [FIXED_TIME - 30, FIXED_TIME - 20, FIXED_TIME - 10],
+            [FIXED_TIME - 180, FIXED_TIME - 120, FIXED_TIME - 60],
         )
 
     def test_invalid_tick_fails_clearly(self) -> None:
@@ -176,7 +176,7 @@ class ReadOnlyBrokerTests(unittest.IsolatedAsyncioTestCase):
         )
         # History arrives in Pocket Option server time (UTC+2) and is
         # returned in true UTC.
-        history = await broker.candle_history("EURUSD_otc", 10, 3000)
+        history = await broker.candle_history("EURUSD_otc", 60, 3000)
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0]["timestamp"], FIXED_TIME - 7200)
         self.assertEqual(

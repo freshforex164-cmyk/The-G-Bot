@@ -47,7 +47,7 @@ SETTINGS: dict[str, tuple[str, type]] = {
 SET_USAGE = (
     "Usage: /at_set <name> <value>\n"
     "  stake 2         amount per trade\n"
-    "  expiry 60       trade length in seconds (15-900)\n"
+    "  expiry 60       fixed 1-minute trade length\n"
     "  max_trades 1    open trades at once (1-5)\n"
     "  stop_loss 10    stop for the day after losing this much\n"
     "  take_profit 20  stop for the day after winning this much\n"
@@ -239,6 +239,9 @@ class AutotradeCommands:
                 raise ValueError
         except ValueError:
             await self.reply(chat_id, f"'{raw[:20]}' isn't a valid {'whole ' if kind is int else ''}number for {name}.")
+            return
+        if field == "expiry_seconds" and value != 60:
+            await self.reply(chat_id, "Expiry is fixed at 60 seconds (1 minute).")
             return
         s = await self.client.update_settings(uid, {field: value})  # type: ignore[union-attr]
         await self.reply(chat_id, f"Saved: {name} = {_num(value)}.\n\n" + settings_summary(s))

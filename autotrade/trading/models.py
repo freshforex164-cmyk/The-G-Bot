@@ -18,7 +18,7 @@ class TradingSettings:
 
     mode: str = DEMO
     live_confirmed: bool = False       # set only by an explicit Live toggle, cleared on re-login
-    strategy: str = "gap"
+    strategy: str = "price_action"
     symbol_real: str = "EURUSD"
     symbol_otc: str = "EURUSD_otc"
     gap_threshold: float = 0.0015
@@ -42,8 +42,8 @@ class TradingSettings:
         cap = cfg.live_max_stake if self.mode == LIVE else cfg.max_stake
         if not (1.0 <= self.stake <= cap):
             bad(f"stake must be between 1 and {cap:g} in {self.mode} mode")
-        if not (15 <= self.expiry_seconds <= 900):
-            bad("expiry_seconds must be between 15 and 900")
+        if self.expiry_seconds != 60:
+            bad("expiry_seconds must be 60 (1 minute)")
         if not (1 <= self.max_concurrent <= 5):
             bad("max_concurrent must be between 1 and 5")
         if not (self.daily_stop_loss > 0):
@@ -85,6 +85,7 @@ class Tick:
     symbol: str
     price: float
     received_at: float  # Clock.monotonic() when the tick arrived here (not the provider timestamp)
+    broker_time: float | None = None
 
 
 @dataclass(frozen=True)

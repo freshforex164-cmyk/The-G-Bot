@@ -5,12 +5,17 @@ from ..errors import BrokerError, ReauthRequired
 from ..trading.manager import CapacityError, LiveDisabled, TradingHalted
 from ..trading.models import TradingSettings
 from .fakes import Env, wait_async, wait_until
+from .fakes import ScriptedDecision
+from unittest.mock import patch
 
 
 class EngineBase(unittest.IsolatedAsyncioTestCase):
     allow_live = False
 
     async def asyncSetUp(self):
+        strategy_patch = patch.dict("autotrade.trading.strategy.STRATEGIES", {"price_action": ScriptedDecision})
+        strategy_patch.start()
+        self.addCleanup(strategy_patch.stop)
         self.env = Env(allow_live=self.allow_live)
         self.m = self.env.rt.manager
         self.repo = self.env.repo

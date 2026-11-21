@@ -26,8 +26,8 @@ class PaperTracker:
         output: Callable[[str], None] = print,
     ) -> None:
         expiries = tuple(sorted(set(expiries_seconds)))
-        if not expiries or any(expiry <= 0 for expiry in expiries):
-            raise ValueError("paper expiries must be positive")
+        if expiries != (60,):
+            raise ValueError("Only 1-minute paper expiry is supported.")
         if human_delay_seconds < 0:
             raise ValueError("human delay cannot be negative")
         self.expiries_seconds = expiries
@@ -125,21 +125,6 @@ class PaperTracker:
                 f"win_rate={self._win_rate(wins, count):.1f}%"
             )
 
-        buckets = (("0-59", 0, 59), ("60-79", 60, 79), ("80-100", 80, 100))
-        for label, low, high in buckets:
-            for expiry in self.expiries_seconds:
-                outcomes = [
-                    record.outcomes[expiry]
-                    for record in self.records.values()
-                    if low <= record.signal.strength <= high
-                    and record.outcomes[expiry].result is not None
-                ]
-                wins = sum(outcome.result == "WIN" for outcome in outcomes)
-                count = len(outcomes)
-                lines.append(
-                    f"PAPER strength={label} expiry={expiry}s count={count} "
-                    f"wins={wins} win_rate={self._win_rate(wins, count):.1f}%"
-                )
         return lines
 
     def summary(self) -> str:

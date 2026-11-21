@@ -468,7 +468,7 @@ class PriceActionStrategy:
         if (
             high >= regime.high_zone_low
             and high <= regime.range_high
-            and close < high
+            and close < float(candle.open)
         ):
             key = ("RANGE_HIGH_SELL", regime.range_high)
             return self._fire(
@@ -484,7 +484,7 @@ class PriceActionStrategy:
         if (
             low <= regime.low_zone_high
             and low >= regime.range_low
-            and close > low
+            and close > float(candle.open)
         ):
             key = ("RANGE_LOW_BUY", regime.range_low)
             return self._fire(

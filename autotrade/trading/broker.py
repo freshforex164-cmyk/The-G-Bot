@@ -27,7 +27,7 @@ class BrokerClient(Protocol):
     async def payout(self, asset: str) -> int | None: ...
     async def place(self, asset: str, direction: str, amount: float, expiry_seconds: int) -> str: ...
     async def outcome(self, trade_id: str, timeout: float) -> TradeOutcome: ...
-    def ticks(self, symbol: str) -> AsyncIterator[float]: ...
+    def ticks(self, symbol: str) -> AsyncIterator[float | dict]: ...
 
 
 _EXPIRED = ("ssid", "session", "unauthor", "auth", "not authenticated", "forbidden", "invalid token")
@@ -135,10 +135,10 @@ class PocketOptionBroker:
         return TradeOutcome(result if result in {"win", "loss", "draw"} else "unknown",
                             float(profit) if profit is not None else None)
 
-    async def ticks(self, symbol: str) -> AsyncIterator[float]:
+    async def ticks(self, symbol: str) -> AsyncIterator[float | dict]:
         try:
             sub = await self._need().subscribe_symbol(symbol)
             async for candle in sub:
-                yield float(candle["close"])
+                yield {"price": float(candle["close"]), "timestamp": candle.get("timestamp", candle.get("time"))}
         except Exception as exc:
             raise map_exception(exc) from None

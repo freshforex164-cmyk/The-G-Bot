@@ -187,7 +187,7 @@ class ConsolidationAndResetTests(unittest.TestCase):
         upper = strategy_with_level("CONSOLIDATION")
         sell = self.evaluate(
             upper,
-            [bar(0, 8, 9.5, 8, 9.0), bar(60, 9.0, 9.8, 8.5, 9.2)],
+            [bar(0, 8, 9.5, 8, 9.0), bar(60, 9.4, 9.8, 8.5, 9.2)],
             self.RANGE,
         )
         self.assertEqual((sell.setup, sell.direction), ("RANGE_HIGH_SELL", "SELL"))
@@ -203,12 +203,12 @@ class ConsolidationAndResetTests(unittest.TestCase):
     def test_consolidation_structural_level_fires_only_once(self) -> None:
         strategy = strategy_with_level("CONSOLIDATION")
         candles = [bar(0, 8, 9.5, 8, 9.0)]
-        first = bar(60, 9.0, 9.8, 8.5, 9.2)
+        first = bar(60, 9.4, 9.8, 8.5, 9.2)
         self.assertEqual(
             self.evaluate(strategy, candles + [first], self.RANGE).setup,
             "RANGE_HIGH_SELL",
         )
-        second = bar(120, 9.0, 9.8, 8.4, 9.1)
+        second = bar(120, 9.3, 9.8, 8.4, 9.1)
         self.assertIsNone(
             self.evaluate(strategy, candles + [first, second], self.RANGE)
         )

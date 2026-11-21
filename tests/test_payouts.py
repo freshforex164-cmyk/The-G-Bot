@@ -38,17 +38,6 @@ class AccountTypeTests(unittest.TestCase):
         self.assertEqual(config.account_type(""), "UNKNOWN")
 
 
-class SignalPayoutTests(unittest.TestCase):
-    def test_signal_shows_feed_payout_or_unavailable_and_disclaimer(self) -> None:
-        self.assertIn("Payout: 92%", format_signal_message(signal(92.0)))
-        text = format_signal_message(signal(None))
-        self.assertIn("Payout: unavailable", text)
-        self.assertIn(
-            "Payouts vary by account type and change over time. "
-            "Check the payout on your chart before you trade.",
-            text,
-        )
-
 
 class SignalTimePayoutTests(unittest.IsolatedAsyncioTestCase):
     async def test_payout_is_read_from_the_feed_when_the_signal_fires(self) -> None:

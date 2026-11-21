@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import math
 from collections import deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -50,6 +51,8 @@ def _number(value: Any, field: str) -> float:
         result = float(value)
     except (TypeError, ValueError, OverflowError):
         raise CandleDataError(f"Broker candle is missing a valid {field}.") from None
+    if not math.isfinite(result):
+        raise CandleDataError(f"Broker candle has a non-finite {field}.")
     return result
 
 
@@ -60,13 +63,15 @@ class CandleBuilder:
         self,
         period_seconds: int = CANDLE_INTERVAL_SECONDS,
         max_candles: int = MAX_CANDLES_PER_PAIR,
+        clock=None,
     ) -> None:
-        if period_seconds <= 0:
-            raise ValueError("period_seconds must be greater than zero")
+        if period_seconds != 60:
+            raise ValueError("Only 1-minute candles are supported.")
         if max_candles <= 0:
             raise ValueError("max_candles must be greater than zero")
 
         self.period_seconds = period_seconds
+        self._clock = clock or time.time
         self.max_candles = max_candles
         self.closed: deque[Candle] = deque(maxlen=max_candles)
         self.current: Candle | None = None
@@ -85,7 +90,7 @@ class CandleBuilder:
         and history for the current bucket provides its true open/high/low so
         the first live candle is complete rather than partial.
         """
-        current_bucket = int(time.time()) // self.period_seconds * self.period_seconds
+        current_bucket = int(self._clock()) // self.period_seconds * self.period_seconds
         by_time: dict[int, Candle] = {}
         normalized_rows: list[tuple[int, Candle]] = []
         forming_rows: list[tuple[int, Candle]] = []
@@ -167,7 +172,7 @@ class CandleBuilder:
                 low=price,
                 close=price,
             )
-            self._current_partial = timestamp != bucket_time
+            self._current_partial = timestamp != bucket_time and self._latest_closed_time != bucket_time - 60
             return None
 
         if bucket_time < self.current.time:
@@ -188,9 +193,23 @@ class CandleBuilder:
             low=price,
             close=price,
         )
-        self._current_partial = False
+        self._current_partial = bucket_time != closed_candle.time + 60
         if was_partial:
             return None
         self.closed.append(closed_candle)
         self._latest_closed_time = closed_candle.time
         return closed_candle
+
+    def close_due(self, broker_now: float) -> Candle | None:
+        """Close a complete minute without waiting for a tick from the next minute."""
+        candle = self.current
+        if candle is None or broker_now < candle.time + 60:
+            return None
+        self.current = None
+        if self._current_partial:
+            self._current_partial = False
+            self._latest_closed_time = candle.time
+            return None
+        self.closed.append(candle)
+        self._latest_closed_time = candle.time
+        return candle

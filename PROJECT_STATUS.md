@@ -1,4 +1,36 @@
-# GBot status — 2026-11-20
+# G-Bot refinement status — 2026-11-21
+
+## Implemented in this revision
+- `/start` sends the supplied futuristic trader header with a concise caption. `WELCOME_IMAGE_URL` can override the hosted image; a failed image request falls back to text.
+- Main menu: Choose Asset, Account Info, Auto Trading, Support/Help. Submenus edit the existing text/caption, include Back, and do not modify independent signal messages.
+- Public Telegram command scope contains only `/start`. All eight administrative commands are guarded by `ADMIN_IDS` and the configured admin-chat boundary; admin actions are absent from public menus.
+- Asset categories re-check the broker's active-asset response; closed, unmapped, and known zero-payout assets are omitted. A failed availability request does not expose stale cached assets.
+- Candle builders accept only 60-second intervals. A broker-timestamp/monotonic clock drives scheduled minute closes without waiting for a next-minute tick. Partial startup candles are excluded; late closes cannot trigger fresh signals.
+- Consolidation SELL requires a bearish closed candle near range high; BUY requires a bullish closed candle near range low. Existing trend continuation/pullback logic is retained.
+- Removed executable legacy indicator engines and indicator-only strategy modules. ATR remains a price-derived range measurement; no oscillator/Bollinger strategy executes.
+- Auto-trading uses the same price-action engine, timestamped feed ticks, minute-boundary wake-ups, and 60-second expiry. Saved `gap` settings are a compatibility alias to price action, not the former gap strategy.
+- Independent HTML signal cards show BUY/CALL or SELL/PUT, asset, one-minute expiration, live payout (or unavailable), and only `Payouts may vary.` Telegram supports bold text and colored emoji, not arbitrary font sizes or colored text.
+- Existing database structures, encrypted broker-session vault, private hosted login, heartbeat/reconnect checks, risk limits, and open-trade recovery remain intact. CSV stores preserve existing headers/rows.
+
+## Verified in this revision — offline only
+- Bot suite: 163 tests run, 133 passed, 30 previously skipped legacy tests, no failures.
+- Auto-trading suite: 75 tests run, 72 passed, 3 skipped PostgreSQL integration tests, no failures.
+- New concrete tests cover closed-minute timing at :00, first next-minute tick after :00, rejected 15/35-second candles, required 60-second expiry, bearish/bullish range confirmation, monotonic broker clock, scheduled auto-trading decisions, and administrator IDs.
+- Existing regression coverage includes single-menu behavior, broker-symbol filtering, Telegram delivery/rate-limit handling, login-link permissions, encrypted session handling, reconnection, demo/live boundaries, and risk enforcement.
+- Order/risk tests use a clearly test-only scripted decision provider; production price action is verified separately. No real orders, real credentials, paid AI calls, or production database writes were used.
+
+## Not implemented / not live verified
+- Direct password collection in Telegram chat is not added: deleting a message does not make Telegram bot chats a private credential channel. The existing broker-hosted browser login remains the supported path.
+- A dedicated Google OAuth flow requires documented broker-supported authorization endpoints, client registration, and redirect approval. A Google button in the existing broker page is not a verified SSO integration.
+- Multi-hour live session continuity, broker master-clock accuracy/network latency, live payouts/signals, real Telegram photo/submenu behavior, and the autotrade Docker image have not been verified on the deployed services. Tick-derived synchronization is not an independent server-time API check or a hard real-time guarantee.
+- The Python bot still runs on its separate Python host; the Lovable page is a repository status view, not an operating Telegram bot or trading terminal.
+- Deploy both Python services with their existing environment configuration and test the Telegram menu plus broker DEMO login first. Use a stable HTTPS `WELCOME_IMAGE_URL` if changing hosting.
+
+The sections below are the repository's prior report, retained as historical context; their earlier live checks do not verify this revision.
+
+---
+
+# Historical baseline — 2026-11-20
 
 ## Goal
 - Read-only Pocket Option signals on Telegram: every listed asset selectable, payouts

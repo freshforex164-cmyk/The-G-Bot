@@ -12,30 +12,11 @@ from typing import Any
 import config
 from data.candles import Candle
 from indicators.atr import calculate_atr
-from indicators.bollinger_bands import calculate_bollinger_bands
-from indicators.moving_average import calculate_moving_average
-from indicators.stochastic import calculate_stochastic
-from strategy.pullback_reversal import Signal
+from strategy.model import Signal
 
 DECISION_FIELDS = (
-    "event",
-    "time",
-    "pair",
-    "direction",
-    "state",
-    "reason",
-    "stochastic_k",
-    "stochastic_d",
-    "sma",
-    "bollinger_middle",
-    "bollinger_upper",
-    "bollinger_lower",
-    "atr",
-    "signal_id",
-    "signal_strength",
-    "candle_2_close",
-    "candle_3_close",
-    "outcome_35s_proxy",
+    "event", "time", "pair", "direction", "state", "reason", "atr",
+    "signal_id", "entry_price", "expiry_close", "outcome_1m_proxy",
 )
 
 
@@ -79,53 +60,20 @@ class DecisionStore:
         self._ensure_header()
 
     def _ensure_header(self) -> None:
+        # Existing append-only files retain their original header and all historical rows.
         if self.file_path.exists() and self.file_path.stat().st_size:
+            with self.file_path.open(newline="", encoding="utf-8") as handle:
+                self._fields = tuple(next(csv.reader(handle)))
             return
+        self._fields = DECISION_FIELDS
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         with self.file_path.open("w", newline="", encoding="utf-8") as handle:
-            csv.DictWriter(handle, fieldnames=DECISION_FIELDS).writeheader()
+            csv.DictWriter(handle, fieldnames=self._fields).writeheader()
 
     def _append(self, row: dict[str, Any]) -> None:
-        self.file_path.parent.mkdir(parents=True, exist_ok=True)
         with self.file_path.open("a", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=DECISION_FIELDS)
-            writer.writerow({key: row.get(key, "") for key in DECISION_FIELDS})
-
-    @staticmethod
-    def _indicators(candles: Sequence[Candle]) -> dict[str, str]:
-        values = {
-            "stochastic_k": "",
-            "stochastic_d": "",
-            "sma": "",
-            "bollinger_middle": "",
-            "bollinger_upper": "",
-            "bollinger_lower": "",
-            "atr": "",
-        }
-        if not candles:
-            return values
-        index = len(candles) - 1
-        try:
-            stochastic = calculate_stochastic(candles)
-            bands = calculate_bollinger_bands(candles)
-            moving_average = calculate_moving_average(
-                candles,
-                period=config.MOVING_AVERAGE_PERIOD,
-                method=config.MOVING_AVERAGE_METHOD,
-            )
-            atr = calculate_atr(candles)
-            values.update(
-                stochastic_k=_number(stochastic.slow_k[index]),
-                stochastic_d=_number(stochastic.slow_d[index]),
-                sma=_number(moving_average[index]),
-                bollinger_middle=_number(bands.middle[index]),
-                bollinger_upper=_number(bands.upper[index]),
-                bollinger_lower=_number(bands.lower[index]),
-                atr=_number(atr[index]),
-            )
-        except (IndexError, TypeError, ValueError, ZeroDivisionError):
-            pass
-        return values
+            csv.DictWriter(handle, fieldnames=self._fields).writerow(
+                {key: row.get(key, "") for key in self._fields})
 
     def record_candle(
         self,
@@ -135,90 +83,41 @@ class DecisionStore:
         strategy: Any,
         signal: Signal | None,
     ) -> None:
-        """Record both directional states, then resolve signals as closes arrive."""
-        timestamp = candle.time
-        time_text = datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
-        indicators = self._indicators(candles)
-        states = getattr(strategy, "states", {})
-        state_getter = getattr(strategy, "state", None)
+        """Record closed-minute decisions and a one-minute candle-close outcome proxy."""
+        if candle.time % 60:
+            raise ValueError("Decision candles must start on whole minutes.")
         for direction in ("SELL", "BUY"):
-            direction_state = (
-                state_getter(pair, direction)
-                if callable(state_getter)
-                else states.get((pair, direction))
-            )
-            status = getattr(direction_state, "status", "IDLE")
-            reason = getattr(direction_state, "reason", "")
-            if not reason:
-                reason = (
-                    "indicator history unavailable"
-                    if len(candles) < config.MIN_STRATEGY_CANDLES
-                    else "no qualifying setup"
-                )
             selected = signal if signal is not None and signal.direction == direction else None
-            row = {
+            self._append({
                 "event": "DECISION",
-                "time": time_text,
-                "pair": pair,
-                "direction": direction,
-                "state": status,
-                "reason": reason,
-                **indicators,
+                "time": datetime.fromtimestamp(candle.time, timezone.utc).isoformat(),
+                "pair": pair, "direction": direction,
+                "state": getattr(strategy, "regime_name", "CONSOLIDATION"),
+                "reason": selected.setup if selected else "no qualifying closed-candle setup",
+                "atr": _number(calculate_atr(candles)[-1]) if candles else "",
                 "signal_id": selected.id if selected else "",
-                "signal_strength": selected.strength if selected else "",
-            }
-            self._append(row)
+                "entry_price": _number(selected.price) if selected else "",
+            })
             if selected is not None:
                 self.signal_count += 1
-                self._pending.setdefault(pair, []).append(
-                    {
-                        "index": len(candles) - 1,
-                        "time": time_text,
-                        "signal": selected,
-                        "candle_2_close": None,
-                    }
-                )
-
-        current_index = len(candles) - 1
-        remaining: list[dict[str, Any]] = []
+                self._pending.setdefault(pair, []).append({"signal": selected, "time": candle.time})
+        remaining = []
         for pending in self._pending.get(pair, []):
-            signal_index = int(pending["index"])
-            candle_2_index = signal_index + 2
-            candle_3_index = signal_index + 3
-            if current_index >= candle_2_index and pending["candle_2_close"] is None:
-                pending["candle_2_close"] = float(candles[candle_2_index].close)
-            if current_index < candle_3_index:
+            if candle.time < pending["time"] + 60:
                 remaining.append(pending)
                 continue
-            signal = pending["signal"]
-            candle_2_close = pending["candle_2_close"]
-            candle_3_close = float(candles[candle_3_index].close)
-            if candle_2_close is None:
-                remaining.append(pending)
+            selected = pending["signal"]
+            # Missing minutes are not fabricated or counted as wins/losses.
+            if candle.time != pending["time"] + 60:
                 continue
-            is_win = (
-                candle_2_close < signal.price
-                if signal.direction == "SELL"
-                else candle_2_close > signal.price
-            )
-            outcome = "WIN" if is_win else "LOSS"
+            won = candle.close < selected.price if selected.direction == "SELL" else candle.close > selected.price
             self.resolved_count += 1
-            self.wins += int(is_win)
-            self._append(
-                {
-                    "event": "OUTCOME",
-                    "time": pending["time"],
-                    "pair": pair,
-                    "direction": signal.direction,
-                    "state": "FIRE",
-                    "reason": "outcome is an approximate candle-close proxy; ties are losses",
-                    "signal_id": signal.id,
-                    "signal_strength": signal.strength,
-                    "candle_2_close": _number(candle_2_close),
-                    "candle_3_close": _number(candle_3_close),
-                    "outcome_35s_proxy": outcome,
-                }
-            )
+            self.wins += int(won)
+            self._append({"event": "OUTCOME", "time": selected.time.isoformat(), "pair": pair,
+                          "direction": selected.direction, "signal_id": selected.id,
+                          "entry_price": _number(selected.price), "expiry_close": _number(candle.close),
+                          "outcome_1m_proxy": "WIN" if won else "LOSS",
+                          "reason": "one-minute candle-close proxy; ties are losses"})
         self._pending[pair] = remaining
 
     def summary(self) -> str:

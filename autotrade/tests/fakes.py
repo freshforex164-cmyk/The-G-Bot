@@ -12,6 +12,8 @@ from ..errors import Disconnected, SessionExpired
 from ..runtime import build_runtime
 from ..storage.repo import InMemoryRepository
 from ..trading.broker import TradeOutcome
+from ..trading.models import Decision
+from unittest.mock import patch
 from ..vault.crypto import KeyRing
 
 
@@ -115,6 +117,20 @@ class FakeBroker:
         while True:
             yield await q.get()
 
+
+
+class ScriptedDecision:
+    """Test-only order input for risk/session tests, independent of production strategy rules."""
+    name = "scripted"
+
+    def required_symbols(self, s):
+        return (s.symbol_real, s.symbol_otc)
+
+    def on_tick(self, ticks, s):
+        real, otc = ticks.get(s.symbol_real), ticks.get(s.symbol_otc)
+        if real is None or otc is None or abs(real.price - otc.price) < s.gap_threshold:
+            return None
+        return Decision(s.symbol_otc, "CALL" if real.price > otc.price else "PUT", 60, "scripted test decision")
 
 class Env:
     def __init__(self, *, allow_live: bool = False):

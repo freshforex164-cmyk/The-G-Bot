@@ -1,1130 +1,253 @@
-"""Telegram long-polling commands and subscriber signal delivery."""
-
+"""Hierarchical Telegram presentation; shared transport and delivery remain in telegram_core."""
 from __future__ import annotations
 
 import asyncio
 import html
-import json
 import logging
 import os
-import time
-import urllib.error
-import urllib.request
-from collections.abc import Awaitable, Mapping
-from datetime import datetime, timezone
-from typing import Any, Callable
-from urllib.parse import urlsplit
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from collections.abc import Mapping
+from typing import Any
 
-import config
-from autotrade_commands import ALL_COMMANDS as AUTOTRADE_COMMAND_NAMES
-from autotrade_commands import AutotradeCommands
-from market_assets import CATALOG, CATALOG_BY_ID, CATEGORIES
-from notifications import TelegramNotifier, TelegramSendError, format_signal_message
-from strategy.model import Signal
-from subscriber_store import SubscriberStore
+import telegram_core as core
+from autotrade_commands import ALL_COMMANDS, AUTOTRADE_ADMIN_COMMANDS
+from market_assets import CATALOG, CATEGORIES
+from notifications import TelegramSendError
 
-logger = logging.getLogger("gbot.telegram")
-
-def configured_timezone() -> ZoneInfo:
-    name = os.environ.get("TIMEZONE", "Africa/Lagos").strip() or "Africa/Lagos"
-    try:
-        return ZoneInfo(name)
-    except ZoneInfoNotFoundError:
-        logger.warning("TIMEZONE is invalid; using Africa/Lagos.")
-        return ZoneInfo("Africa/Lagos")
+SubscriberFanoutNotifier = core.SubscriberFanoutNotifier
+TelegramPollingService = core.TelegramPollingService
+configured_timezone = core.configured_timezone
+COMMAND_REPLY_COOLDOWN_SECONDS = core.COMMAND_REPLY_COOLDOWN_SECONDS
+PUBLIC_COMMANDS = [{"command": "start", "description": "Open G-Bot"}]
+ADMIN_ONLY_COMMANDS = core.ADMIN_ONLY_COMMANDS | {"at_halt", "at_resume"}
+ADMIN_COMMANDS = PUBLIC_COMMANDS + core.ADMIN_COMMANDS[len(core.PUBLIC_COMMANDS):] + AUTOTRADE_ADMIN_COMMANDS
+WELCOME_TEXT = "<b>G-Bot · Goodness AI Trader</b>\nClosed 1-minute price-action signals. Choose your next action."
+logger = logging.getLogger("gbot.navigation")
 
 
-PUBLIC_COMMANDS = [
-    {"command": "start", "description": "Choose an asset"},
-    {"command": "stop", "description": "Stop receiving signals"},
-    {"command": "register", "description": "Pocket Option account information"},
-    {"command": "status", "description": "Check your signal status"},
-    {"command": "help", "description": "How GBot works"},
-]
-ADMIN_COMMANDS = PUBLIC_COMMANDS + [
-    {"command": "admin", "description": "Check signal stats"},
-    {"command": "health", "description": "Check scanner health"},
-    {"command": "pause", "description": "Pause signal scanning"},
-    {"command": "resume", "description": "Resume signal scanning"},
-    {"command": "subscribers", "description": "List active subscriber chats"},
-    {"command": "testsignal", "description": "Send a sample signal to admin"},
-]
-ADMIN_ONLY_COMMANDS = {
-    "admin",
-    "health",
-    "pause",
-    "resume",
-    "subscribers",
-    "testsignal",
-}
-COMMAND_REPLY_COOLDOWN_SECONDS = 20.0
-
-
-class TelegramBotClient:
-    """Small Bot API client that never includes its token in error messages."""
-
-    def __init__(
-        self,
-        token: str,
-        *,
-        opener: Callable[..., object] | None = None,
-        request_timeout: float = 8.0,
-        poll_http_timeout: float = 35.0,
-    ) -> None:
-        if not token.strip():
-            raise ValueError("Telegram bot token is required.")
-        self._token = token
-        self._opener = opener or urllib.request.urlopen
-        self.request_timeout = request_timeout
-        self.poll_http_timeout = poll_http_timeout
-
-    def _call_sync(
-        self, method: str, payload: Mapping[str, Any], timeout: float
-    ) -> Any:
-        request = urllib.request.Request(
-            f"https://api.telegram.org/bot{self._token}/{method}",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            response = self._opener(request, timeout=timeout)
-            with response:  # type: ignore[attr-defined]
-                status = int(
-                    getattr(response, "status", response.getcode())  # type: ignore[attr-defined]
-                )
-                body = response.read()  # type: ignore[attr-defined]
-        except urllib.error.HTTPError as exc:
+def configured_admin_ids(primary: int | None = None) -> frozenset[int]:
+    values = {primary} if primary is not None else set()
+    for raw in os.environ.get("ADMIN_IDS", "").split(","):
+        if raw.strip():
             try:
-                body = exc.read()
-            except Exception:
-                body = b""
-            TelegramNotifier._raise_api_error(exc.code, body)
-            raise AssertionError("unreachable")
-        except urllib.error.URLError as exc:
-            raise TelegramSendError(
-                f"Telegram API request failed ({type(exc.reason).__name__})."
-            ) from None
-        except TelegramSendError:
-            raise
-        except Exception as exc:
-            raise TelegramSendError(
-                f"Telegram API request failed ({type(exc).__name__})."
-            ) from None
-
-        try:
-            result = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            raise TelegramSendError("Telegram returned an unreadable API response.") from None
-        if not isinstance(result, dict):
-            raise TelegramSendError("Telegram returned an unexpected API response.")
-        if not 200 <= status < 300 or not result.get("ok"):
-            TelegramNotifier._raise_api_error(status, body)
-        return result.get("result")
-
-    async def call(
-        self,
-        method: str,
-        payload: Mapping[str, Any],
-        *,
-        timeout: float | None = None,
-    ) -> Any:
-        return await asyncio.to_thread(
-            self._call_sync,
-            method,
-            payload,
-            self.request_timeout if timeout is None else timeout,
-        )
-
-    async def get_updates(
-        self, *, offset: int | None, poll_timeout: int = 25
-    ) -> list[Mapping[str, Any]]:
-        payload: dict[str, Any] = {
-            "timeout": poll_timeout,
-            "allowed_updates": ["message", "callback_query"],
-        }
-        if offset is not None:
-            payload["offset"] = offset
-        result = await self.call(
-            "getUpdates", payload, timeout=self.poll_http_timeout
-        )
-        if not isinstance(result, list):
-            raise TelegramSendError("Telegram returned an unexpected update list.")
-        return [item for item in result if isinstance(item, Mapping)]
-
-    async def send_message(
-        self,
-        chat_id: int | str,
-        text: str,
-        *,
-        reply_markup: Mapping[str, Any] | None = None,
-        parse_mode: str | None = "HTML",
-    ) -> Any:
-        payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
-        if parse_mode:
-            payload["parse_mode"] = parse_mode
-        if reply_markup is not None:
-            payload["reply_markup"] = reply_markup
-        return await self.call("sendMessage", payload)
-
-    async def edit_message_text(
-        self,
-        chat_id: int | str,
-        message_id: int,
-        text: str,
-        *,
-        reply_markup: Mapping[str, Any] | None = None,
-        parse_mode: str | None = "HTML",
-    ) -> Any:
-        payload: dict[str, Any] = {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": text,
-        }
-        if parse_mode:
-            payload["parse_mode"] = parse_mode
-        if reply_markup is not None:
-            payload["reply_markup"] = reply_markup
-        return await self.call("editMessageText", payload)
-
-    async def delete_message(self, chat_id: int | str, message_id: int) -> None:
-        await self.call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
-
-    async def answer_callback(self, callback_id: str) -> None:
-        await self.call("answerCallbackQuery", {"callback_query_id": callback_id})
-
-    async def register_commands(
-        self,
-        admin_id: int | str,
-        *,
-        extra_public: list[dict[str, str]] | None = None,
-        extra_admin: list[dict[str, str]] | None = None,
-    ) -> None:
-        """extra_* add optional command groups (the auto-trading commands when configured)."""
-        default_scope = {"type": "default"}
-        admin_scope = {"type": "chat", "chat_id": admin_id}
-        public = PUBLIC_COMMANDS + list(extra_public or [])
-        admin = public + ADMIN_COMMANDS[len(PUBLIC_COMMANDS):] + list(extra_admin or [])
-        await self.call(
-            "setMyCommands",
-            {"commands": public, "scope": default_scope},
-        )
-        await self.call(
-            "setMyCommands",
-            {"commands": admin, "scope": admin_scope},
-        )
-        for label, scope in (("default", default_scope), ("admin", admin_scope)):
-            commands = await self.call("getMyCommands", {"scope": scope})
-            names = (
-                [
-                    str(command["command"])
-                    for command in commands
-                    if isinstance(command, Mapping)
-                    and isinstance(command.get("command"), str)
-                ]
-                if isinstance(commands, list)
-                else []
-            )
-            print(f"Telegram commands ({label}): {', '.join(names)}", flush=True)
+                values.add(int(raw.strip()))
+            except ValueError:
+                raise ValueError("ADMIN_IDS must be comma-separated Telegram user IDs.") from None
+    return frozenset(values)
 
 
-class TelegramCommandHandler:
-    """Route public commands to the source chat and restrict admin actions."""
+def keyboard(*rows: list[tuple[str, str]]) -> dict[str, Any]:
+    return {"inline_keyboard": [[{"text": text, "callback_data": data} for text, data in row] for row in rows]}
 
-    def __init__(
-        self,
-        client: TelegramBotClient,
-        subscribers: SubscriberStore,
-        *,
-        admin_id: int | None,
-        referral_link: str | None = None,
-        scanner: Any = None,
-        tracker: Any = None,
-        fanout: Any = None,
-        decision_store: Any = None,
-        scanner_running: Callable[[], bool] = lambda: False,
-        admin_chat_id: int | str | None = None,
-        started_at: float | None = None,
-        test_signal_provider: Callable[[], Awaitable[list[str]]] | None = None,
-        clock: Callable[[], float] = time.monotonic,
-        background_selection: bool = False,
-        autotrade: Any = None,
-    ) -> None:
-        self.client = client
-        # Optional: AutotradeClient for the separate auto-trading service. None = commands say "not set up".
-        self.autotrade_enabled = autotrade is not None
-        self.autotrade = AutotradeCommands(autotrade, self._autotrade_send)
-        self.subscribers = subscribers
-        self.admin_id = admin_id
-        self.referral_link = self._valid_referral(referral_link)
-        self.scanner = scanner
-        self.tracker = tracker
-        self.fanout = fanout
-        self.decision_store = decision_store
-        self.scanner_running = scanner_running
-        self.admin_chat_id = admin_chat_id
-        self.started_at = started_at or time.monotonic()
-        self.test_signal_provider = test_signal_provider
-        self._clock = clock
-        self._last_command_reply_at: dict[tuple[str, str], float] = {}
-        self._last_reply_text: dict[str, str] = {}
-        # One menu message per chat: its message_id is edited in place.
-        self.menu_message_ids: dict[int, int] = {}
-        self._menu_locks: dict[int, asyncio.Lock] = {}
-        self.background_selection = background_selection
-        self._background_tasks: set[asyncio.Task[None]] = set()
 
-    async def _send_command_reply(
-        self,
-        chat_id: int | str,
-        text: str,
-        *,
-        command: str,
-        reply_markup: Mapping[str, Any] | None = None,
-        parse_mode: str | None = "HTML",
-        force: bool = False,
-    ) -> bool:
-        chat_key = str(chat_id)
-        command_key = (chat_key, command)
-        now = self._clock()
-        last_sent = self._last_command_reply_at.get(command_key)
-        if not force and last_sent is not None and now - last_sent < COMMAND_REPLY_COOLDOWN_SECONDS:
-            return False
-        if not force and self._last_reply_text.get(chat_key) == text:
-            return False
-        await self.client.send_message(
-            chat_id,
-            text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode,
-        )
-        self._last_command_reply_at[command_key] = now
-        self._last_reply_text[chat_key] = text
-        return True
+class TelegramBotClient(core.TelegramBotClient):
+    async def send_photo(self, chat_id, photo, caption, *, reply_markup=None):
+        return await self.call("sendPhoto", {"chat_id": chat_id, "photo": photo, "caption": caption,
+                                           "parse_mode": "HTML", "reply_markup": reply_markup or {}})
+
+    async def edit_message_caption(self, chat_id, message_id, caption, *, reply_markup=None):
+        return await self.call("editMessageCaption", {"chat_id": chat_id, "message_id": message_id,
+                    "caption": caption, "parse_mode": "HTML", "reply_markup": reply_markup or {}})
+
+    async def register_commands(self, admin_id, *, extra_public=None, extra_admin=None):
+        # Public users get a single entry point; admin scopes never leak into the default scope.
+        await self.call("setMyCommands", {"commands": PUBLIC_COMMANDS, "scope": {"type": "default"}})
+        ids = configured_admin_ids(int(admin_id))
+        for uid in ids:
+            await self.call("setMyCommands", {"commands": ADMIN_COMMANDS,
+                                             "scope": {"type": "chat", "chat_id": uid}})
+
+
+class TelegramCommandHandler(core.TelegramCommandHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.admin_ids = configured_admin_ids(self.admin_id)
+        self._photo_menus: set[int] = set()
+        self._menu_context: dict[int, str] = {}
 
     @staticmethod
-    def _update_command(update: Mapping[str, Any]) -> str:
-        callback = update.get("callback_query")
-        if isinstance(callback, Mapping):
-            return str(callback.get("data", "command")).removeprefix("signals:")
-        message = update.get("message")
-        if isinstance(message, Mapping):
-            text = message.get("text")
-            if isinstance(text, str) and text.startswith("/"):
-                return text.split(maxsplit=1)[0][1:].split("@", 1)[0].lower()
-        return "command"
+    def _main_keyboard():
+        return keyboard([("Choose Asset", "menu:assets"), ("Account Info", "menu:account")],
+                        [("Auto Trading", "menu:autotrade"), ("Support/Help", "menu:help")])
+
+    def _keyboard(self, chat_id):
+        return self._main_keyboard()
 
     @staticmethod
-    def _valid_referral(link: str | None) -> str | None:
-        candidate = (link or "").strip()
-        parsed = urlsplit(candidate)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            if candidate:
-                logger.warning("REFERRAL_LINK is not a valid HTTP(S) URL; omitting it.")
-            else:
-                logger.warning("REFERRAL_LINK is missing; account links are omitted.")
-            return None
-        return candidate
-
-    async def handle_update(self, update: Mapping[str, Any]) -> None:
-        try:
-            await self._handle_update(update)
-        except TelegramSendError:
-            raise
-        except Exception as exc:
-            logger.error("Telegram command failed (%s).", type(exc).__name__)
-            chat_id = self._update_chat_id(update)
-            if chat_id is not None:
-                try:
-                    await self._render_menu(
-                        chat_id,
-                        "Sorry, that request could not be completed. Try again.\n\n"
-                        "Choose an asset category:",
-                        self._categories_keyboard(),
-                    )
-                except TelegramSendError:
-                    logger.warning("Could not send a Telegram command error response.")
+    def _selected_keyboard():
+        return keyboard([("Change asset", "menu:assets"), ("Stop", "signals:stop")], [("Back", "menu:main")])
 
     @staticmethod
-    def _update_chat_id(update: Mapping[str, Any]) -> int | None:
-        message = update.get("message")
-        if isinstance(message, Mapping):
-            chat = message.get("chat")
-            if isinstance(chat, Mapping) and chat.get("id") is not None:
-                try:
-                    return int(chat["id"])
-                except (TypeError, ValueError):
-                    return None
-        callback = update.get("callback_query")
-        if isinstance(callback, Mapping):
-            message = callback.get("message")
-            if isinstance(message, Mapping):
-                chat = message.get("chat")
-                if isinstance(chat, Mapping) and chat.get("id") is not None:
-                    try:
-                        return int(chat["id"])
-                    except (TypeError, ValueError):
-                        return None
-        return None
+    def _categories_keyboard():
+        rows = [[(category, f"assetcat:{index}")] for index, category in enumerate(CATEGORIES)]
+        return keyboard(*rows, [("Back", "menu:main")])
 
-    async def _handle_update(self, update: Mapping[str, Any]) -> None:
-        callback = update.get("callback_query")
-        if isinstance(callback, Mapping):
-            callback_id = callback.get("id")
-            data = str(callback.get("data", ""))
-            chat_id = self._update_chat_id(update)
-            if callback_id is not None:
-                # Answer first so the button stops loading, whatever follows.
-                try:
-                    await self.client.answer_callback(str(callback_id))
-                except TelegramSendError as exc:
-                    logger.warning(
-                        "Callback answer failed (%s).",
-                        exc.status_code or type(exc).__name__,
-                    )
-            message = callback.get("message")
-            message_id = message.get("message_id") if isinstance(message, Mapping) else None
-            if chat_id is not None and isinstance(message_id, int):
-                self.menu_message_ids[chat_id] = message_id
-            if chat_id is not None and data.startswith("asset:") and self.background_selection:
-                task = asyncio.create_task(
-                    self._locked_select(chat_id, data.split(":", 1)[1]),
-                    name=f"select-asset-{chat_id}",
-                )
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
-                return
-            if chat_id is not None and data.startswith("assetcat:"):
-                await self._show_category(chat_id, data.split(":", 1)[1])
-                return
-            if chat_id is not None and data == "assetback":
-                await self._show_categories(chat_id)
-                return
-            if chat_id is not None and data.startswith("asset:"):
-                await self._select_asset(chat_id, data.split(":", 1)[1])
-                return
-            if chat_id is not None and data.startswith("signals:"):
-                await self._dispatch(
-                    data.removeprefix("signals:"), chat_id, from_menu=True
-                )
-            return
-
-        message = update.get("message")
-        if not isinstance(message, Mapping):
-            return
-        chat_id = self._update_chat_id(update)
-        sender = message.get("from")
-        sender_id: int | None = None
-        if isinstance(sender, Mapping) and sender.get("id") is not None:
-            try:
-                sender_id = int(sender["id"])
-            except (TypeError, ValueError):
-                pass
-        text = message.get("text")
-        if chat_id is None or not isinstance(text, str) or not text.startswith("/"):
-            return
-        parts = text.split(maxsplit=1)
-        command = parts[0][1:].split("@", 1)[0].lower()
-        args = parts[1] if len(parts) > 1 else ""
-        await self._dispatch(command, chat_id, sender_id=sender_id, args=args)
-
-    async def _dispatch(
-        self,
-        command: str,
-        chat_id: int,
-        *,
-        sender_id: int | None = None,
-        from_menu: bool = False,
-        args: str = "",
-    ) -> None:
-        if command in AUTOTRADE_COMMAND_NAMES:
-            if from_menu or sender_id is None:
-                return
-            is_admin = (
-                self.admin_id is not None
-                and sender_id == self.admin_id
-                and self.admin_chat_id is not None
-                and str(chat_id) == str(self.admin_chat_id)
-            )
-            work = self._autotrade_safe(command, chat_id, sender_id, args, is_admin)
-            if self.background_selection:
-                # Service calls can be slow (e.g. /at_stop waits for open trades): never block polling.
-                task = asyncio.create_task(work, name=f"autotrade-{command}-{chat_id}")
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
-            else:
-                await work
-            return
-        if command in {"start", "stop", "status", "help", "register", "pricecheck"}:
-            if command == "start":
-                if from_menu:
-                    await self._show_categories(chat_id)
-                else:
-                    await self._restart_menu(chat_id)
-            elif command == "stop":
-                changed = await asyncio.to_thread(
-                    self.subscribers.set_subscribed, chat_id, False
-                )
-                await self._render_menu(
-                    chat_id,
-                    "Signals are off." if changed else "Signals are already off.",
-                    self._keyboard(chat_id),
-                )
-            elif command == "status":
-                if from_menu:
-                    await self._render_menu(
-                        chat_id, await self._status_text(chat_id), self._keyboard(chat_id)
-                    )
-                else:
-                    await self._status_reply(chat_id)
-            elif command == "help":
-                await self._send_command_reply(
-                    chat_id,
-                    "GBot reports informational price-action signals from closed "
-                    "1-minute candles. Use /start to choose one asset, /status to "
-                    "check your selection, /pricecheck for its latest price, and "
-                    "/stop to stop receiving signals. Signals never place trades.\n\n"
-                    + (
-                        "Optional auto-trading runs on a separate service, starts in Demo "
-                        "and only works in a private chat: /autotrade.\n\n"
-                        if self.autotrade_enabled
-                        else ""
-                    )
-                    + html.escape(config.PAYOUT_DISCLAIMER, quote=False),
-                    command="help",
-                    force=True,
-                )
-            elif command == "pricecheck":
-                await self._pricecheck_reply(chat_id)
-            else:
-                await self._register_reply(chat_id)
-            return
-
-        if command in ADMIN_ONLY_COMMANDS:
-            if (
-                self.admin_id is None
-                or sender_id != self.admin_id
-                or self.admin_chat_id is None
-                or str(chat_id) != str(self.admin_chat_id)
-            ):
-                return
-            if command in {"admin", "health"}:
-                await self._send_command_reply(
-                    chat_id, await self._admin_report_with_payouts(), command=command
-                )
-            elif command == "pause":
-                pause = getattr(self.scanner, "pause", None)
-                if callable(pause):
-                    pause()
-                    text = "Signal scanning is paused."
-                else:
-                    text = "Signal scanning is unavailable."
-                await self._send_command_reply(chat_id, text, command="pause")
-            elif command == "resume":
-                resume = getattr(self.scanner, "resume", None)
-                if callable(resume):
-                    resume()
-                    text = "Signal scanning has resumed."
-                else:
-                    text = "Signal scanning is unavailable."
-                await self._send_command_reply(chat_id, text, command="resume")
-            elif command == "subscribers":
-                chat_ids = await asyncio.to_thread(
-                    self.subscribers.subscribed_chat_ids
-                )
-                text = (
-                    f"Active subscribers: {len(chat_ids)}\n"
-                    + (
-                        "Chats: " + ", ".join(str(item) for item in chat_ids)
-                        if chat_ids
-                        else "No active subscriber chats."
-                    )
-                )
-                if len(text) > 3900:
-                    text = text[:3890] + "\n…"
-                await self._send_command_reply(
-                    chat_id, text, command="subscribers", parse_mode=None
-                )
-            elif command == "testsignal":
-                if self.test_signal_provider is None:
-                    await self._send_command_reply(
-                        chat_id,
-                        "Live test-signal pipeline is unavailable.",
-                        command="testsignal",
-                    )
-                    return
-                messages = self.test_signal_provider()
-                if asyncio.iscoroutine(messages):
-                    messages = await messages
-                if messages:
-                    await self._send_command_reply(
-                        self.admin_chat_id,
-                        "\n\n".join(messages),
-                        command="testsignal",
-                        parse_mode=None,
-                    )
-            return
-
-        await self._send_command_reply(
-            chat_id, "Unknown command. Use /help.", command=command
-        )
-
-    async def _autotrade_send(
-        self, chat_id: int, text: str, *, reply_markup: Mapping[str, Any] | None = None
-    ) -> None:
-        await self.client.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=None)
-
-    async def _autotrade_safe(
-        self, command: str, chat_id: int, sender_id: int, args: str, is_admin: bool
-    ) -> None:
-        try:
-            await self.autotrade.handle(command, chat_id, sender_id, args, is_admin=is_admin)
-        except Exception as exc:
-            logger.error("Auto-trading command failed (%s).", type(exc).__name__)
-            try:
-                await self._autotrade_send(chat_id, "Sorry, that didn't work. Try again in a minute.")
-            except Exception:
-                logger.warning("Could not send the auto-trading error reply.")
-
-    def _keyboard(self, chat_id: int) -> dict[str, Any]:
-        subscriber = self.subscribers.subscribers.get(chat_id)
-        if subscriber is not None and subscriber.subscribed:
-            rows = [
-                [{"text": "Change asset", "callback_data": "assetback"}],
-                [{"text": "Stop", "callback_data": "signals:stop"}],
-            ]
-        else:
-            rows = [
-                [{"text": "Choose an asset", "callback_data": "signals:start"}],
-                [{"text": "Register", "callback_data": "signals:register"}],
-            ]
-        return {"inline_keyboard": rows}
-
-    @staticmethod
-    def _selected_keyboard() -> dict[str, Any]:
-        return {
-            "inline_keyboard": [
-                [{"text": "Change asset", "callback_data": "assetback"}],
-                [{"text": "Stop", "callback_data": "signals:stop"}],
-            ]
-        }
-
-    @staticmethod
-    def _categories_keyboard() -> dict[str, Any]:
-        return {
-            "inline_keyboard": [
-                [{"text": category, "callback_data": f"assetcat:{index}"}]
-                for index, category in enumerate(CATEGORIES)
-            ]
-        }
-
-    def _asset_matches(self) -> dict[str, Any]:
-        return getattr(self.scanner, "asset_matches", {}) if self.scanner else {}
-
-    def _menu_lock(self, chat_id: int) -> asyncio.Lock:
-        lock = self._menu_locks.get(chat_id)
-        if lock is None:
-            lock = self._menu_locks[chat_id] = asyncio.Lock()
-        return lock
-
-    async def _send_menu(
-        self, chat_id: int, text: str, reply_markup: Mapping[str, Any]
-    ) -> None:
-        result = await self.client.send_message(
-            chat_id, text, reply_markup=reply_markup
-        )
-        message_id = result.get("message_id") if isinstance(result, Mapping) else None
-        if isinstance(message_id, int):
-            self.menu_message_ids[chat_id] = message_id
-        else:
-            self.menu_message_ids.pop(chat_id, None)
-
-    async def _render_menu(
-        self, chat_id: int, text: str, reply_markup: Mapping[str, Any]
-    ) -> None:
-        """Edit this chat's single menu message; send one new menu if editing fails."""
+    async def _render_menu(self, chat_id, text, reply_markup):
         message_id = self.menu_message_ids.get(chat_id)
         if message_id is not None:
             try:
-                await self.client.edit_message_text(
-                    chat_id, message_id, text, reply_markup=reply_markup
-                )
+                if chat_id in self._photo_menus:
+                    await self.client.edit_message_caption(chat_id, message_id, text, reply_markup=reply_markup)
+                else:
+                    await self.client.edit_message_text(chat_id, message_id, text, reply_markup=reply_markup)
                 return
-            except TelegramSendError as exc:
+            except (TelegramSendError, AttributeError) as exc:
                 if "not modified" in str(exc):
                     return
-                logger.info(
-                    "Menu edit failed (%s); sending a new menu.",
-                    exc.status_code or type(exc).__name__,
-                )
+                try:
+                    await self.client.delete_message(chat_id, message_id)
+                except (TelegramSendError, AttributeError):
+                    pass
+        self._photo_menus.discard(chat_id)
         await self._send_menu(chat_id, text, reply_markup)
 
-    async def _restart_menu(self, chat_id: int) -> None:
-        """/start: delete the previous menu (the bot's own message) and send a new one."""
-        message_id = self.menu_message_ids.pop(chat_id, None)
-        if message_id is not None:
+    async def _restart_menu(self, chat_id):
+        old = self.menu_message_ids.pop(chat_id, None)
+        self._photo_menus.discard(chat_id)
+        if old is not None:
             try:
-                await self.client.delete_message(chat_id, message_id)
-            except TelegramSendError as exc:
-                logger.info(
-                    "Previous menu could not be deleted (%s).",
-                    exc.status_code or type(exc).__name__,
-                )
-        await self._send_menu(
-            chat_id, "Choose an asset category:", self._categories_keyboard()
-        )
+                await self.client.delete_message(chat_id, old)
+            except (TelegramSendError, AttributeError):
+                pass
+        self._menu_context[chat_id] = "main"
+        image_url = os.environ.get("WELCOME_IMAGE_URL", "https://project--47b83d1f-e152-421a-8f32-8b4029bda188-dev.lovable.app/__l5e/assets-v1/e2da1dfc-7177-4452-8eb0-6919e87aad5a/g-bot-welcome.jpg").strip()
+        if image_url.startswith("https://") and callable(getattr(self.client, "send_photo", None)):
+            try:
+                result = await self.client.send_photo(chat_id, image_url, WELCOME_TEXT,
+                                                      reply_markup=self._main_keyboard())
+                message_id = result.get("message_id") if isinstance(result, Mapping) else None
+                if isinstance(message_id, int):
+                    self.menu_message_ids[chat_id] = message_id
+                    self._photo_menus.add(chat_id)
+                    return
+            except TelegramSendError:
+                logger.warning("Welcome image unavailable; opening text menu.")
+        await self._send_menu(chat_id, WELCOME_TEXT, self._main_keyboard())
 
-    async def _show_categories(self, chat_id: int, notice: str = "") -> None:
-        await self._render_menu(
-            chat_id,
-            f"{notice}Choose an asset category:",
-            self._categories_keyboard(),
-        )
-
-    async def _live_payouts(self) -> dict[str, float]:
-        reader = getattr(self.scanner, "live_payouts", None)
-        if not callable(reader):
-            return {}
+    async def _show_category(self, chat_id, index_text, notice=""):
         try:
-            return await reader()
-        except Exception as exc:
-            logger.warning("Menu payouts unavailable (%s).", type(exc).__name__)
-            return {}
-
-    async def _show_category(
-        self, chat_id: int, index_text: str, notice: str = ""
-    ) -> None:
-        try:
-            category = CATEGORIES[int(index_text)]
-        except (ValueError, IndexError):
+            index = int(index_text)
+            if not 0 <= index < len(CATEGORIES):
+                raise ValueError
+            category = CATEGORIES[index]
+        except (ValueError, TypeError):
             await self._show_categories(chat_id)
             return
-        matches = self._asset_matches()
+        refresh = getattr(self.scanner, "refresh_asset_matches", None)
+        try:
+            matches = await refresh() if callable(refresh) else self._asset_matches()
+        except Exception:
+            # A stale cached asset list is not proof that the market is open.
+            matches = {}
         payouts = await self._live_payouts()
-        assets = [item for item in CATALOG if item.category == category]
-        buttons: list[dict[str, str]] = []
-        for item in assets:
-            live = matches.get(item.id)
-            label = item.name
-            payout = payouts.get(live.symbol) if live is not None else None
-            if payout is not None:
-                label += f" · {payout:g}%"
-            buttons.append({"text": label, "callback_data": f"asset:{item.id}"})
-        rows = [buttons[offset : offset + 2] for offset in range(0, len(buttons), 2)]
-        rows.append([{"text": "Back", "callback_data": "assetback"}])
-        await self._render_menu(
-            chat_id,
-            f"{notice}{html.escape(category, quote=False)} — choose an asset:",
-            {"inline_keyboard": rows},
-        )
-
-    async def _locked_select(self, chat_id: int, asset_id: str) -> None:
-        async with self._menu_lock(chat_id):
-            try:
-                await self._select_asset(chat_id, asset_id)
-            except Exception as exc:
-                logger.error("Asset selection failed (%s).", type(exc).__name__)
-                try:
-                    await self._show_categories(
-                        chat_id, "Sorry, that request could not be completed. Try again.\n\n"
-                    )
-                except TelegramSendError:
-                    logger.warning("Could not update the menu after an error.")
-
-    async def wait_idle(self) -> None:
-        while self._background_tasks:
-            await asyncio.gather(*tuple(self._background_tasks), return_exceptions=True)
-
-    async def _select_asset(self, chat_id: int, asset_id: str) -> None:
-        asset = CATALOG_BY_ID.get(asset_id)
-        if asset is None:
-            await self._show_categories(chat_id)
-            return
-        name = html.escape(asset.name, quote=False)
-        category_index = str(CATEGORIES.index(asset.category))
-        await self._render_menu(
-            chat_id,
-            f"Checking {name}…",
-            {"inline_keyboard": [[{"text": "Back", "callback_data": "assetback"}]]},
-        )
-        select = getattr(self.scanner, "select_asset", None)
-        try:
-            live = await select(chat_id, asset_id) if callable(select) else None
-        except Exception as exc:
-            logger.warning(
-                "Asset selection failed (%s).", type(exc).__name__
-            )
-            live = None
-        if not live:
-            await self._show_category(
-                chat_id, category_index, f"{name} isn't available right now.\n\n"
-            )
-            return
-        await self._render_menu(
-            chat_id,
-            f"Selected {name}. Signals are on for this asset.",
-            self._selected_keyboard(),
-        )
-
-    async def _pricecheck_reply(self, chat_id: int) -> None:
-        subscriber = self.subscribers.subscribers.get(chat_id)
-        selected = getattr(subscriber, "selected_asset", None)
-        getter = getattr(self.scanner, "price_for_symbol", None)
-        price = getter(selected) if selected and callable(getter) else None
-        if price is None:
-            if not selected:
-                await self._send_command_reply(
-                    chat_id,
-                    "No asset selected. Use /start to choose one.",
-                    command="pricecheck",
-                    force=True,
-                )
-                return
-            market_asset = next(
-                (
-                    asset
-                    for asset in self._asset_matches().values()
-                    if asset.symbol == selected
-                ),
-                None,
-            )
-            catalog_asset = CATALOG_BY_ID.get(market_asset.catalog_id) if market_asset else None
-            name = catalog_asset.name if catalog_asset else "Your selected asset"
-            await self._send_command_reply(
-                chat_id,
-                f"{name} isn't available right now. Pick another asset.",
-                command="pricecheck",
-                force=True,
-            )
-            if market_asset:
-                await self._show_category(
-                    chat_id, str(CATEGORIES.index(market_asset.category))
-                )
-            else:
-                await self._show_categories(chat_id)
-            return
-        symbol, value, timestamp = price
-        await self._send_command_reply(
-            chat_id,
-            f"{html.escape(symbol)}: {value:g} at "
-            f"{timestamp.astimezone(configured_timezone()).strftime('%Y-%m-%d %H:%M:%S %Z')}",
-            command="pricecheck",
-            force=True,
-        )
-
-    async def _register_reply(self, chat_id: int) -> None:
-        if self.referral_link:
-            text = (
-                "Don't have a Pocket Option account yet? Create one here: "
-                f"{html.escape(self.referral_link)}. Already have one? Tap Start signals."
-            )
-        else:
-            text = (
-                "The Pocket Option account link is not configured. "
-                "Already have an account? Tap Start signals."
-            )
-        await self._render_menu(chat_id, text, self._keyboard(chat_id))
-
-    async def _payout_line(self, symbol: str | None) -> str:
-        account = config.account_type()
-        reader = getattr(self.scanner, "live_payout", None)
-        payout = await reader(symbol) if symbol and callable(reader) else None
-        value = f"{payout:g}%" if payout is not None else "unavailable"
-        return f"Payout: {value} ({account} account)"
-
-    async def _status_text(self, chat_id: int) -> str:
-        subscriber = self.subscribers.subscribers.get(chat_id)
-        subscribed = bool(subscriber and subscriber.subscribed)
-        symbol = getattr(subscriber, "selected_asset", None)
-        return (
-            f"Signals: {'on' if subscribed else 'off'}\n"
-            f"Scanner: {self._scanner_status()}\n"
-            f"Asset: {html.escape(self._asset_name(subscriber), quote=False)}\n"
-            f"{await self._payout_line(symbol)}"
-        )
-
-    async def _status_reply(self, chat_id: int) -> None:
-        await self._send_command_reply(
-            chat_id,
-            await self._status_text(chat_id),
-            command="status",
-            force=True,
-        )
-
-    def _asset_name(self, subscriber: Any) -> str:
-        symbol = getattr(subscriber, "selected_asset", None)
-        if not symbol:
-            return "not selected"
-        return next(
-            (
-                asset.display_name
-                for asset in self._asset_matches().values()
-                if asset.symbol == symbol
-            ),
-            symbol,
-        )
-
-    def _scanner_status(self) -> str:
-        if bool(getattr(self.scanner, "is_paused", False)):
-            return "Starting, waiting for first prices"
-        if not getattr(self.scanner, "pairs", {}):
-            return "Starting, waiting for first prices"
-        age = getattr(self.scanner, "last_tick_age_seconds", None)
-        broker = getattr(self.scanner, "broker", None)
-        connected_value = getattr(broker, "is_connected", False)
-        connected = bool(
-            connected_value() if callable(connected_value) else connected_value
-        )
-        if connected and age is not None and age <= config.WATCHDOG_TICK_MAX_AGE_SECONDS:
-            return "Live"
-        if age is None:
-            return "Starting, waiting for first prices"
-        return "Reconnecting"
-
-    def admin_metrics(self) -> dict[str, Any]:
-        now = datetime.now(timezone.utc)
-        signals = getattr(self.scanner, "signals", {}) if self.scanner else {}
-        signal_times = []
-        for signal in signals.values():
-            signal_time = getattr(signal, "time", None)
-            if not isinstance(signal_time, datetime):
+        buttons = []
+        for asset in CATALOG:
+            live = matches.get(asset.id)
+            if asset.category != category or live is None or not live.is_open:
                 continue
-            if signal_time.tzinfo is None:
-                signal_time = signal_time.replace(tzinfo=timezone.utc)
-            signal_times.append(signal_time.astimezone(timezone.utc))
-        today = sum(signal_time.date() == now.date() for signal_time in signal_times)
-        last_signal_time = (
-            max(signal_times).isoformat(timespec="seconds")
-            if signal_times
-            else None
-        )
-        broker = getattr(self.scanner, "broker", None) if self.scanner else None
-        connected_value = getattr(broker, "is_connected", False)
-        connected = bool(
-            connected_value() if callable(connected_value) else connected_value
-        )
-        age = getattr(self.scanner, "last_tick_age_seconds", None)
-        age_text = "n/a" if age is None else f"{age:.1f}s"
-        scan_latency = getattr(self.scanner, "last_signal_latency_ms", None)
-        scan_latency_text = "n/a" if scan_latency is None else f"{scan_latency:.1f}ms"
-        delivery_latency = getattr(self.fanout, "last_signal_to_telegram_ms", None)
-        delivery_latency_text = (
-            "n/a" if delivery_latency is None else f"{delivery_latency:.1f}ms"
-        )
-        pairs = len(getattr(self.scanner, "pairs", {})) if self.scanner else 0
-        store = getattr(self.subscribers, "count", None)
-        subscriber_count = store() if callable(store) else 0
-        return {
-            "feed_status": "connected" if connected else "disconnected",
-            "last_tick_age_seconds": age,
-            "selected_assets_streaming": pairs,
-            "subscriber_count": subscriber_count,
-            "signals_today": today,
-            "last_signal_time": last_signal_time,
-            "tick_to_signal_latency_ms": scan_latency,
-            "signal_to_telegram_latency_ms": delivery_latency,
-            "uptime_seconds": max(0, int(time.monotonic() - self.started_at)),
-        }
+            payout = payouts.get(live.symbol)
+            if payout is not None and payout <= 0:
+                continue
+            label = asset.name + (f" · {payout:g}%" if payout is not None else "")
+            buttons.append((label, f"asset:{asset.id}"))
+        rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+        rows.append([("Back", "assetback")])
+        text = f"{notice}<b>{html.escape(category)}</b>" + (" — choose an asset:" if buttons else " — no available assets.")
+        await self._render_menu(chat_id, text, keyboard(*rows))
 
-    async def _admin_report_with_payouts(self) -> str:
-        report = self._admin_report()
-        pairs = getattr(self.scanner, "pairs", {}) if self.scanner else {}
-        if not pairs:
-            return report + f"\nPayouts ({config.account_type()}): no assets streaming"
-        payouts = await self._live_payouts()
-        parts = []
-        for symbol, state in sorted(pairs.items()):
-            name = getattr(getattr(state, "asset", None), "display_name", symbol)
-            value = payouts.get(symbol)
-            parts.append(f"{name} {value:g}%" if value is not None else f"{name} unavailable")
-        return report + f"\nPayouts ({config.account_type()}): " + ", ".join(parts)
+    def _is_admin(self, sender_id, chat_id):
+        allowed_chat = str(chat_id) == str(self.admin_chat_id) if self.admin_chat_id is not None else chat_id == sender_id
+        return sender_id in self.admin_ids and allowed_chat
 
-    def _admin_report(self) -> str:
-        metrics = self.admin_metrics()
-        age = metrics["last_tick_age_seconds"]
-        age_text = "n/a" if age is None else f"{age:.1f}s"
-        scan_latency = metrics["tick_to_signal_latency_ms"]
-        scan_latency_text = "n/a" if scan_latency is None else f"{scan_latency:.1f}ms"
-        delivery_latency = metrics["signal_to_telegram_latency_ms"]
-        delivery_latency_text = (
-            "n/a" if delivery_latency is None else f"{delivery_latency:.1f}ms"
-        )
-        last_signal_time = metrics["last_signal_time"]
-        if last_signal_time:
-            parsed_time = datetime.fromisoformat(last_signal_time).astimezone(
-                configured_timezone()
-            )
-            last_signal_time = parsed_time.strftime("%Y-%m-%d %H:%M:%S %Z")
-        else:
-            last_signal_time = "n/a"
-        return (
-            f"Feed: {metrics['feed_status']}\n"
-            f"SSID: {'configured' if os.environ.get('PO_SSID', '').strip() else 'missing'}\n"
-            f"Account: {config.account_type()}\n"
-            f"Last tick age: {age_text}\n"
-            f"Selected assets streaming: {metrics['selected_assets_streaming']}\n"
-            f"Subscribers: {metrics['subscriber_count']}\n"
-            f"Signals today: {metrics['signals_today']}\n"
-            f"Last signal time: {last_signal_time}\n"
-            f"Tick-to-signal latency: {scan_latency_text}\n"
-            f"Signal-to-Telegram latency: {delivery_latency_text}\n"
-            f"Uptime: {metrics['uptime_seconds']}s"
-        )
+    async def _handle_update(self, update):
+        callback = update.get("callback_query")
+        if isinstance(callback, Mapping) and str(callback.get("data", "")).startswith("menu:"):
+            callback_id = callback.get("id")
+            if callback_id is not None:
+                await self.client.answer_callback(str(callback_id))
+            chat_id = self._update_chat_id(update)
+            if chat_id is None:
+                return
+            sender = callback.get("from", {})
+            sender_id = sender.get("id") if isinstance(sender, Mapping) else None
+            message = callback.get("message", {})
+            message_id = message.get("message_id") if isinstance(message, Mapping) else None
+            # Do not let a stale button turn a signal or another message into a menu.
+            if message_id != self.menu_message_ids.get(chat_id):
+                return
+            async with self._menu_lock(chat_id):
+                await self._navigate(chat_id, str(callback["data"])[5:], sender_id)
+            return
+        await super()._handle_update(update)
 
-class SubscriberFanoutNotifier:
-    """Deliver each signal to active subscriber chats with global throttling."""
+    async def _navigate(self, chat_id, target, sender_id):
+        self._menu_context[chat_id] = target
+        if target == "assets":
+            await self._show_categories(chat_id)
+        elif target == "main":
+            await self._render_menu(chat_id, WELCOME_TEXT, self._main_keyboard())
+        elif target == "account":
+            await self._render_menu(chat_id, await self._status_text(chat_id),
+                keyboard([("Connect account", "menu:at_login"), ("Account link", "signals:register")],
+                         [("Back", "menu:main")]))
+        elif target == "help":
+            await self._render_menu(chat_id, "<b>Support/Help</b>\nSignals use closed 1-minute candles and 1-minute expiry. Payouts may vary.",
+                keyboard([("Signal status", "signals:status"), ("Stop signals", "signals:stop")], [("Back", "menu:main")]))
+        elif target == "autotrade":
+            await self._render_menu(chat_id, "<b>Auto Trading</b>\nDemo is the default. Live trading requires explicit confirmation.",
+                keyboard([("Log in", "menu:at_login"), ("Results", "menu:at_stats")],
+                         [("Start", "menu:at_start"), ("Stop", "menu:at_stop")],
+                         [("Demo", "menu:at_demo"), ("Live", "menu:live")],
+                         [("Log out", "menu:at_logout"), ("Back", "menu:main")]))
+        elif target == "live":
+            if sender_id != chat_id:
+                return
+            await self._render_menu(chat_id, "<b>Switch to Live?</b>\nTrades use real money. Losses are possible.",
+                                    keyboard([("Confirm Live", "menu:live_confirm"), ("Back", "menu:autotrade")]))
+        elif target == "live_confirm":
+            await self._dispatch("at_live", chat_id, sender_id=sender_id, args="confirm")
+        elif target in ALL_COMMANDS - ADMIN_ONLY_COMMANDS:
+            await self._dispatch(target, chat_id, sender_id=sender_id)
 
-    def __init__(
-        self,
-        client: TelegramBotClient,
-        subscribers: SubscriberStore,
-        *,
-        max_messages_per_second: int = 25,
-        sleep: Callable[[float], Any] = asyncio.sleep,
-    ) -> None:
-        if max_messages_per_second <= 0:
-            raise ValueError("max_messages_per_second must be positive")
-        self.client = client
-        self.subscribers = subscribers
-        self.interval = 1.0 / max_messages_per_second
-        self._sleep = sleep
-        self._lock = asyncio.Lock()
-        self._last_send = 0.0
-        self.last_signal_to_telegram_ms: float | None = None
+    async def _autotrade_send(self, chat_id, text, *, reply_markup=None):
+        # Service replies reuse the menu; independently delivered signal messages are untouched.
+        markup = dict(reply_markup) if reply_markup else keyboard()
+        rows = list(markup.get("inline_keyboard", []))
+        rows.append([{"text": "Back", "callback_data": "menu:autotrade"}])
+        await self._render_menu(chat_id, html.escape(text, quote=False), {"inline_keyboard": rows})
 
-    async def _throttle(self) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            delay = self._last_send + self.interval - now
-            if delay > 0:
-                await self._sleep(delay)
-            self._last_send = time.monotonic()
-
-    @staticmethod
-    def _is_stale(signal: Signal) -> bool:
-        signal_time = signal.time
-        if signal_time.tzinfo is None:
-            signal_time = signal_time.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        return (
-            (now - signal_time).total_seconds() > 10
-            or (signal.valid_until is not None and signal.valid_until <= now)
-        )
-
-    async def send(self, signal: Signal) -> str:
-        chat_ids = await asyncio.to_thread(
-            self.subscribers.subscribed_chat_ids, signal.pair
-        )
-        sent = 0
-        text = format_signal_message(signal)
-        for chat_id in chat_ids:
-            if self._is_stale(signal):
-                logger.info("Signal expired during subscriber fan-out.")
-                break
-            failures = 0
-            while True:
-                await self._throttle()
-                try:
-                    await self.client.send_message(chat_id, text)
-                    sent += 1
-                    if sent == 1:
-                        signal_time = signal.time
-                        if signal_time.tzinfo is None:
-                            signal_time = signal_time.replace(tzinfo=timezone.utc)
-                        self.last_signal_to_telegram_ms = max(
-                            0.0,
-                            (
-                                datetime.now(timezone.utc) - signal_time
-                            ).total_seconds()
-                            * 1000.0,
-                        )
-                    break
-                except TelegramSendError as exc:
-                    if exc.status_code == 403:
-                        await asyncio.to_thread(
-                            self.subscribers.set_subscribed, chat_id, False
-                        )
-                        logger.info("Removed a subscriber after Telegram denied delivery.")
-                        break
-                    if exc.retry_after is not None:
-                        if self._is_stale(signal):
-                            logger.info("Signal expired while waiting for Telegram rate limit.")
-                            break
-                        signal_time = signal.time
-                        if signal_time.tzinfo is None:
-                            signal_time = signal_time.replace(tzinfo=timezone.utc)
-                        remaining = 10 - (
-                            datetime.now(timezone.utc) - signal_time
-                        ).total_seconds()
-                        if exc.retry_after >= remaining:
-                            logger.info(
-                                "Signal expired before Telegram's retry window."
-                            )
-                            break
-                        await self._sleep(max(0.1, float(exc.retry_after)))
-                        failures += 1
-                        if failures < 5:
-                            continue
-                    raise
-        return f"sent to {sent} subscriber chats"
-
-
-class TelegramPollingService:
-    """Long-poll updates sequentially, acknowledge by offset, and back off errors."""
-
-    def __init__(
-        self,
-        client: TelegramBotClient,
-        handler: TelegramCommandHandler,
-        *,
-        poll_timeout: int = 25,
-        min_backoff: float = 1.0,
-        max_backoff: float = 30.0,
-        sleep: Callable[[float], Any] = asyncio.sleep,
-    ) -> None:
-        self.client = client
-        self.handler = handler
-        self.poll_timeout = poll_timeout
-        self.min_backoff = min_backoff
-        self.max_backoff = max_backoff
-        self._sleep = sleep
-        self.offset: int | None = None
-
-    async def poll_once(self) -> int:
-        updates = await self.client.get_updates(
-            offset=self.offset, poll_timeout=self.poll_timeout
-        )
-        processed = 0
-        for update in updates:
-            update_id = update.get("update_id")
-            try:
-                await self.handler.handle_update(update)
-            except TelegramSendError as exc:
-                logger.warning(
-                    "Telegram update handler failed (%s).",
-                    exc.status_code or type(exc).__name__,
-                )
-            if isinstance(update_id, int):
-                self.offset = max(self.offset or update_id, update_id + 1)
-            processed += 1
-        return processed
-
-    async def run(self, stop_event: asyncio.Event) -> None:
-        backoff = self.min_backoff
-        while not stop_event.is_set():
-            try:
-                await self.poll_once()
-                backoff = self.min_backoff
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning("Telegram polling failed (%s).", type(exc).__name__)
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=backoff)
-                except TimeoutError:
-                    pass
-                backoff = min(self.max_backoff, max(self.min_backoff, backoff * 2))
+    async def _dispatch(self, command, chat_id, *, sender_id=None, from_menu=False, args=""):
+        if command == "login":
+            command = "at_login"
+        if command in ADMIN_ONLY_COMMANDS:
+            if from_menu or not self._is_admin(sender_id, chat_id):
+                return
+            if command in {"at_halt", "at_resume"}:
+                await self._autotrade_safe(command, chat_id, sender_id, args, True)
+            elif command in {"admin", "health"}:
+                await self._send_command_reply(chat_id, await self._admin_report_with_payouts(), command=command)
+            elif command in {"pause", "resume"}:
+                action = getattr(self.scanner, command, None)
+                if callable(action):
+                    action()
+                text = "Signal scanning is paused." if command == "pause" else "Signal scanning has resumed."
+                await self._send_command_reply(chat_id, text if callable(action) else "Scanner unavailable.", command=command)
+            elif command == "subscribers":
+                ids = await asyncio.to_thread(self.subscribers.subscribed_chat_ids)
+                await self._send_command_reply(chat_id, f"Active subscribers: {len(ids)}\nChats: " + ", ".join(map(str, ids)), command=command)
+            elif command == "testsignal":
+                messages = await self.test_signal_provider() if self.test_signal_provider else []
+                await self._send_command_reply(chat_id, "\n\n".join(messages) or "Live test-signal pipeline unavailable.", command=command, parse_mode=None)
+            return
+        if command == "start":
+            if from_menu:
+                await self._show_categories(chat_id)
+            else:
+                await self._restart_menu(chat_id)
+            return
+        if command == "help":
+            await self._navigate(chat_id, "help", sender_id)
+            return
+        if command == "autotrade":
+            await self._navigate(chat_id, "autotrade", sender_id)
+            return
+        await super()._dispatch(command, chat_id, sender_id=sender_id, from_menu=from_menu, args=args)

@@ -186,7 +186,8 @@ class UserWorker:
                     await self._drain(broker)
                     return  # run() reconnects with the new account / strategy
                 try:
-                    await asyncio.wait_for(ev.wait(), timeout=1.0)
+                    wake = getattr(strategy, "next_wake_seconds", None)
+                    await asyncio.wait_for(ev.wait(), timeout=wake() if callable(wake) else 1.0)
                 except asyncio.TimeoutError:
                     pass
                 ev.clear()

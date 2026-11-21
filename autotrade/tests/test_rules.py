@@ -4,7 +4,7 @@ from ..config import Config
 from ..errors import SettingsError
 from ..trading.models import Decision, Tick, TradingSettings
 from ..trading.risk import RiskManager, RiskState
-from ..trading.strategy import GapStrategy
+from ..trading.strategy import PriceActionExecution
 
 CFG = Config(max_stake=100, live_max_stake=10)
 D = Decision("EURUSD_otc", "CALL", 60, "t")
@@ -89,22 +89,11 @@ class RiskTests(unittest.TestCase):
         self.assertEqual(self.r.check_payout(self.s, None).reason, "payout_unavailable")
 
 
-class GapStrategyTests(unittest.TestCase):
-    s = TradingSettings(gap_threshold=0.0015)
+class PriceActionStrategyTests(unittest.TestCase):
+    def test_timestamp_less_ticks_cannot_place_a_trade(self):
+        s = TradingSettings()
+        self.assertIsNone(PriceActionExecution().on_tick({s.symbol_otc: Tick(s.symbol_otc, 1.1, 0)}, s))
 
-    def decide(self, real, otc):
-        ticks = {"EURUSD": Tick("EURUSD", real, 0), "EURUSD_otc": Tick("EURUSD_otc", otc, 0)}
-        return GapStrategy().on_tick(ticks, self.s)
-
-    def test_real_above_otc_is_call_on_otc(self):
-        d = self.decide(1.0816, 1.0800)
-        self.assertEqual((d.direction, d.asset), ("CALL", "EURUSD_otc"))
-
-    def test_real_below_otc_is_put(self):
-        self.assertEqual(self.decide(1.0800, 1.0816).direction, "PUT")
-
-    def test_inside_threshold_no_trade(self):
-        self.assertIsNone(self.decide(1.0812, 1.0800))
-
-    def test_needs_both_prices(self):
-        self.assertIsNone(GapStrategy().on_tick({"EURUSD": Tick("EURUSD", 1.1, 0)}, self.s))
+    def test_non_minute_expiry_is_rejected(self):
+        with self.assertRaises(SettingsError):
+            TradingSettings(expiry_seconds=120).validate(CFG)

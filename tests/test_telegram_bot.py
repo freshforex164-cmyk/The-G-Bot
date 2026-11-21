@@ -170,17 +170,6 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.handler.handle_update(message_update("/status"))
         self.assertEqual(len(self.client.messages), 2)
 
-    async def test_register_injects_referral_link_and_start_button(self) -> None:
-        await self.handler.handle_update(message_update("/register"))
-        _chat_id, text, markup, _mode = self.client.messages[-1]
-        self.assertIn("https://example.test/join?src=gbot&amp;tag=one", text)
-        self.assertEqual(
-            markup["inline_keyboard"],
-            [
-                [{"text": "Choose an asset", "callback_data": "signals:start"}],
-                [{"text": "Register", "callback_data": "signals:register"}],
-            ],
-        )
 
     async def test_register_without_referral_omits_url_button(self) -> None:
         with self.assertLogs("gbot.telegram", level="WARNING"):
@@ -385,35 +374,14 @@ class TelegramApiAndPollingTests(unittest.IsolatedAsyncioTestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             await client.register_commands(admin_id=900)
-        self.assertEqual(len(requests), 4)
-        self.assertEqual(requests[0][0], "setMyCommands")
+        self.assertEqual(len(requests), 2)
         self.assertEqual(requests[0][1]["scope"], {"type": "default"})
-        default_names = [
-            item["command"] for item in requests[0][1]["commands"]
-        ]
-        self.assertEqual(
-            default_names, ["start", "stop", "register", "status", "help"]
-        )
+        default_names = [item["command"] for item in requests[0][1]["commands"]]
+        self.assertEqual(default_names, ["start"])
         self.assertTrue(ADMIN_ONLY_COMMANDS.isdisjoint(default_names))
-        self.assertEqual(
-            requests[1][1]["scope"], {"type": "chat", "chat_id": 900}
-        )
-        admin_names = [item["command"] for item in requests[1][1]["commands"]]
-        self.assertEqual(admin_names, default_names + sorted(ADMIN_ONLY_COMMANDS))
-        self.assertEqual(requests[2][0], "getMyCommands")
-        self.assertEqual(requests[2][1]["scope"], {"type": "default"})
-        self.assertEqual(requests[3][0], "getMyCommands")
-        self.assertEqual(
-            requests[3][1]["scope"], {"type": "chat", "chat_id": 900}
-        )
-        self.assertEqual(
-            output.getvalue().splitlines(),
-            [
-                "Telegram commands (default): start, stop, register, status, help",
-                "Telegram commands (admin): "
-                + ", ".join(default_names + sorted(ADMIN_ONLY_COMMANDS)),
-            ],
-        )
+        self.assertEqual(requests[1][1]["scope"], {"type": "chat", "chat_id": 900})
+        admin_names = {item["command"] for item in requests[1][1]["commands"]}
+        self.assertTrue(ADMIN_ONLY_COMMANDS <= admin_names)
 
     async def test_poller_advances_offset_and_sends_it_on_next_request(self) -> None:
         client = FakeClient()

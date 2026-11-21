@@ -15,7 +15,6 @@ from typing import Protocol
 
 from config import PAYOUT_DISCLAIMER
 from strategy.model import Signal
-from strategy.price_action import SETUP_LABELS
 
 logger = logging.getLogger("gbot.notifications")
 
@@ -28,20 +27,16 @@ def _expiry_label(seconds: int) -> str:
 
 
 def format_signal_message(signal: Signal) -> str:
-    direction = html.escape(signal.direction.upper(), quote=False)
-    icon = "🔴" if direction == "SELL" else "🟢"
-    asset_name = html.escape(signal.asset_name, quote=False)
-    setup = html.escape(SETUP_LABELS[signal.setup], quote=False)
-    payout = (
-        f"Payout: {signal.payout:g}%" if signal.payout is not None else "Payout: unavailable"
-    )
+    if signal.direction.upper() not in {"BUY", "SELL"} or signal.expiry_seconds != 60:
+        raise ValueError("Signals require BUY/SELL direction and 1-minute expiry.")
+    direction = "🔴 SELL / PUT" if signal.direction.upper() == "SELL" else "🟢 BUY / CALL"
+    asset = html.escape(signal.asset_name, quote=False)
+    payout = f"{signal.payout:g}%" if signal.payout is not None else "unavailable"
     return (
-        f"{icon} <b>{direction}</b>\n"
-        f"Asset: {asset_name}\n"
-        f"Setup: {setup}\n"
-        f"Expiry: {_expiry_label(signal.expiry_seconds)}\n"
-        f"{payout}\n"
-        "Valid for: 10 seconds\n"
+        f"<b>{direction}</b>\n"
+        f"<b>Asset:</b> {asset}\n"
+        f"<b>Expiration:</b> 1 minute\n"
+        f"<b>Payout:</b> {payout}\n"
         f"<i>{html.escape(PAYOUT_DISCLAIMER, quote=False)}</i>"
     )
 

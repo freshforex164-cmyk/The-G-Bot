@@ -15,20 +15,17 @@ class CliTests(unittest.TestCase):
         signal = Signal(
             pair="BITB_otc",
             direction="SELL",
+        setup="RANGE_HIGH_SELL",
+            asset_name="Bitcoin OTC",
             price=24.0017,
             time=now,
-            stochastic_k=80,
-            stochastic_d=75,
-            ma_slope=-0.01,
-            bollinger_middle=24.0,
             payout=92,
-            strength=84,
             valid_until=now + timedelta(seconds=15),
         )
         self.assertEqual(
             main._format_signal_line(signal),
             "2026-01-01T00:00:00+00:00 BITB_otc SELL payout=92% "
-            "strength=84 expiry=35s valid-for=15s",
+            "strength=84 expiry=60s valid-for=15s",
         )
 
     @unittest.skip("OBSOLETE (failing before 2026-11-20): CLI commands it calls (run_scanner, run_pairs, run_explain, FeedCheckResult, _format_signal_line) were removed before 2026-11-20.")

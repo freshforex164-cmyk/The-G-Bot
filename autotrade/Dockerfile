@@ -6,6 +6,9 @@ COPY autotrade/requirements.txt autotrade/requirements.txt
 RUN pip install --no-cache-dir -r autotrade/requirements.txt \
  && python -m playwright install chromium
 COPY autotrade autotrade
+COPY data data
+COPY strategy strategy
+COPY config.py strategy.json ./
 ENV PYTHONUNBUFFERED=1 PORT=8100
 EXPOSE 8100
 CMD ["python", "-m", "autotrade.main"]

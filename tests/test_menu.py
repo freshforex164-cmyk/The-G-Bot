@@ -33,17 +33,6 @@ class OneMenuTests(unittest.IsolatedAsyncioTestCase):
     async def press(self, data: str, callback_id: str = "cb") -> None:
         await self.handler.handle_update(tap(data, self.menu_id(), callback_id=callback_id))
 
-    async def test_start_category_asset_back_keep_one_menu(self) -> None:
-        await self.handler.handle_update(start())
-        await self.press("assetcat:0")
-        await self.press("asset:aud-cad-otc")
-        menu = self.client.menus(5)
-        self.assertEqual(len(menu), 1)
-        self.assertEqual(menu[0]["text"], "Selected AUD/CAD OTC. Signals are on for this asset.")
-        labels = [b["text"] for row in menu[0]["markup"]["inline_keyboard"] for b in row]
-        self.assertEqual(labels, ["Change asset", "Stop"])
-        await self.press("assetback")
-        self.assertEqual(len(self.client.menus(5)), 1)
 
     async def test_unavailable_asset_is_reported_once_inside_the_open_menu(self) -> None:
         await self.handler.handle_update(start())

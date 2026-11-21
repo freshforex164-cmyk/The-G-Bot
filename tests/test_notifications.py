@@ -31,15 +31,10 @@ def sample_signal(
     return Signal(
         pair="BITB_otc",
         direction="SELL",
+        setup="RANGE_HIGH_SELL",
         price=24.0017,
         time=created,
-        stochastic_k=70,
-        stochastic_d=65,
-        ma_slope=0.01,
-        bollinger_middle=24.0,
         payout=92,
-        strength=strength,
-        recommended_expiry_seconds=35,
         asset_name="Bitcoin OTC",
         valid_until=valid_until or created + timedelta(seconds=15),
     )
@@ -89,7 +84,7 @@ class TelegramNotifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             captured["body"]["text"],
             "🔴 <b>SELL</b>\nAsset: Bitcoin OTC\nPayout: 92%\n"
-            "Strength: 84\nExpiration: <b>35s</b>",
+            "Strength: 84\nExpiration: <b>60s</b>",
         )
         self.assertEqual(captured["body"]["parse_mode"], "HTML")
 
@@ -102,7 +97,7 @@ class TelegramNotifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             message,
             "🔴 <b>SELL</b>\nAsset: EUR/GBP &lt;OTC&gt;\nPayout: 92%\n"
-            "Strength: 84\nExpiration: <b>35s</b>",
+            "Strength: 84\nExpiration: <b>60s</b>",
         )
         self.assertEqual(len(message.splitlines()), 5)
         self.assertNotIn("24.0017", message)

@@ -124,7 +124,7 @@ class LiveCommandTests(unittest.IsolatedAsyncioTestCase):
             for index in range(80):
                 store.append(
                     "PAIR",
-                    Candle(index * 10, 100.0, 100.2, 99.8, 100.0),
+                    Candle(index * 60, 100.0, 100.2, 99.8, 100.0),
                 )
             output = io.StringIO()
             with (
@@ -136,7 +136,7 @@ class LiveCommandTests(unittest.IsolatedAsyncioTestCase):
 
         text = output.getvalue()
         self.assertEqual(len(result), 24)
-        self.assertIn("Loaded PAIR: 80 closed 15-second candles", text)
+        self.assertIn("Loaded PAIR: 80 closed 1-minute candles", text)
         self.assertIn("APPROXIMATE STRATEGY LAB", text)
         self.assertIn("52.1%", text)
 

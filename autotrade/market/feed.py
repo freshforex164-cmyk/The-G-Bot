@@ -109,7 +109,12 @@ class SharedMarketFeed:
                     continue
                 self.stream_starts[symbol] += 1
                 async for price in broker.ticks(symbol):
-                    self._ticks[symbol] = Tick(symbol, price, self._clock.monotonic())
+                    stamp = None
+                    if isinstance(price, dict):
+                        from data.candles import _normalize_broker_timestamp
+                        stamp = _normalize_broker_timestamp(price.get("timestamp"))
+                        price = float(price["price"])
+                    self._ticks[symbol] = Tick(symbol, price, self._clock.monotonic(), stamp)
                     delay = 1.0
                     for ev in tuple(self._listeners):
                         ev.set()

@@ -50,15 +50,9 @@ CSV_FIELDS = (
     "entry_price",
     "time",
     "payout",
-    "strength",
-    "strength_components",
     "recommended_expiry_seconds",
     "valid_until",
     "status",
-    "stochastic_k",
-    "stochastic_d",
-    "ma_slope",
-    "bollinger_middle",
     "human_delay_entry_price",
     "human_delay_entry_time",
     *(
@@ -73,9 +67,12 @@ class CsvSignalStore:
     def __init__(self, path: str | Path = "data/signals.csv") -> None:
         self.path = Path(path)
         self._rows: dict[str, dict[str, str]] = {}
+        self._fields = CSV_FIELDS
         if self.path.exists():
             with self.path.open("r", newline="", encoding="utf-8") as handle:
-                for row in csv.DictReader(handle):
+                reader = csv.DictReader(handle)
+                self._fields = tuple(reader.fieldnames or CSV_FIELDS)
+                for row in reader:
                     signal_id = row.get("id")
                     if signal_id:
                         self._rows[signal_id] = {
@@ -94,22 +91,14 @@ class CsvSignalStore:
                 "direction": signal.direction,
                 "entry_price": f"{signal.entry_price:.12g}",
                 "time": signal.time.isoformat(),
-                "payout": f"{signal.payout:g}",
-                "strength": str(signal.strength),
-                "strength_components": json.dumps(
-                    signal.strength_components, sort_keys=True
-                ),
+                "payout": _optional_number(signal.payout),
                 "recommended_expiry_seconds": str(
-                    signal.recommended_expiry_seconds
+                    signal.expiry_seconds
                 ),
                 "valid_until": (
                     signal.valid_until.isoformat() if signal.valid_until else ""
                 ),
                 "status": signal.status,
-                "stochastic_k": _optional_number(signal.stochastic_k),
-                "stochastic_d": _optional_number(signal.stochastic_d),
-                "ma_slope": _optional_number(signal.ma_slope),
-                "bollinger_middle": f"{signal.bollinger_middle:.12g}",
                 "human_delay_entry_price": _optional_number(record.entry_price),
                 "human_delay_entry_time": (
                     record.entry_time.isoformat() if record.entry_time else ""
@@ -135,7 +124,7 @@ class CsvSignalStore:
     def _write(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+            writer = csv.DictWriter(handle, fieldnames=self._fields, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(self._rows.values())
 
