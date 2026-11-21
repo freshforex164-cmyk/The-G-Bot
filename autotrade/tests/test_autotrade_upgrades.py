@@ -47,6 +47,51 @@ class LowMemoryBrowserTests(unittest.TestCase):
         self.assertTrue(Config().low_memory)
 
 
+class BrokerPageVisibleWhenNeededTests(unittest.IsolatedAsyncioTestCase):
+    """Stripped pages save memory only while the user isn't looking at the broker page."""
+
+    def backend(self, **kw):
+        from ..auth.handshake import PlaywrightBackend
+        b = PlaywrightBackend(True, **kw)
+        b._pages = [type("P", (), {"url": "https://m.pocketoption.com/en/login/"})()]
+        return b
+
+    def test_login_page_stripped_while_the_email_form_is_used(self):
+        self.assertTrue(self.backend()._strip_assets())
+
+    def test_page_loads_styled_once_the_user_must_see_it(self):
+        b = self.backend()
+        b.show_full_page()
+        self.assertFalse(b._strip_assets())
+
+    def test_trading_cabinet_stays_stripped(self):
+        b = self.backend()
+        b.show_full_page()
+        b._pages[-1].url = "https://m.pocketoption.com/en/cabinet/demo-quick-high-low/"
+        self.assertTrue(b._strip_assets())
+
+    def test_setting_off_never_strips(self):
+        self.assertFalse(self.backend(block_assets=False)._strip_assets())
+
+    async def test_tapping_the_broker_page_shows_it_in_full(self):
+        b = self.backend()
+        b._pages = []
+        await b.interact({"type": "click", "x": 1, "y": 1})
+        self.assertFalse(b._strip_login_page)
+
+    def test_open_on_broker_page_button_starts_in_full_view(self):
+        env = Env()
+        seen = []
+        class B(FakeBackend):
+            def show_full_page(self): seen.append(True)
+        env.rt.handshakes._factory = lambda: B(tokens=good_tokens())
+        client = TestClient(create_app(env.rt))
+        r = client.post("/auth/handshake", json={"width": 390, "height": 844, "full_view": True},
+                        headers={"Authorization": f"Bearer {token(env.cfg.jwt_secret, sub='tg:1')}"})
+        self.assertEqual(r.status_code, 201)
+        self.assertEqual(seen, [True])
+
+
 class CrashBackend(FakeBackend):
     async def capture_tokens(self, timeout, on_status):
         on_status("waiting_for_login")

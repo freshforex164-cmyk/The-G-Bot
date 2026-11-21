@@ -113,6 +113,7 @@ class HandshakeStart(BaseModel):
     model_config = ConfigDict(extra="forbid")
     width: int | None = Field(None, ge=200, le=4000)
     height: int | None = Field(None, ge=200, le=4000)
+    full_view: bool = False     # the user will sign in on the broker page itself (styles and pictures load)
 
 
 class StopBody(BaseModel):
@@ -320,7 +321,7 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
         limited(handshake_limit, p.user_id)
         vp = (body.width, body.height) if body and body.width and body.height else None
         try:
-            s = await rt.handshakes.start(p.user_id, vp)
+            s = await rt.handshakes.start(p.user_id, vp, full_view=bool(body and body.full_view))
         except RuntimeError:
             raise HTTPException(503, {"error": "busy", "message": TOO_MANY_LOGINS}) from None
         except Exception as exc:     # never a blank 500 page

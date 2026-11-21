@@ -136,13 +136,13 @@
   $("closeBtn").onclick = () => { if (tg) { try { tg.close(); return; } catch (e) {} } window.close(); };
 
   // ---- start ------------------------------------------------------------------------------------
-  async function begin() {
+  async function begin(fullView = false) {
     $("credentials").hidden = true; $("result").hidden = true; submittedAt = 0; lastNotice = "";
     $("start").hidden = true; msg("Opening the login page… (this can take ~10 seconds)");
     stage.style.display = "block";            // so we can measure it: the site is rendered at exactly this size
     const w = Math.round(stage.clientWidth), h = Math.round(stage.clientHeight);
     let r;
-    try { r = await api("auth/handshake", { method: "POST", body: JSON.stringify({ width: w, height: h }) }); }
+    try { r = await api("auth/handshake", { method: "POST", body: JSON.stringify({ width: w, height: h, full_view: fullView === true }) }); }
     catch (e) { r = null; }
     if (r && r.status === 401) { expired(); return false; }
     if (!r || !r.ok) {
@@ -155,8 +155,8 @@
     looping = true; loop(); statusTimer = setInterval(refreshStatus, 1500);
     return true;
   }
-  $("startBtn").onclick = begin;
-  $("openBroker").onclick = () => { $("password").value = ""; begin(); };
+  $("startBtn").onclick = () => begin(true);
+  $("openBroker").onclick = () => { $("password").value = ""; begin(true); };
   $("showPassword").onclick = () => {
     const visible = $("password").type === "password";
     $("password").type = visible ? "text" : "password";

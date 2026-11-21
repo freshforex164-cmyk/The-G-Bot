@@ -8,6 +8,10 @@
   (Google sign-in / CAPTCHA pages load in full). The browser closes right after the Demo and Real sessions are
   captured; every close step is time-boxed. If Chromium dies (out of memory) the page shows "The secure sign-in
   browser stopped unexpectedly… try again" — never a blank screen. Busy/slow/unreachable cases have their own text.
+- Pages the user has to look at load normally: the broker page is stripped only while the user signs in with
+  the email/password form. After submitting (verification), after tapping the broker page, and with
+  "Open Pocket Option login" / "finish on the Pocket Option page", it loads with styles and pictures.
+  Trading cabinet pages (only visited to capture sessions) always stay stripped.
 - **Real Demo + Real sessions**: each account's session is now captured from its own Pocket Option page
   (live testing showed a Demo session derived from the Real one is rejected).
 - **Menu**: `/start` → category → asset → **📡 Receive Signals** (cards only) or **🤖 Start Auto-Trade**

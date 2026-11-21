@@ -189,6 +189,10 @@ class PlaywrightBackend:
                  *, low_memory: bool = True, block_assets: bool = True, block_third_party: bool = True):
         self._headless, self._hosts, self._login_url = headless, hosts, login_url
         self._low_memory, self._block_assets, self._block_third_party = low_memory, block_assets, block_third_party
+        # Login-page assets are dropped only while the user is not looking at the broker page (email/password
+        # form). Once they must see it (verification after submit, or "finish on the Pocket Option page"),
+        # it loads styled. Trading cabinet pages are only visited to capture sessions, so stay stripped.
+        self._strip_login_page = block_assets
         self._vp = dict(VIEWPORT)
         self._pw = self._browser = self._context = None
         self._pages: list[Any] = []
@@ -201,6 +205,18 @@ class PlaywrightBackend:
         """Match the user's own screen so the site fills the phone edge to edge. Before open()."""
         self._vp = {"width": min(max(int(width), MIN_VIEW[0]), MAX_VIEW[0]),
                     "height": min(max(int(height), MIN_VIEW[1]), MAX_VIEW[1])}
+
+    def show_full_page(self) -> None:
+        """The user is looking at / using the broker page itself: load it with its styles and pictures."""
+        self._strip_login_page = False
+
+    def _strip_assets(self) -> bool:
+        if not self._block_assets:
+            return False
+        if self._strip_login_page:
+            return True
+        page = self._page
+        return page is not None and "/cabinet" in (page.url or "")
 
     async def open(self) -> None:
         from playwright.async_api import async_playwright
@@ -229,7 +245,7 @@ class PlaywrightBackend:
         nav = request.is_navigation_request()
         try:
             if not host_allowed(request.url, navigation=nav, hosts=self._hosts) or (
-                    not nav and should_block(request.url, request.resource_type, block_assets=self._block_assets,
+                    not nav and should_block(request.url, request.resource_type, block_assets=self._strip_assets(),
                                              block_third_party=self._block_third_party)):
                 await route.abort()
             else:
@@ -298,6 +314,7 @@ class PlaywrightBackend:
                 "inputs": inputs, "host": host, "notice": notice}
 
     async def interact(self, event: dict[str, Any]) -> None:
+        self.show_full_page()       # the user is using the broker page directly
         page = self._page
         if page is None:
             return
@@ -376,6 +393,8 @@ class PlaywrightBackend:
             raise RuntimeError("Enter a valid email address.")
         if not isinstance(password, str) or not 1 <= len(password) <= MAX_VALUE_LEN:
             raise RuntimeError("Enter a valid password.")
+        # Whatever happens next (verification, or "use the broker page"), the user now sees that page.
+        self.show_full_page()
         async with self._credential_lock:
             page = self._page
             url = urlparse(page.url) if page is not None else None
@@ -470,7 +489,8 @@ class HandshakeManager:
             if not s.active and s.created_at and (now - s.created_at).total_seconds() > 900:
                 del self._sessions[sid]
 
-    async def start(self, user_id: str, viewport: tuple[int, int] | None = None) -> HandshakeSession:
+    async def start(self, user_id: str, viewport: tuple[int, int] | None = None,
+                    full_view: bool = False) -> HandshakeSession:
         self._prune()
         for s in list(self._sessions.values()):
             if s.user_id == user_id and s.active:
@@ -480,6 +500,8 @@ class HandshakeManager:
         session = HandshakeSession(secrets.token_urlsafe(24), user_id, created_at=self._clock.utcnow(), backend=self._factory())
         if viewport and hasattr(session.backend, "set_viewport"):
             session.backend.set_viewport(*viewport)
+        if full_view and hasattr(session.backend, "show_full_page"):
+            session.backend.show_full_page()
         self._sessions[session.id] = session
         session.task = asyncio.create_task(self._run(session), name=f"handshake:{session.id[:6]}")
         return session
