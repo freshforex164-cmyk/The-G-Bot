@@ -19,6 +19,7 @@ from strategy.price_action import PriceActionStrategy
 from strategy.settings import STRATEGY_SETTINGS
 from subscriber_store import SubscriberStore
 
+MAX_KEPT_SIGNALS = 200
 logger = logging.getLogger("gbot.scanner")
 ASSET_TICK_WAIT_SECONDS = 10.0
 ASSET_SUBSCRIBE_ATTEMPTS = 2
@@ -232,6 +233,7 @@ class SignalScanner:
             await asyncio.gather(task, return_exceptions=True)
         self.pairs.pop(symbol, None)
         self._unselected_since.pop(symbol, None)
+        self._receiving_pairs.discard(symbol)
 
     async def _make_room(self, keep: set[str]) -> bool:
         """Free one slot under MAX_SUBSCRIBED by dropping the oldest unselected stream."""
@@ -438,6 +440,9 @@ class SignalScanner:
         if state is None or self.price_for_symbol(signal.pair) is None:
             return
         self.signals[signal.id] = signal
+        if len(self.signals) > MAX_KEPT_SIGNALS:      # bounded: only recent signals are ever read
+            for old in list(self.signals)[: len(self.signals) - MAX_KEPT_SIGNALS]:
+                self.signals.pop(old, None)
         signal_time = signal.time
         if signal_time.tzinfo is None:
             signal_time = signal_time.replace(tzinfo=timezone.utc)
@@ -449,7 +454,7 @@ class SignalScanner:
             try:
                 result = self.on_signal(signal)
                 if asyncio.iscoroutine(result):
-                    asyncio.create_task(result)
+                    self._spawn(result, f"publish-{signal.pair}")
             except Exception as exc:
                 logger.error("Signal callback failed (%s).", type(exc).__name__)
 

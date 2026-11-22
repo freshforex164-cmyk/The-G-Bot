@@ -49,6 +49,8 @@ class SharedMarketFeed:
                 if task:
                     task.cancel()
                 self._ticks.pop(sym, None)
+        if not self._refs:              # nobody needs prices: close the idle WebSocket too
+            await self._drop_broker()
 
     def latest(self, symbol: str) -> Tick | None:
         return self._ticks.get(symbol)
@@ -74,6 +76,8 @@ class SharedMarketFeed:
         await asyncio.gather(*self._tasks.values(), return_exceptions=True)
         self._tasks.clear()
         self._refs.clear()
+        self._ticks.clear()
+        self._listeners.clear()
         await self._drop_broker()
 
     # -- internals ----------------------------------------------------------------------------
@@ -128,6 +132,7 @@ class SharedMarketFeed:
                 await asyncio.sleep(60)
             except Exception as exc:
                 self.state = "reconnecting"
+                self._ticks.pop(symbol, None)   # a stale price must never look current
                 log.warning("feed stream %s failed (%s); retrying", symbol, type(exc).__name__)
                 await self._drop_broker()
                 await asyncio.sleep(delay + random.random())
