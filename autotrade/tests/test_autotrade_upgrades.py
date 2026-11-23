@@ -165,13 +165,14 @@ class AutoTraderListAndAlertsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await wait_until(lambda: len(self.env.alerts.sent) >= 2))
         (u1, opened), (u2, settled) = self.env.alerts.sent[:2]
         self.assertEqual((u1, u2), ("tg:5", "tg:5"))
-        self.assertIn("🤖 Auto-Trade opened · DEMO", opened)
-        self.assertIn("🟢 BUY / CALL", opened)
+        self.assertIn("🤖 TRADE OPENED · DEMO", opened)
+        self.assertIn("Direction: 🟢 BUY", opened)
         self.assertIn("Setup: Uptrend Pullback", opened)
         self.assertIn("Asset: EUR/USD OTC", opened)
-        self.assertIn("Expiration: 1 minute", opened)
-        self.assertIn("❌ LOSS · -1.00", settled)
-        self.assertIn("Balance (Demo): 10,001.00", settled)
+        self.assertIn("Expiry: 1m", opened)
+        self.assertIn("❌ LOSS · DEMO", settled)
+        self.assertIn("Net P/L: -$1.00", settled)
+        self.assertIn("Balance: $10,001.00", settled)
 
     async def test_skipped_signal_is_explained(self):
         self.env.world("tg:5").payout = 70

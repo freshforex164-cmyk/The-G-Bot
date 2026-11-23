@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from collections import deque
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Protocol
@@ -56,26 +58,65 @@ def setup_name(setup: str | None) -> str:
     return text[:48] or "Price Action"
 
 
+def _usd(value: float | None) -> str:
+    return f"${float(value or 0):,.2f}"
+
+
+def _signed_usd(value: float | None) -> str:
+    v = float(value or 0)
+    return f"{'+' if v > 0 else '-' if v < 0 else ''}${abs(v):,.2f}"
+
+
+def _side(direction: str) -> str:
+    return "🟢 BUY" if direction == "CALL" else "🔴 SELL"
+
+
 def opened_text(*, mode: str, asset: str, direction: str, setup: str, stake: float, payout: int | None,
-                expiry_seconds: int) -> str:
+                expiry_seconds: int, step: int | None = None) -> str:
+    """Trade opened: mode, asset, direction, stake, payout, expiry (professional log layout)."""
     minutes = max(1, expiry_seconds // 60)
-    lines = [f"🤖 Auto-Trade opened · {_account(mode).upper()}", direction_line(direction),
-             f"Setup: {setup_name(setup)}"]
-    lines += [f"Asset: {asset}", f"Expiration: {minutes} minute{'s' if minutes != 1 else ''}",
-              f"Stake: {_money(stake)}", f"Payout: {payout}%" if payout is not None else "Payout: unavailable"]
-    return "\n".join(lines)
+    stake_line = f"Stake: {_usd(stake)}" + (f" (Martingale step {step})" if step else "")
+    return "\n".join([
+        f"🤖 TRADE OPENED · {_account(mode).upper()}",
+        f"Asset: {asset}",
+        f"Direction: {_side(direction)}",
+        stake_line,
+        f"Payout: {payout}%" if payout is not None else "Payout: unavailable",
+        f"Expiry: {minutes}m",
+        f"Setup: {setup_name(setup)}",
+    ])
 
 
 def settled_text(*, mode: str, asset: str, direction: str, stake: float, outcome: str, profit: float | None,
-                 balance: float | None, setup: str = "") -> str:
-    head = {"win": f"✅ WIN · +{_money(profit)}", "loss": f"❌ LOSS · -{_money(abs(profit or 0))}",
-            "draw": "➖ BREAK EVEN · 0.00"}.get(outcome, "❔ Result unavailable")
+                 balance: float | None, setup: str = "", win_streak: int | None = None,
+                 step: int | None = None, martingale: bool = False) -> str:
+    """Trade settled: outcome, net P/L, current balance, win streak / ladder step."""
+    head = {"win": "✅ WIN", "loss": "❌ LOSS", "draw": "➖ DRAW"}.get(outcome, "❔ RESULT UNAVAILABLE")
     lines = [f"{head} · {_account(mode).upper()}",
-             f"{asset} · {direction_line(direction)[2:]} · stake {_money(stake)}",
-             f"Setup: {setup_name(setup)}"]
-    if balance is not None:
-        lines.append(f"Balance ({_account(mode)}): {balance:,.2f}")
+             f"Asset: {asset} · {_side(direction)[2:]} · stake {_usd(stake)}",
+             f"Net P/L: {_signed_usd(profit)}" if profit is not None else "Net P/L: unavailable",
+             f"Balance: {_usd(balance)}" if balance is not None else "Balance: unavailable"]
+    streak = []
+    if win_streak is not None:
+        streak.append(f"Win streak: {win_streak}")
+    if martingale and step is not None:
+        streak.append(f"Next step: {step}")
+    if streak:
+        lines.append(" · ".join(streak))
+    lines.append(f"Setup: {setup_name(setup)}")
     return "\n".join(lines)
+
+
+def daily_summary_text(*, mode: str, day: str, trades: int, wins: int, losses: int, draws: int,
+                       win_rate: float | None, pnl: float) -> str:
+    """Daily summary: total trades, win rate, realized P/L for one UTC day and account."""
+    rate = f"{win_rate:.1f}%" if win_rate is not None else "n/a"
+    return "\n".join([
+        f"📊 DAILY SUMMARY · {_account(mode).upper()} · {day} (UTC)",
+        f"Total trades: {trades}",
+        f"Win rate: {rate} ({wins}W / {losses}L / {draws}D)",
+        f"Realized P/L: {_signed_usd(pnl)}",
+    ])
 
 
 def skipped_text(*, asset: str, direction: str, reason: str, setup: str = "", payout: int | None = None,
@@ -121,12 +162,22 @@ class NullNotifier:
 
 
 class TelegramNotifier:
-    """Fire-and-forget delivery; ``sent`` keeps the texts in tests."""
+    """Non-blocking, ordered delivery. ``send`` only appends to a small per-chat queue (bounded, oldest
+    dropped first) and returns at once, so WebSocket and settlement loops never wait on Telegram. One drain
+    task per chat posts in order from a worker thread, retries 429/5xx a few times, and exits when the
+    queue is empty (no idle tasks or queues are kept)."""
 
-    def __init__(self, token: str, *, opener: Callable[..., Any] | None = None, timeout: float = 10.0):
+    MAX_QUEUE = 50
+    ATTEMPTS = 3
+
+    def __init__(self, token: str, *, opener: Callable[..., Any] | None = None, timeout: float = 10.0,
+                 sleep: Callable[[float], None] | None = None):
         self._token, self._timeout = token, timeout
         self._open = opener or urllib.request.urlopen
+        self._sleep = sleep or time.sleep
         self._tasks: set[asyncio.Task] = set()
+        self._queues: dict[int, deque[str]] = {}
+        self._draining: dict[int, asyncio.Task] = {}
 
     @staticmethod
     def chat_id(user_id: str) -> int | None:
@@ -138,17 +189,34 @@ class TelegramNotifier:
             return None
         return value if value > 0 else None
 
-    def _post(self, chat_id: int, text: str) -> None:
+    def _post(self, chat_id: int, text: str) -> bool:
+        """One delivery with a few retries (worker thread). True when Telegram accepted it."""
         body = json.dumps({"chat_id": chat_id, "text": text, "disable_web_page_preview": True}).encode()
-        req = urllib.request.Request(f"https://api.telegram.org/bot{self._token}/sendMessage", data=body,
-                                     method="POST", headers={"Content-Type": "application/json"})
-        try:
-            with self._open(req, timeout=self._timeout) as resp:
-                resp.read()
-        except urllib.error.HTTPError as exc:
-            log.info("trade alert not delivered (HTTP %s)", exc.code)
-        except Exception as exc:
-            log.info("trade alert not delivered (%s)", type(exc).__name__)
+        for attempt in range(1, self.ATTEMPTS + 1):
+            req = urllib.request.Request(f"https://api.telegram.org/bot{self._token}/sendMessage", data=body,
+                                         method="POST", headers={"Content-Type": "application/json"})
+            try:
+                with self._open(req, timeout=self._timeout) as resp:
+                    resp.read()
+                return True
+            except urllib.error.HTTPError as exc:
+                retry = exc.code == 429 or exc.code >= 500
+                wait = float(attempt)
+                if exc.code == 429:
+                    try:
+                        wait = float(json.loads(exc.read() or b"{}").get("parameters", {}).get("retry_after", 1))
+                    except Exception:
+                        wait = 1.0
+                log.info("trade alert not delivered (HTTP %s, attempt %s)", exc.code, attempt)
+                if not retry or attempt == self.ATTEMPTS:
+                    return False
+                self._sleep(min(max(wait, 0.5), 10.0))
+            except Exception as exc:
+                log.info("trade alert not delivered (%s, attempt %s)", type(exc).__name__, attempt)
+                if attempt == self.ATTEMPTS:
+                    return False
+                self._sleep(float(attempt))
+        return False
 
     def send(self, user_id: str, text: str) -> None:
         chat_id = self.chat_id(user_id)
@@ -158,9 +226,27 @@ class TelegramNotifier:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        task = loop.create_task(asyncio.to_thread(self._post, chat_id, text))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        q = self._queues.setdefault(chat_id, deque())
+        if len(q) >= self.MAX_QUEUE:
+            q.popleft()
+            log.info("trade alert queue full; oldest alert dropped")
+        q.append(text)
+        if chat_id not in self._draining:
+            task = loop.create_task(self._drain_chat(chat_id))
+            self._draining[chat_id] = task
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def _drain_chat(self, chat_id: int) -> None:
+        try:
+            q = self._queues.get(chat_id)
+            while q:
+                text = q.popleft()
+                await asyncio.to_thread(self._post, chat_id, text)
+        finally:
+            self._draining.pop(chat_id, None)
+            if not self._queues.get(chat_id):
+                self._queues.pop(chat_id, None)
 
     async def drain(self) -> None:
         while self._tasks:

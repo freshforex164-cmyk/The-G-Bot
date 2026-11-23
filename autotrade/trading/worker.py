@@ -6,15 +6,16 @@ import asyncio
 import logging
 import uuid
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Awaitable, Callable
 
 from ..clock import Clock, utc_day_start
 from ..errors import (BrokerError, Disconnected, ModeMismatch, RateLimited, SessionExpired, VaultError)
 from ..market.feed import SharedMarketFeed
-from ..notify import NullNotifier, Notifier, failed_text, low_balance_text, opened_text, settled_text, skipped_text
-from ..storage.repo import BalanceRow, BotState, Repository
+from ..notify import (NullNotifier, Notifier, daily_summary_text, failed_text, low_balance_text, opened_text,
+                      settled_text, skipped_text)
+from ..storage.repo import BalanceRow, BotState, Repository, summarize
 from ..vault.service import TokenVault
 from .broker import BrokerClient, TradeOutcome, account_is_demo, map_exception
 from .models import DEMO, Decision, TradeRecord, TradingSettings
@@ -126,6 +127,8 @@ class UserWorker:
         self.signals_received = 0
         self.stakes = StakeTracker()
         self.last_route: dict | None = None
+        self._summary_day: datetime | None = None     # UTC day of the last settled trade
+        self._summaries_sent: set[tuple] = set()
         self._open_stakes: dict[str, float] = {}
 
     # -- control ------------------------------------------------------------------------------
@@ -260,6 +263,7 @@ class UserWorker:
                         await asyncio.shield(broker.close())
             self.status = WorkerStatus.STOPPED
             await self._persist()
+            await self._daily_summary(utc_day_start(self._clock.utcnow()), self.settings.mode, "stop")
         except asyncio.CancelledError:
             self.status = WorkerStatus.STOPPED
             await self._persist()
@@ -473,6 +477,8 @@ class UserWorker:
             self._note(verdict.reason)
             self._alert_skip(d, verdict.reason)
             self.status = WorkerStatus.PAUSED if verdict.halt else WorkerStatus.RUNNING
+            if verdict.halt:
+                await self._daily_summary(day, s.mode, verdict.reason)
             return
         self.status = WorkerStatus.RUNNING
         if payout is None:            # the router already read it for routed candidates
@@ -524,7 +530,8 @@ class UserWorker:
         await self._repo.update_trade(self.user_id, ref, status="open", broker_trade_id=trade_id)
         setup = d.reason if d.reason and d.reason != "gbot_signal" else ""
         self._alert(opened_text(mode=s.mode, asset=name, direction=d.direction, setup=setup, stake=stake,
-                                payout=payout, expiry_seconds=d.expiry_seconds))
+                                payout=payout, expiry_seconds=d.expiry_seconds,
+                                step=meta["stake_step"] if s.stake_mode == "martingale" else None))
         self._spawn_tracker(broker, ref, trade_id, stake, payout, d.expiry_seconds + 45,
                             info={"mode": s.mode, "asset": name, "direction": d.direction, "setup": setup})
 
@@ -546,10 +553,15 @@ class UserWorker:
                 await self._repo.update_trade(self.user_id, ref, status="settled", outcome=out.result,
                                               profit=profit, settled_at=self._clock.utcnow())
                 balance = await self._refresh_balance(broker)
+                if balance is None and self.balance_kind == ("demo" if info.get("mode") == DEMO else "real"):
+                    balance = self.balance
                 if info:
+                    s = self.settings
                     self._alert(settled_text(mode=info["mode"], asset=info["asset"], direction=info["direction"],
                                              stake=stake, outcome=out.result, profit=profit, balance=balance,
-                                             setup=info.get("setup", "")))
+                                             setup=info.get("setup", ""), win_streak=self.stakes.win_streak,
+                                             step=self.stakes.step, martingale=s.stake_mode == "martingale"))
+                await self._on_settled(info.get("mode") or self.settings.mode)
         except asyncio.CancelledError:
             raise  # left 'open'; the next session adopts it
         except Exception as exc:
@@ -558,6 +570,36 @@ class UserWorker:
         finally:
             self._trackers.pop(ref, None)
             self._open_stakes.pop(ref, None)
+
+    # -- daily summary ------------------------------------------------------------------------
+    async def _on_settled(self, mode: str) -> None:
+        """After a settlement: on the first result of a new UTC day, summarize the previous day once."""
+        today = utc_day_start(self._clock.utcnow())
+        prev, self._summary_day = self._summary_day, today
+        if prev is not None and prev != today:
+            await self._daily_summary(prev, mode, "day_end")
+
+    async def _daily_summary(self, day: datetime, mode: str, reason: str) -> None:
+        """Total trades, win rate and realized P/L for one UTC day and account. Sent at most once per day
+        and trigger (day end, daily limit, bot stopped); never raises and never blocks trading for long."""
+        key = (day.date().isoformat(), mode, reason)
+        if key in self._summaries_sent:
+            return
+        try:
+            end = day + timedelta(days=1)
+            rows = [t for t in await self._repo.recent_trades(self.user_id, 500)
+                    if t.mode == mode and t.opened_at is not None and day <= t.opened_at < end]
+            stats = summarize(rows)
+            if not stats["settled"]:
+                return
+            if len(self._summaries_sent) >= 16:
+                self._summaries_sent.clear()
+            self._summaries_sent.add(key)
+            self._alert(daily_summary_text(mode=mode, day=key[0], trades=stats["settled"], wins=stats["wins"],
+                                           losses=stats["losses"], draws=stats["draws"],
+                                           win_rate=stats["win_rate"], pnl=stats["net_profit"]))
+        except Exception:
+            log.info("daily summary failed for user %s", self.user_id)
 
     async def _adopt_open_trades(self, broker: BrokerClient, mode: str) -> None:
         for t in await self._repo.open_trades(self.user_id):
