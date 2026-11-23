@@ -63,6 +63,9 @@ class PostgresRepositoryTests(unittest.IsolatedAsyncioTestCase):
         await vault.store("u2", "real", real)
         await vault.store("u2", "demo", build_ssid("D2", "demo", uid=4))
         self.assertEqual(await vault.get("u2", "real"), real)
+        await vault.delete("u2", "demo")                 # forced re-login wipes one slot only
+        self.assertIsNone(await self.repo.get_credential("u2", "demo"))
+        self.assertEqual(await vault.get("u2", "real"), real)
         await vault.delete_all("u2")
 
     async def test_settings_trades_stats_state(self):
