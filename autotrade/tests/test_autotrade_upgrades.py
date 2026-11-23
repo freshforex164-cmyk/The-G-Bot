@@ -174,12 +174,13 @@ class AutoTraderListAndAlertsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Net P/L: -$1.00", settled)
         self.assertIn("Balance: $10,001.00", settled)
 
-    async def test_skipped_signal_is_explained(self):
+    async def test_routine_skip_is_counted_not_sent_as_a_signal_text(self):
+        # Auto-Trade mode never posts buy/sell texts: a low-payout skip shows in /at_status only.
         self.env.world("tg:5").payout = 70
         await self.m.submit_signal("tg:5", gbot_signal(self.env))
-        self.assertTrue(await wait_until(lambda: self.env.alerts.sent))
-        self.assertIn("skipped", self.env.alerts.sent[0][1])
-        self.assertIn("payout is below your minimum", self.env.alerts.sent[0][1])
+        self.assertTrue(await wait_until(lambda: self.m._workers["tg:5"].last_reject == "payout_below_minimum"))
+        self.assertEqual(self.env.alerts.sent, [])
+        self.assertEqual((await self.m.stats("tg:5"))["bot"]["skipped"], {"payout_below_minimum": 1})
 
     async def test_balance_is_saved_and_readable_after_the_bot_stops(self):
         await self.m.submit_signal("tg:5", gbot_signal(self.env))

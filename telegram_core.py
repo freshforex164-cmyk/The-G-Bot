@@ -10,6 +10,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from collections.abc import Awaitable, Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -1203,6 +1204,9 @@ class TelegramCommandHandler:
             f"Uptime: {metrics['uptime_seconds']}s"
         )
 
+MAX_TRACKED_DISPATCHES = 64
+
+
 class SubscriberFanoutNotifier:
     """Deliver each signal to active subscriber chats with global throttling."""
 
@@ -1226,7 +1230,10 @@ class SubscriberFanoutNotifier:
         self.roster = roster if roster is not None else (AutotradeRoster(autotrade) if autotrade else None)
         self._autotrade_slots = asyncio.Semaphore(max(1, max_parallel_autotrade))
         self._autotrade_tasks: set[asyncio.Task] = set()
+        # signal id -> hand-off task (result: the chats that got the signal as a trade instead of a card)
+        self._dispatches: "OrderedDict[str, asyncio.Task]" = OrderedDict()
         self.autotrade_accepted = 0
+        self.autotrade_handoffs = 0
         self.interval = 1.0 / max_messages_per_second
         self._sleep = sleep
         self._lock = asyncio.Lock()
@@ -1280,9 +1287,16 @@ class SubscriberFanoutNotifier:
                 return
             reason = result.get("reason") if isinstance(result, dict) else None
             if reason in ("not_running", "follow_signals_off") and self.roster is not None:
-                self.roster.discard(chat_id)        # the bot stopped: back to signal cards
+                self.roster.discard(chat_id)        # the bot stopped: back to signal cards (Signal Mode)
             if reason in ("not_running", "follow_signals_off", "unreachable", "trading_halted") and signal is not None:
-                await self._send_card_late(chat_id, signal)   # nothing was traded: the user still gets the signal
+                # Nothing was traded: a user who chose this asset still gets the signal card.
+                try:
+                    chose = int(chat_id) in set(await asyncio.to_thread(
+                        self.subscribers.subscribed_chat_ids, signal.pair))
+                except Exception:
+                    chose = False
+                if chose:
+                    await self._send_card_late(chat_id, signal)
 
     async def _send_card_late(self, chat_id: Any, signal: Signal) -> None:
         if self._is_stale(signal):
@@ -1311,18 +1325,50 @@ class SubscriberFanoutNotifier:
             started += 1
         return started
 
+    def dispatch_autotrade(self, signal: Signal) -> "asyncio.Task | None":
+        """Auto-Trade mode: hand this confirmed signal to every auto-trading user's bot at once.
+
+        Called the moment the scanner confirms a signal, before (and independent of) the Telegram card
+        queue, so a slow card fan-out can never make a signal expire before it reaches the bots. Every
+        active auto-trader gets every confirmed signal (all scanned assets, not only the chart they chose);
+        the auto-trade service's payout router then places the best ones. Idempotent per signal id."""
+        if self.autotrade is None or self.roster is None:
+            return None
+        task = self._dispatches.get(signal.id)
+        if task is None:
+            task = asyncio.create_task(self._dispatch(signal), name=f"autotrade-dispatch-{signal.pair}")
+            self._dispatches[signal.id] = task
+            while len(self._dispatches) > MAX_TRACKED_DISPATCHES:
+                self._dispatches.popitem(last=False)
+        return task
+
+    async def _dispatch(self, signal: Signal) -> set[int]:
+        if self.roster.stale:
+            await self.roster.refresh(timeout=2.0)
+        auto_ids: set[int] = set()
+        for chat_id in self.roster.active_ids():
+            try:
+                if int(chat_id) > 0:          # private chats only: groups/channels are not accounts
+                    auto_ids.add(int(chat_id))
+            except (TypeError, ValueError):
+                continue
+        self.autotrade_handoffs += self.mirror_to_autotrade(sorted(auto_ids), signal)
+        return auto_ids
+
     async def send(self, signal: Signal) -> str:
+        """Signal Mode delivery: the card goes to subscribers of this asset who are not auto-trading."""
+        auto_ids: set[int] = set()
+        task = self.dispatch_autotrade(signal)      # already started by the scanner callback in production
+        if task is not None:
+            try:
+                auto_ids = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.info("Auto-trade dispatch failed (%s).", type(exc).__name__)
         chat_ids = await asyncio.to_thread(
             self.subscribers.subscribed_chat_ids, signal.pair
         )
-        # Auto-trading users get the signal placed at once (and trade alerts from the service) instead
-        # of the card; everyone else gets the card. Only users on the service's active list are called.
-        auto_ids: set[int] = set()
-        if self.autotrade is not None and self.roster is not None:
-            if self.roster.stale:
-                await self.roster.refresh(timeout=2.0)
-            auto_ids = {c for c in chat_ids if int(c) > 0 and self.roster.is_active(c)}
-        self.mirror_to_autotrade(sorted(auto_ids), signal)
         sent = 0
         text = format_signal_message(signal)
         for chat_id in [c for c in chat_ids if c not in auto_ids]:

@@ -1,4 +1,4 @@
-# GBot — Phase 3 status (2026-11-23, re-login update)
+# GBot — Phase 3 status (2026-11-23, signal pipeline update)
 
 ## Commits on main (pushed via GitHub API, remote tree verified after each)
 | Checkpoint | Commit | Scope |
@@ -12,7 +12,8 @@
 | 6 | `60c93f447581d5bd87a8e8246139864eb4e6ecfe` | Final verification, PostgreSQL Phase 3 test |
 | 1b | `451f531896b0c8b0e985211b177d06e19f42e5c4` | "Sign in again anyway" replaces stale sessions; login view never blank |
 | 2b | `90097575c84aee3617df3cf4d8d6428b864b4d86` | PostgreSQL check: wiping one slot keeps the other |
-| 6b | commit adding this version | Final verification and this report |
+| 6b | `a2f0443821de9e2b2594b79d3bda37259aea545e` | Re-login verification report |
+| 7 | commit adding this version | Signal → trade pipeline fix, Auto-Trade vs Signal Mode, threaded alerts |
 
 ## Implemented
 - Memory (render.yaml, Dockerfile): MALLOC_ARENA_MAX=2, MALLOC_TRIM_THRESHOLD_=131072, NODE_OPTIONS 256 MB
@@ -36,14 +37,21 @@
 - Telegram: Trade Opened (mode, asset, BUY/SELL, stake, payout, 1m), Trade Settled (WIN/LOSS, net P/L,
   balance, win streak / step), Daily Summary (trades, win rate, realized P/L). Alerts are queued per chat,
   sent in order off the trading loop, retried on 429/5xx, capped at 50 queued.
+- Signal pipeline (7): GBot hands each confirmed signal to every auto-trader's bot the moment it is
+  confirmed, before the Telegram card queue (slow card fan-out used to expire signals), and for every
+  scanned asset, not only the chart the user chose. Auto-traders get no signal text; others get cards.
+- Bot side: GBot signals skip the anti-retry cooldown; trades past their 1-minute expiry no longer block
+  the next minute's signal (stop-loss exposure still counts them); signals arriving while reconnecting are
+  queued; pre-order balance read capped at 2.5 s; every trade (Demo and Real) uses a 60 s expiry.
+- Routine skips (payout, max open trades, expired) post nothing and are counted in `/at_status`; low
+  balance and limits are told once. The settled alert replies to its TRADE OPENED message.
 - Unchanged: 1-minute candle price-action engine and candle close timing.
 
 ## Offline verification (Checkpoint 6)
-- `pytest autotrade/tests/` with a throwaway local PostgreSQL 16: 219 passed, 0 failed, 0 skipped (3 runs).
-- Same without a database: 215 passed, 4 PostgreSQL tests skipped.
+- Checkpoint 7: `pytest autotrade/tests/` 223 passed, 4 PostgreSQL tests skipped (no database);
+  `pytest tests/` 176 passed. New: pipeline (8), dispatch / mode (6). Earlier with PostgreSQL 16: 219 passed.
 - Login page driven in headless Chromium at 384x661 against a simulated broker: re-login replaces both
   sessions; loading panel shown, then the live picture; page close cancels the server browser.
-- `pytest tests/`: 170 passed.
 - New tests: re-login override (7), stake ladder, routing (14), tracking (8), PostgreSQL settings + dual vault.
 - Schema applied twice (idempotent); invalid `stake_mode` rejected by its check constraint.
 
@@ -55,6 +63,7 @@
 - Live payouts, multi-asset routing and order placement: NOT RUN.
 - Martingale progression on real settlements: NOT RUN.
 - Telegram delivery of trade alerts and daily summary: NOT RUN.
+- Signal → order rate on the live scanner and broker (checkpoint 7): NOT RUN.
 - No secrets were printed or logged; tests use fake brokers and fake sessions.
 
 ## Risks / limits

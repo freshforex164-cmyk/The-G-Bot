@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 import time
-from collections import deque
+from collections import OrderedDict, deque
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Protocol
@@ -153,11 +153,11 @@ def failed_text(*, asset: str, direction: str, setup: str = "") -> str:
 
 
 class Notifier(Protocol):
-    def send(self, user_id: str, text: str) -> None: ...
+    def send(self, user_id: str, text: str, *, key: str | None = None, reply_to: str | None = None) -> None: ...
 
 
 class NullNotifier:
-    def send(self, user_id: str, text: str) -> None:
+    def send(self, user_id: str, text: str, *, key: str | None = None, reply_to: str | None = None) -> None:
         return None
 
 
@@ -169,6 +169,7 @@ class TelegramNotifier:
 
     MAX_QUEUE = 50
     ATTEMPTS = 3
+    MAX_THREADS = 200          # remembered TRADE OPENED message ids (bounded)
 
     def __init__(self, token: str, *, opener: Callable[..., Any] | None = None, timeout: float = 10.0,
                  sleep: Callable[[float], None] | None = None):
@@ -176,8 +177,9 @@ class TelegramNotifier:
         self._open = opener or urllib.request.urlopen
         self._sleep = sleep or time.sleep
         self._tasks: set[asyncio.Task] = set()
-        self._queues: dict[int, deque[str]] = {}
+        self._queues: dict[int, deque[tuple[str, str | None, str | None]]] = {}
         self._draining: dict[int, asyncio.Task] = {}
+        self._message_ids: OrderedDict[tuple[int, str], int] = OrderedDict()
 
     @staticmethod
     def chat_id(user_id: str) -> int | None:
@@ -189,16 +191,25 @@ class TelegramNotifier:
             return None
         return value if value > 0 else None
 
-    def _post(self, chat_id: int, text: str) -> bool:
-        """One delivery with a few retries (worker thread). True when Telegram accepted it."""
-        body = json.dumps({"chat_id": chat_id, "text": text, "disable_web_page_preview": True}).encode()
+    def _post(self, chat_id: int, text: str, reply_to_message_id: int | None = None) -> int | bool:
+        """One delivery with a few retries (worker thread). The message id (or True) when Telegram accepted
+        it, False otherwise. A reply never fails because its parent message is gone."""
+        payload: dict[str, Any] = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = reply_to_message_id
+            payload["allow_sending_without_reply"] = True
+        body = json.dumps(payload).encode()
         for attempt in range(1, self.ATTEMPTS + 1):
             req = urllib.request.Request(f"https://api.telegram.org/bot{self._token}/sendMessage", data=body,
                                          method="POST", headers={"Content-Type": "application/json"})
             try:
                 with self._open(req, timeout=self._timeout) as resp:
-                    resp.read()
-                return True
+                    raw = resp.read()
+                try:
+                    mid = json.loads(raw or b"{}").get("result", {}).get("message_id")
+                except Exception:
+                    mid = None
+                return int(mid) if isinstance(mid, int) and mid > 0 else True
             except urllib.error.HTTPError as exc:
                 retry = exc.code == 429 or exc.code >= 500
                 wait = float(attempt)
@@ -218,7 +229,7 @@ class TelegramNotifier:
                 self._sleep(float(attempt))
         return False
 
-    def send(self, user_id: str, text: str) -> None:
+    def send(self, user_id: str, text: str, *, key: str | None = None, reply_to: str | None = None) -> None:
         chat_id = self.chat_id(user_id)
         if chat_id is None:
             return
@@ -230,7 +241,7 @@ class TelegramNotifier:
         if len(q) >= self.MAX_QUEUE:
             q.popleft()
             log.info("trade alert queue full; oldest alert dropped")
-        q.append(text)
+        q.append((text, key, reply_to))
         if chat_id not in self._draining:
             task = loop.create_task(self._drain_chat(chat_id))
             self._draining[chat_id] = task
@@ -241,8 +252,15 @@ class TelegramNotifier:
         try:
             q = self._queues.get(chat_id)
             while q:
-                text = q.popleft()
-                await asyncio.to_thread(self._post, chat_id, text)
+                text, key, reply_to = q.popleft()
+                parent = self._message_ids.get((chat_id, reply_to)) if reply_to else None
+                sent = await asyncio.to_thread(self._post, chat_id, text, parent)
+                if key and isinstance(sent, int) and not isinstance(sent, bool):
+                    self._message_ids[(chat_id, key)] = sent
+                    while len(self._message_ids) > self.MAX_THREADS:
+                        self._message_ids.popitem(last=False)
+                if reply_to:
+                    self._message_ids.pop((chat_id, reply_to), None)     # settled: thread closed
         finally:
             self._draining.pop(chat_id, None)
             if not self._queues.get(chat_id):
@@ -258,6 +276,8 @@ class RecordingNotifier:
 
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.threads: list[tuple[str | None, str | None]] = []     # (key, reply_to) per message
 
-    def send(self, user_id: str, text: str) -> None:
+    def send(self, user_id: str, text: str, *, key: str | None = None, reply_to: str | None = None) -> None:
         self.sent.append((user_id, text))
+        self.threads.append((key, reply_to))

@@ -134,8 +134,8 @@ class WorkerRoutingTests(unittest.IsolatedAsyncioTestCase):
         await self.m.submit_signal("a", gbot_signal(self.env, "s2", asset="XAUUSD_otc", direction="PUT"))
         self.assertTrue(await wait_until(lambda: len(w.placed) == 1))
         self.assertEqual(w.placed[0][:2], ("XAUUSD_otc", "PUT"))         # its own setup and direction
-        alerts = [t for _, t in self.env.alerts.sent if "skipped" in t]
-        self.assertTrue(any("EURUSD_otc" in t and "72%" in t and "Routed to XAUUSD_otc (92%)" in t for t in alerts))
+        self.assertFalse([t for _, t in self.env.alerts.sent if "skipped" in t])   # no buy/sell text in Auto-Trade
+        self.assertEqual((await self.m.stats("a"))["bot"]["skipped"].get("payout_below_minimum"), 1)
         route_info = (await self.m.stats("a"))["routing"]["last_route"]
         self.assertEqual((route_info["chosen"], route_info["payout"]), ("XAUUSD_otc", 92))
 

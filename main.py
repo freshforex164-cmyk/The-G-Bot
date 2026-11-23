@@ -624,7 +624,13 @@ async def run_serve() -> None:
             f"entry={signal.price:g}",
             flush=True,
         )
-        queue.enqueue(signal)
+        # Auto-Trade mode first: hand the signal to the auto-traders' bots right now, never behind the
+        # Telegram card queue (a slow card fan-out used to let signals expire before they were traded).
+        try:
+            fanout.dispatch_autotrade(signal)
+        except Exception as exc:
+            logger.error("Auto-trade dispatch failed (%s).", type(exc).__name__)
+        queue.enqueue(signal)   # Signal Mode cards (auto-traders are skipped)
 
     scanner = SignalScanner(
         PocketOptionBroker(config.load_ssid()),

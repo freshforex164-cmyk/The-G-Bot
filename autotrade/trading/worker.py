@@ -29,6 +29,16 @@ MAX_RECONNECTS = 8
 MAX_UNEXPECTED = 3
 MAX_PENDING_SIGNALS = 20
 SEEN_SIGNAL_IDS = 500
+# Every auto-trade (Demo and Real, GBot signal or engine) is placed with this expiry: the 1-minute signal timeframe.
+TRADE_EXPIRY_SECONDS = 60
+# Pre-order balance read: a slow broker answer must not let the signal expire (the last reading is used instead).
+PRE_ORDER_BALANCE_TIMEOUT = 2.5
+# Skips that are normal while following every GBot signal: counted in /at_status, no Telegram message (otherwise
+# each skipped signal would reach the chat as a buy/sell text, which Auto-Trade mode must not send).
+QUIET_SKIPS = frozenset({"payout_below_minimum", "max_concurrent", "cooldown", "duplicate_asset", "duplicate",
+                         "signal_expired", "no_verified_setup", "stale_prices"})
+# Statuses in which a GBot signal is queued: a reconnect or start-up must not lose the signals that arrive meanwhile.
+ACCEPTING = ("starting", "running", "paused_daily_limit", "reconnecting")
 
 
 class StakeTracker:
@@ -130,6 +140,9 @@ class UserWorker:
         self._summary_day: datetime | None = None     # UTC day of the last settled trade
         self._summaries_sent: set[tuple] = set()
         self._open_stakes: dict[str, float] = {}
+        self._open_until: dict[str, float] = {}       # ref -> monotonic time its expiry passes
+        self.skipped: dict[str, int] = {}             # reason -> signals skipped since start
+        self._alerted_reason: str | None = None       # actionable skip already told to the user
 
     # -- control ------------------------------------------------------------------------------
     def request_stop(self, drain: bool = True) -> None:
@@ -144,6 +157,11 @@ class UserWorker:
     def open_count(self) -> int:
         return len(self._trackers)
 
+    def live_open_count(self, now: float | None = None) -> int:
+        """Open trades whose expiry has not passed yet (the rest only wait for the broker's result)."""
+        t = self._clock.monotonic() if now is None else now
+        return sum(1 for ref in self._trackers if self._open_until.get(ref, float("inf")) > t)
+
     def snapshot(self) -> dict:
         return {"status": self.status.value, "last_error": self.last_error, "last_skip_reason": self.last_reject,
                 "open_trades": self.open_count, "follow_signals": self.settings.follow_signals,
@@ -151,7 +169,7 @@ class UserWorker:
                 "balance": self.balance, "balance_account": self.balance_kind,
                 "balance_at": self.balance_at.isoformat() if self.balance_at else None,
                 "last_route": self.last_route, "stake_step": self.stakes.step,
-                "win_streak": self.stakes.win_streak}
+                "win_streak": self.stakes.win_streak, "skipped": dict(self.skipped)}
 
     @property
     def follows_signals(self) -> bool:
@@ -168,7 +186,7 @@ class UserWorker:
 
     def submit_signal(self, d: Decision) -> str:
         """Queue a GBot signal for this user. Returns 'queued' or why it was ignored."""
-        if not self.desired or self.status not in (WorkerStatus.RUNNING, WorkerStatus.PAUSED):
+        if not self.desired or self.status.value not in ACCEPTING:
             return "not_running"
         if not self.settings.follow_signals:
             return "follow_signals_off"
@@ -385,14 +403,28 @@ class UserWorker:
     def _asset_name(d: Decision) -> str:
         return str(d.meta.get("asset_name") or d.asset)
 
-    def _alert(self, text: str) -> None:
+    def _alert(self, text: str, *, key: str | None = None, reply_to: str | None = None) -> None:
+        """Queue a Telegram alert (never waits). ``key`` names the message so a later one can reply to it:
+        the settlement is threaded under its TRADE OPENED message."""
         try:
-            self._notifier.send(self.user_id, text)
+            if key is None and reply_to is None:
+                self._notifier.send(self.user_id, text)
+            else:
+                try:
+                    self._notifier.send(self.user_id, text, key=key, reply_to=reply_to)
+                except TypeError:          # a notifier without threading support
+                    self._notifier.send(self.user_id, text)
         except Exception:
             log.info("trade alert failed for user %s", self.user_id)
 
     def _alert_skip(self, d: Decision, reason: str, *, payout: int | None = None,
                     routed: tuple[Decision, int] | None = None) -> None:
+        self.skipped[reason] = self.skipped.get(reason, 0) + 1
+        if reason in QUIET_SKIPS:
+            return
+        if reason == self._alerted_reason:     # told once; again only after a trade was placed
+            return
+        self._alerted_reason = reason
         if d.signal_id:          # only GBot signals: the user would otherwise hear nothing about them
             self._alert(skipped_text(asset=self._asset_name(d), direction=d.direction, reason=reason,
                                      setup=d.reason or "", payout=payout,
@@ -467,7 +499,12 @@ class UserWorker:
         stake = self.stakes.stake_for(s)
         # A pushed GBot signal was produced from a fresh closed candle; its freshness is its valid_until.
         ages = [0.0] if pushed else [self._feed.age(sym) for sym in symbols]
-        state = RiskState(now=now, last_trade_at=self._last_trade_at, open_count=self.open_count, daily_pnl=pnl,
+        # GBot signals: each is a distinct confirmed setup (duplicates are already refused by id), so the
+        # engine's anti-retry cooldown does not apply, and a trade whose 1-minute expiry has passed (only
+        # waiting for the broker's result) no longer blocks the next minute's signal. Stop-loss exposure
+        # still counts every unsettled stake.
+        state = RiskState(now=now, last_trade_at=None if pushed else self._last_trade_at,
+                          open_count=self.live_open_count(now) if pushed else self.open_count, daily_pnl=pnl,
                           tick_ages=ages, client_is_demo=self._client_is_demo,
                           halted=self._is_halted(), stake=stake,
                           open_exposure=sum(self._open_stakes.values()) if self._open_stakes else
@@ -493,7 +530,10 @@ class UserWorker:
             return
         # Demo and Real alike: only trade money that is there. A fresh reading; the last known one if the
         # broker does not answer; no reading at all -> skip (never trade blind).
-        balance = await self._refresh_balance(broker)
+        try:
+            balance = await asyncio.wait_for(self._refresh_balance(broker), timeout=PRE_ORDER_BALANCE_TIMEOUT)
+        except asyncio.TimeoutError:
+            balance = None
         if balance is None:
             balance = self.balance
         if balance is None or balance < stake:
@@ -502,20 +542,29 @@ class UserWorker:
             if balance is None:
                 self._alert_skip(d, reason)
             else:
-                self._alert(low_balance_text(mode=s.mode, asset=self._asset_name(d), direction=d.direction,
-                                             stake=stake, balance=balance, setup=d.reason or ""))
+                self.skipped[reason] = self.skipped.get(reason, 0) + 1
+                if self._alerted_reason != reason:
+                    self._alerted_reason = reason
+                    self._alert(low_balance_text(mode=s.mode, asset=self._asset_name(d), direction=d.direction,
+                                                 stake=stake, balance=balance, setup=d.reason or ""))
+            return
+        if pushed and self._expired(d):      # the checks took too long: never place a stale signal
+            self._note("signal_expired")
+            self._alert_skip(d, "signal_expired")
             return
         self.last_reject = None
+        self._alerted_reason = None
         self._last_trade_at = now          # cooldown starts before the order, so a failure cannot cause rapid retries
         ref = uuid.uuid4().hex
         meta = {**d.meta, **({"signal_id": d.signal_id, "source": "gbot_signal"} if d.signal_id else {}),
                 "stake_mode": s.stake_mode, "stake_step": self.stakes.step}
         name = self._asset_name(d)
-        rec = TradeRecord(self.user_id, ref, s.mode, d.asset, d.direction, stake, d.expiry_seconds,
+        expiry = TRADE_EXPIRY_SECONDS            # identical for Demo and Real
+        rec = TradeRecord(self.user_id, ref, s.mode, d.asset, d.direction, stake, expiry,
                           payout=payout, reason=d.reason, meta=meta, opened_at=self._clock.utcnow())
         await self._repo.insert_trade(rec)
         try:
-            trade_id = await broker.place(d.asset, d.direction, stake, d.expiry_seconds)
+            trade_id = await broker.place(d.asset, d.direction, stake, expiry)
         except BrokerError as exc:
             await self._repo.update_trade(self.user_id, ref, status="failed", error=str(exc)[:200])
             self._alert(failed_text(asset=name, direction=d.direction, setup=d.reason or ""))
@@ -527,18 +576,20 @@ class UserWorker:
         except SessionExpired as exc:
             await self._repo.update_trade(self.user_id, ref, status="failed", error="session rejected")
             raise
-        await self._repo.update_trade(self.user_id, ref, status="open", broker_trade_id=trade_id)
         setup = d.reason if d.reason and d.reason != "gbot_signal" else ""
+        # Alert first (queued, never waits) so the chat hears about the trade the moment the broker accepts it.
         self._alert(opened_text(mode=s.mode, asset=name, direction=d.direction, setup=setup, stake=stake,
-                                payout=payout, expiry_seconds=d.expiry_seconds,
-                                step=meta["stake_step"] if s.stake_mode == "martingale" else None))
-        self._spawn_tracker(broker, ref, trade_id, stake, payout, d.expiry_seconds + 45,
+                                payout=payout, expiry_seconds=expiry,
+                                step=meta["stake_step"] if s.stake_mode == "martingale" else None), key=ref)
+        await self._repo.update_trade(self.user_id, ref, status="open", broker_trade_id=trade_id)
+        self._spawn_tracker(broker, ref, trade_id, stake, payout, expiry + 45,
                             info={"mode": s.mode, "asset": name, "direction": d.direction, "setup": setup})
 
     # -- results ------------------------------------------------------------------------------
     def _spawn_tracker(self, broker: BrokerClient, ref: str, trade_id: str, stake: float,
                        payout: int | None, timeout: float, info: dict | None = None) -> None:
         self._open_stakes[ref] = float(stake)
+        self._open_until[ref] = self._clock.monotonic() + max(0.0, float(timeout) - 45.0)
         self._trackers[ref] = asyncio.create_task(
             self._track(broker, ref, trade_id, stake, payout, timeout, info or {}))
 
@@ -560,7 +611,8 @@ class UserWorker:
                     self._alert(settled_text(mode=info["mode"], asset=info["asset"], direction=info["direction"],
                                              stake=stake, outcome=out.result, profit=profit, balance=balance,
                                              setup=info.get("setup", ""), win_streak=self.stakes.win_streak,
-                                             step=self.stakes.step, martingale=s.stake_mode == "martingale"))
+                                             step=self.stakes.step, martingale=s.stake_mode == "martingale"),
+                                reply_to=ref)
                 await self._on_settled(info.get("mode") or self.settings.mode)
         except asyncio.CancelledError:
             raise  # left 'open'; the next session adopts it
@@ -570,6 +622,7 @@ class UserWorker:
         finally:
             self._trackers.pop(ref, None)
             self._open_stakes.pop(ref, None)
+            self._open_until.pop(ref, None)
 
     # -- daily summary ------------------------------------------------------------------------
     async def _on_settled(self, mode: str) -> None:

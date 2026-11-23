@@ -209,12 +209,29 @@ def overview_text(stats: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+SKIP_LABELS = {
+    "payout_below_minimum": "payout under minimum", "max_concurrent": "max open trades",
+    "signal_expired": "expired", "duplicate_asset": "same asset", "stop_loss_exposure": "stop-loss limit",
+    "insufficient_balance": "low balance", "balance_unavailable": "balance unreadable",
+    "payout_unavailable": "payout unreadable", "daily_stop_loss": "daily stop-loss",
+    "daily_take_profit": "daily take-profit",
+}
+
+
 def stats_text(stats: dict[str, Any]) -> str:
     lines = [overview_text(stats)]
     total = stats.get("all_time", {})
     rate = total.get("win_rate")
     lines += ["", results_line("All time", total, total.get("net_profit")),
               f"Win rate: {f'{rate}%' if rate is not None else 'n/a'}"]
+    bot = stats.get("bot") or {}
+    received = bot.get("signals_received")
+    skipped = {k: v for k, v in (bot.get("skipped") or {}).items() if isinstance(v, int) and v > 0}
+    if received or skipped:
+        lines += ["", f"Signals received: {int(received or 0)}"]
+        if skipped:
+            lines.append("Not placed: " + " · ".join(
+                f"{SKIP_LABELS.get(k, k.replace('_', ' '))} {v}" for k, v in sorted(skipped.items(), key=lambda kv: -kv[1])))
     recent = stats.get("recent_trades") or []
     if recent:
         lines += ["", "Recent trades:"]
