@@ -102,7 +102,11 @@ class PocketOptionBroker:
             value = self._need().is_demo()          # sync in 0.2.18; tolerate an async version
             if asyncio.iscoroutine(value):
                 value = await value
-            return bool(value)
+            if value in (0, "0"):
+                return False
+            if value in (1, "1"):
+                return True
+            raise BrokerError("broker account mode is unavailable")
         except Exception as exc:
             raise map_exception(exc) from None
 

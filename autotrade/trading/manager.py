@@ -12,6 +12,7 @@ from ..market.feed import SharedMarketFeed
 from ..storage.repo import Repository
 from ..vault.service import TokenVault
 from .broker import BrokerClient
+from .balance_pool import BalancePool
 from .models import DEMO, LIVE, Decision, TradingSettings
 from .risk import RiskManager
 from .strategy import STRATEGIES
@@ -52,6 +53,8 @@ class TradingManager:
         self._factory = broker_factory
         self._risk = risk or RiskManager()
         self._clock = clock or Clock()
+        self._balances = BalancePool(repo, vault, broker_factory, self._clock,
+                                     limit=min(16, max(2, cfg.max_workers * 2)))
         self.halted = cfg.trading_halted
         self._workers: dict[str, UserWorker] = {}
         self._tasks: dict[str, asyncio.Task] = {}
@@ -78,6 +81,7 @@ class TradingManager:
                 raise LiveDisabled("live trading is not enabled")
             s.validate(self.cfg)
             kind = "demo" if s.mode == DEMO else "real"
+            await self._balances.discard(user_id, kind)
             res = await self.health.check(user_id, kind)
             if not res.ok:
                 if res.status in ("missing", "expired"):
@@ -186,6 +190,7 @@ class TradingManager:
         if kind is None:
             raise SettingsError("not a Pocket Option SSID")
         await self.vault.store(user_id, kind, ssid, {"method": "direct", "derived": False})
+        await self._balances.discard(user_id, kind)
         await self.repo.save_settings(user_id, await self.repo.get_settings(user_id))  # Demo default for new users
         if self.is_running(user_id):
             return {"kind": kind, "verified": False, "status": "saved"}
@@ -226,7 +231,7 @@ class TradingManager:
                 if value is not None and worker.balance_kind != kind:
                     value = None            # bot is on the other account: never report its balance
                 if value is None:
-                    value, error = await self._read_balance_once(user_id, kind)
+                    error = "balance_unavailable"
             else:
                 value, error = await self._read_balance_once(user_id, kind)
         saved = (await self.repo.get_balances(user_id)).get(kind)
@@ -249,16 +254,23 @@ class TradingManager:
     async def _read_balance_once(self, user_id: str, kind: str) -> tuple[float | None, str | None]:
         from ..errors import VaultError
         from ..storage.repo import BalanceRow
+        worker = self._workers.get(user_id)
+        if worker is not None and self.is_running(user_id):
+            # A slow live worker must not cause a second socket on its account.
+            if worker.balance_kind in (None, kind):
+                value = await worker.refresh_balance_now()
+                if worker.balance_kind != kind:
+                    value = None
+                return value, None if value is not None else "balance_unavailable"
         try:
             ssid = await self.vault.get(user_id, kind)
         except VaultError:
             return None, "session_unreadable"
         if ssid is None:
             return None, "no_session"
-        broker = self._factory(ssid)
         try:
-            await asyncio.wait_for(broker.connect(), timeout=25)
-            raw = await asyncio.wait_for(broker.balance(), timeout=10)
+            async with self._balances.connection(user_id, kind) as broker:
+                raw = await asyncio.wait_for(broker.balance(), timeout=10)
         except Exception as exc:
             from ..errors import SessionExpired
             from .broker import map_exception
@@ -266,8 +278,6 @@ class TradingManager:
                 await self.vault.mark_expired(user_id, kind, "rejected during balance check")
                 return None, "session_expired"
             return None, "broker_unreachable"
-        finally:
-            await asyncio.shield(broker.close())
         if raw is None or float(raw) < 0:
             return None, "balance_unavailable"
         value = round(float(raw), 2)
@@ -329,4 +339,5 @@ class TradingManager:
         for t in self._tasks.values():
             t.cancel()
         await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+        await self._balances.close()
         await self.feed.aclose()

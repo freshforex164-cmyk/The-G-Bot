@@ -30,10 +30,12 @@ def account_kind(raw: str) -> str | None:
     body = parse_ssid(raw)
     if body is None or "isDemo" not in body:
         return None
-    try:
-        return DEMO_KIND if int(body["isDemo"]) == 1 else REAL_KIND
-    except (TypeError, ValueError):
-        return None
+    flag = body["isDemo"]
+    if flag in (0, "0"):
+        return REAL_KIND
+    if flag in (1, "1"):
+        return DEMO_KIND
+    return None
 
 
 def is_well_formed(raw: str, kind: str | None = None) -> bool:

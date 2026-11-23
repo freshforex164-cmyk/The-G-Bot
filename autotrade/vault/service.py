@@ -41,11 +41,15 @@ class TokenVault:
             captured_at=now, last_checked_at=None, last_error=None, meta=dict(meta or {})))
 
     async def get(self, user_id: str, kind: str, *, include_expired: bool = False) -> str | None:
+        if kind not in KINDS:
+            raise VaultError("unknown account kind")
         row = await self._repo.get_credential(user_id, kind)
         if row is None or (row.status != "active" and not include_expired):
             return None
         plain = self._keys.decrypt(row.ciphertext, make_aad(user_id, kind))
         if plain.startswith('42['):
+            if not is_well_formed(plain, kind):
+                raise VaultError("Stored session does not match its account slot.")
             return plain  # Existing rows remain readable without a migration.
         return self._unpack(plain, kind)["ssid"]
 
