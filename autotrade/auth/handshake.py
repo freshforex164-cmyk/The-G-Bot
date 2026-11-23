@@ -26,6 +26,7 @@ import re
 
 from ..clock import Clock
 from ..config import Config
+from . import browser_memory as bm
 from .ssid import DEMO_KIND, KINDS, REAL_KIND, account_kind, build_ssid, parse_ssid
 from .session_state import broker_domain, sanitize_browser_session
 
@@ -41,19 +42,33 @@ ALLOWED_HOSTS = ("pocketoption.com", "po.market", "po.cash", "google.com", "gsta
 BROKER_HOSTS = ("pocketoption.com", "po.market", "po.cash")
 # Google sign-in and CAPTCHA must render fully, or the user cannot solve a challenge.
 VERIFICATION_HOSTS = ("google.com", "gstatic.com", "recaptcha.net", "googleusercontent.com")
-# Low-memory mode (Render 512 MB): one Chromium process, small JS heap, no GPU/shared-memory use.
+# Low-memory mode (Render 512 MB): no GPU, no /dev/shm, small JS heap, no background services.
 LOW_MEMORY_ARGS = (
-    "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-    "--single-process", "--no-zygote", "--js-flags=--max-old-space-size=128",
-    "--enable-low-end-device-mode", "--disable-software-rasterizer", "--disable-extensions",
-    "--disable-background-networking", "--disable-component-update", "--disable-default-apps",
-    "--disable-sync", "--mute-audio", "--no-first-run", "--disable-breakpad",
-    "--disable-features=site-per-process,IsolateOrigins,Translate,BackForwardCache,MediaRouter,OptimizationHints",
-    "--renderer-process-limit=1",
+    "--no-sandbox", "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",                 # containers give /dev/shm only 64 MB: use /tmp instead
+    "--disable-gpu", "--disable-gpu-compositing", "--disable-software-rasterizer",
+    "--disable-accelerated-2d-canvas",
+    "--js-flags=--max-old-space-size=128 --optimize-for-size",
+    "--enable-low-end-device-mode", "--force-device-scale-factor=1", "--aggressive-cache-discard",
+    "--disable-extensions", "--disable-background-networking", "--disable-component-update",
+    "--disable-default-apps", "--disable-sync", "--mute-audio", "--no-first-run", "--no-default-browser-check",
+    "--disable-breakpad", "--disable-hang-monitor", "--disable-client-side-phishing-detection",
+    "--disable-domain-reliability", "--disable-notifications", "--disable-speech-api", "--disable-print-preview",
+    "--disable-site-isolation-trials",
+    "--disable-features=site-per-process,IsolateOrigins,Translate,BackForwardCache,MediaRouter,OptimizationHints,"
+    "AudioServiceOutOfProcess,PaintHolding,AutofillServerCommunication,CertificateTransparencyComponentUpdater",
 )
+# Everything in one OS process (browser + renderer + GPU thread): the biggest single saving. Chromium does not
+# officially support it, so AUTOTRADE_CHROMIUM_SINGLE_PROCESS=false turns it off if a site crashes with it.
+SINGLE_PROCESS_ARGS = ("--single-process", "--no-zygote", "--renderer-process-limit=1", "--in-process-gpu")
 BLOCKED_RESOURCE_TYPES = frozenset({"image", "font", "media", "stylesheet"})
 CLOSE_TIMEOUT = 10.0
 SCREENSHOT_TIMEOUT = 8.0      # a frame that takes longer is skipped; the page keeps its last picture
+FRAME_INTERVAL = 1.5          # low-memory: at most one new picture per 1.5 s (each one rasterises the page)
+FAST_FRAME_INTERVAL = 0.5     # normal mode
+TOUCHED_FRAME_INTERVAL = 0.35 # right after a tap/keystroke the next picture may come sooner
+CHALLENGE_CHECK_INTERVAL = 2.0  # Turnstile/CAPTCHA/2FA detection reads page text: not on every poll
+LEFTOVER_WAIT = 2.0           # after close(), how long browser processes get to exit before SIGKILL
 IDLE_TIMEOUT = 150.0          # no poll from the phone for this long = page closed: free Chromium
 CABINET_SWITCH_DELAY = 3.5   # seconds between Real and Demo cabinet pages (rapid switching -> "Error. Please try later.")
 VIEWPORT = {"width": 390, "height": 844}     # a phone: the site serves its mobile login layout
@@ -168,6 +183,9 @@ ERROR_MESSAGES = {
     "browser_unavailable": "The secure sign-in browser could not start on the server. Try again in a minute.",
     "browser_crashed": "The secure sign-in browser stopped unexpectedly (the server ran short of memory). "
                        "Nothing was saved. Try again in a minute.",
+    "low_memory": "The sign-in server is short of memory right now, so the secure browser was stopped before "
+                  "it could crash the service (running trades are protected). Nothing was saved. Try again in a "
+                  "minute; if this keeps happening the autotrade service needs a bigger Render instance.",
     "login_timeout": "The sign-in took too long and was closed. Send /at_login for a new link.",
     "store_failed": "You signed in, but the session could not be saved. Send /at_login to try again.",
     "capture_failed": "The sign-in could not be completed. Send /at_login to try again.",
@@ -234,10 +252,12 @@ def _host_in(host: str, hosts: tuple[str, ...]) -> bool:
     return any(host == h or host.endswith("." + h) for h in hosts)
 
 
-def launch_args(low_memory: bool) -> list[str]:
+def launch_args(low_memory: bool, single_process: bool = True) -> list[str]:
     args = ["--disable-blink-features=AutomationControlled"]
     if low_memory:
         args += list(LOW_MEMORY_ARGS)
+        if single_process:
+            args += list(SINGLE_PROCESS_ARGS)
     return args
 
 
@@ -258,10 +278,19 @@ def should_block(url: str, resource_type: str, *, block_assets: bool, block_thir
 class PlaywrightBackend:
     def __init__(self, headless: bool = True, hosts: tuple[str, ...] = ALLOWED_HOSTS, login_url: str = LOGIN_URL,
                  *, low_memory: bool = True, block_assets: bool = True, block_third_party: bool = True,
-                 switch_delay: float = CABINET_SWITCH_DELAY):
+                 switch_delay: float = CABINET_SWITCH_DELAY, single_process: bool = True,
+                 frame_interval: float | None = None):
         self._headless, self._hosts, self._login_url = headless, hosts, login_url
         self._switch_delay = max(0.0, float(switch_delay))
         self._low_memory, self._block_assets, self._block_third_party = low_memory, block_assets, block_third_party
+        self._single_process = single_process
+        self._frame_interval = max(0.0, float(frame_interval if frame_interval is not None else
+                                              FRAME_INTERVAL if low_memory else FAST_FRAME_INTERVAL))
+        self._frame, self._frame_at, self._touched = b"", 0.0, False
+        self._frame_lock = asyncio.Lock()
+        self._pids: set[int] = set()     # OS processes started for this login (Playwright driver + Chromium)
+        self.leftovers_killed = 0        # processes close() had to SIGKILL (0 = everything exited by itself)
+        self.closed = False
         # Login-page assets are dropped only while the user is not looking at the broker page (email/password
         # form). Once they must see it (verification after submit, or "finish on the Pocket Option page"),
         # it loads styled. Trading cabinet pages are only visited to capture sessions, so stay stripped.
@@ -320,10 +349,17 @@ class PlaywrightBackend:
     async def open(self) -> None:
         from playwright.async_api import async_playwright
 
-        self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(
-            headless=self._headless, args=launch_args(self._low_memory), timeout=60000)
-        self._browser.on("disconnected", lambda _b: self._mark_crashed())
+        bm.install_quiet_playwright_handler()
+        bm.release_memory()                  # give Chromium every free page before it starts
+        before = bm.descendant_pids()
+        self.closed = False
+        try:
+            self._pw = await async_playwright().start()
+            self._browser = await self._pw.chromium.launch(
+                headless=self._headless, args=launch_args(self._low_memory, self._single_process), timeout=60000)
+        finally:   # remember exactly which processes this login started, so close() can verify they are gone
+            self._pids = bm.descendant_pids() - before
+        self._browser.on("disconnected", self._on_disconnected)
         # A fresh, non-persistent context per handshake: no shared cookies, nothing written to disk.
         # Phone emulation (touch, mobile user agent) makes the site serve its standard mobile web layout.
         self._context = await self._browser.new_context(
@@ -351,6 +387,9 @@ class PlaywrightBackend:
                 await route.continue_()
         except Exception:       # page closed while routing: nothing left to do
             pass
+
+    def _on_disconnected(self, _browser) -> None:
+        self._mark_crashed()
 
     def _mark_crashed(self) -> None:
         if self._browser is not None:     # close() clears it first, so a normal shutdown is not a crash
@@ -387,13 +426,34 @@ class PlaywrightBackend:
         return self._pages[-1] if self._pages else None
 
     async def screenshot(self) -> bytes:
+        """The live picture for the phone. Every capture makes Chromium rasterise the whole page (a memory
+        spike), so captures are throttled and serialised: polls arriving sooner get the last picture."""
         page = self._page
         if page is None:
             raise RuntimeError("browser is not open")
-        # Time-boxed and without waiting for animations: a busy or navigating page must never stall the
-        # phone's live view (that showed as a black screen).
-        return await page.screenshot(type="jpeg", quality=50 if self._low_memory else 60,
-                                     timeout=SCREENSHOT_TIMEOUT * 1000, animations="disabled", caret="initial")
+        self._check_alive()
+        loop = asyncio.get_running_loop()
+        if self._frame and loop.time() - self._frame_at < self._gap():
+            return self._frame
+        async with self._frame_lock:
+            if self._frame and loop.time() - self._frame_at < self._gap():
+                return self._frame                  # another poll captured it while we waited
+            try:
+                # Time-boxed and without waiting for animations: a busy or navigating page must never stall
+                # the phone's live view (that showed as a black screen).
+                shot = await page.screenshot(type="jpeg", quality=45 if self._low_memory else 60,
+                                             timeout=SCREENSHOT_TIMEOUT * 1000, animations="disabled",
+                                             caret="initial")
+            except Exception:
+                self._check_alive()                 # browser gone -> BrowserCrashed, not a stale picture
+                if self._frame:
+                    return self._frame              # navigating: keep showing the last picture
+                raise
+            self._frame, self._frame_at, self._touched = shot, loop.time(), False
+            return shot
+
+    def _gap(self) -> float:
+        return min(self._frame_interval, TOUCHED_FRAME_INTERVAL) if self._touched else self._frame_interval
 
     async def view(self) -> dict[str, Any]:
         """Phone viewport size, the focused input (if any) and which site is showing. Never a password."""
@@ -412,7 +472,12 @@ class PlaywrightBackend:
             except Exception:
                 notice = None
         host = (urlparse(page.url).hostname or "") if page.url else ""
-        challenge = await self.detect_challenge()
+        loop = asyncio.get_running_loop()
+        if loop.time() - self._challenge_checked >= CHALLENGE_CHECK_INTERVAL:
+            self._challenge_checked = loop.time()
+            challenge = await self.detect_challenge()
+        else:
+            challenge = self.challenge
         return {"width": self._vp["width"], "height": self._vp["height"], "field": field,
                 "inputs": inputs, "host": host, "notice": notice, "challenge": challenge,
                 "hint": CHALLENGE_HINTS.get(challenge or "")}
@@ -447,6 +512,7 @@ class PlaywrightBackend:
             y = min(max(int(event.get("y", self._vp["height"] // 2)), 0), self._vp["height"] - 1)
             await page.mouse.move(x, y)
             await page.mouse.wheel(0, max(-2000, min(2000, int(event.get("dy", 0)))))
+        self._touched = True        # show the result of the tap/keystroke soon
 
     async def capture_tokens(self, timeout, on_status):
         loop = asyncio.get_running_loop()
@@ -546,12 +612,30 @@ class PlaywrightBackend:
         return None
 
     async def close(self) -> None:
-        """Always frees Chromium, even if it hangs: every step is time-boxed and stopping Playwright
-        kills any browser process that is still alive."""
+        """Always frees Chromium, even if it hangs. Order: stop routing and listeners, close every page
+        (popups included), the context, the browser, then the Playwright driver; every step is time-boxed.
+        Then it verifies that no process started for this login is still alive and SIGKILLs any that is."""
         self._frames.clear()
+        self._frame = b""
         context, browser, pw = self._context, self._browser, self._pw
         self._pw = self._browser = self._context = None       # from here on a disconnect is not a crash
         pages, self._pages = list(self._pages), []
+        pids, self._pids = set(self._pids), set()
+        if context is not None:
+            for event, fn in (("page", self._attach),):
+                try:
+                    context.remove_listener(event, fn)
+                except Exception:
+                    pass
+            try:   # pending route handlers would otherwise fail after the browser is gone
+                await asyncio.wait_for(context.unroute_all(behavior="ignoreErrors"), timeout=CLOSE_TIMEOUT)
+            except Exception:
+                pass
+        if browser is not None:
+            try:
+                browser.remove_listener("disconnected", self._on_disconnected)
+            except Exception:
+                pass
         steps = [(p, "close") for p in pages] + [(context, "close"), (browser, "close"), (pw, "stop")]
         for obj, method in steps:
             if obj is None:
@@ -560,6 +644,22 @@ class PlaywrightBackend:
                 await asyncio.wait_for(getattr(obj, method)(), timeout=CLOSE_TIMEOUT)
             except Exception:
                 pass
+        self.leftovers_killed = await self._verify_exited(pids)
+        self.closed = True
+        bm.release_memory()
+
+    @staticmethod
+    async def _verify_exited(pids: set[int]) -> int:
+        if not pids:
+            return 0
+        loop = asyncio.get_running_loop()
+        end = loop.time() + LEFTOVER_WAIT
+        while loop.time() < end and any(bm.alive(p) for p in pids):
+            await asyncio.sleep(0.1)
+        killed = bm.reap(pids)
+        if killed:
+            log.warning("killed %d login browser process(es) that did not exit after close", len(killed))
+        return len(killed)
 
 
 @dataclass
@@ -602,8 +702,10 @@ FailureNotice = Callable[[str, str], None]     # (user_id, user-facing message),
 
 class HandshakeManager:
     def __init__(self, cfg: Config, backend_factory: Callable[[], CaptureBackend], sink: TokenSink, clock: Clock | None = None,
-                 on_failure: FailureNotice | None = None):
+                 on_failure: FailureNotice | None = None,
+                 memory_probe: Callable[[], "dict[str, int] | None"] | None = None):
         self._cfg, self._factory, self._sink = cfg, backend_factory, sink
+        self._memory = memory_probe or bm.container_memory
         self._on_failure = on_failure
         self._clock = clock or Clock()
         self._sessions: dict[str, HandshakeSession] = {}
@@ -678,6 +780,22 @@ class HandshakeManager:
             backend, s.backend = s.backend, None
             await backend.close()
 
+    async def shutdown(self) -> None:
+        """Service stopping (deploy/restart): close every login browser first."""
+        for s in list(self._sessions.values()):
+            if s.active or s.backend is not None:
+                try:
+                    await self.cancel(s.id, s.user_id)
+                except Exception:
+                    pass
+
+    def _free_mb(self) -> int | None:
+        try:
+            mem = self._memory()
+        except Exception:
+            return None
+        return int(mem["free_mb"]) if mem else None
+
     def _report(self, s: HandshakeSession) -> None:
         """Tell the user (Telegram) why the login ended, with what to do next. Never internal details."""
         if self._on_failure is None or s.state not in ("failed", "timeout"):
@@ -688,6 +806,7 @@ class HandshakeManager:
             log.info("could not deliver the login failure notice")
 
     async def _run(self, s: HandshakeSession) -> None:
+        bm.install_quiet_playwright_handler()
         watchdog = asyncio.create_task(self._watch_idle(s), name=f"handshake-idle:{s.id[:6]}")
         try:
             await self._run_inner(s)
@@ -697,11 +816,21 @@ class HandshakeManager:
 
     async def _watch_idle(self, s: HandshakeSession) -> None:
         """The phone polls every second or two. If it stops (page closed, Telegram minimised for good),
-        the login is cancelled so its Chromium does not hold memory until the full login timeout."""
+        the login is cancelled so its Chromium does not hold memory until the full login timeout.
+        It also watches container memory: if Chromium pushes free memory under the floor, the browser is
+        closed by us before the kernel OOM-kills the whole service (and every running trade worker)."""
         idle = float(getattr(self._cfg, "handshake_idle_timeout", IDLE_TIMEOUT) or IDLE_TIMEOUT)
+        floor = float(getattr(self._cfg, "handshake_memory_floor_mb", 0) or 0)
         loop = asyncio.get_running_loop()
         while s.active:
-            await asyncio.sleep(min(5.0, idle / 3))
+            await asyncio.sleep(min(2.0, idle / 3))
+            free = self._free_mb() if floor > 0 and s.active else None
+            if free is not None and free < floor:
+                log.warning("login browser stopped: container memory low (%d MB free, floor %d MB)", free, floor)
+                s.error = "low_memory"
+                if s.task is not None:
+                    s.task.cancel()
+                return
             if s.active and s.state != "capturing" and loop.time() - s.last_seen > idle:
                 log.info("login page stopped polling; closing its browser")
                 s.error = "abandoned"
@@ -717,6 +846,14 @@ class HandshakeManager:
         if hasattr(backend, "set_challenge_listener"):
             backend.set_challenge_listener(lambda c: setattr(s, "challenge", c))
         try:
+            need = float(getattr(self._cfg, "handshake_min_free_mb", 0) or 0)
+            if need > 0:
+                bm.release_memory()
+                free = self._free_mb()
+                if free is not None and free < need:
+                    log.warning("login browser not started: %d MB free, %d MB needed", free, need)
+                    s.state, s.error = "failed", "low_memory"
+                    return
             try:
                 await backend.open()
             except asyncio.CancelledError:
@@ -734,7 +871,7 @@ class HandshakeManager:
             s.state = "waiting_for_login"
             tokens, meta = await backend.capture_tokens(self._cfg.handshake_timeout, lambda st: setattr(s, "state", st))
         except asyncio.CancelledError:
-            s.state = "cancelled"
+            s.state = "failed" if s.error == "low_memory" else "cancelled"
             return
         except BrowserCrashed:
             s.state, s.error = "failed", "browser_crashed"

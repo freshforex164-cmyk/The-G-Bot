@@ -103,7 +103,8 @@ class CabinetSwitchDelayTests(unittest.IsolatedAsyncioTestCase):
     def test_default_pause_is_three_to_four_seconds_and_heap_is_128_mb(self):
         self.assertTrue(3.0 <= Config().cabinet_switch_delay <= 4.0)
         from ..auth.handshake import LOW_MEMORY_ARGS
-        self.assertIn("--js-flags=--max-old-space-size=128", LOW_MEMORY_ARGS)
+        self.assertTrue(any(a.startswith("--js-flags=") and "--max-old-space-size=128" in a.split("=", 1)[1].split()
+                            for a in LOW_MEMORY_ARGS))
 
 
 class RealTradingAndBalanceTests(unittest.IsolatedAsyncioTestCase):

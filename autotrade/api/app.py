@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
+from ..auth.browser_memory import container_memory, install_quiet_playwright_handler
 from ..errors import ReauthRequired, SettingsError
 from .ratelimit import RateLimiter, parse_rate, wait_text
 from ..runtime import Runtime
@@ -214,12 +215,14 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
+        install_quiet_playwright_handler()
         if before_start:
             await before_start()
         if not background:
             try:
                 yield
             finally:
+                await rt.handshakes.shutdown()
                 await rt.manager.shutdown()
                 if after_stop:
                     await after_stop()
@@ -231,6 +234,7 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
             yield
         finally:
             health_task.cancel()
+            await rt.handshakes.shutdown()      # close login browsers before anything else
             await rt.manager.shutdown()
             if after_stop:
                 await after_stop()
@@ -258,7 +262,8 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
-        return {"ok": True, "feed": rt.feed.status(), "halted": rt.manager.halted}
+        return {"ok": True, "feed": rt.feed.status(), "halted": rt.manager.halted,
+                "memory": container_memory()}       # MB numbers only: shows how close the 512 MB cap is
 
     @app.get("/login", response_class=HTMLResponse)
     async def login_page() -> HTMLResponse:

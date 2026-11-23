@@ -32,7 +32,11 @@ class Config:
     max_handshakes: int = 1           # one Chromium at a time fits Render's 512 MB instance
     handshake_idle_timeout: float = 150.0  # login page closed / stopped polling: free its Chromium
     headless: bool = True
-    low_memory: bool = True           # single-process Chromium with a small JS heap (512 MB hosts)
+    low_memory: bool = True           # Chromium without GPU/shared memory, small JS heap (512 MB hosts)
+    chromium_single_process: bool = True  # low-memory Chromium in one OS process (turn off if a site crashes)
+    screenshot_interval: float = 1.5  # low-memory: seconds between live pictures of the broker page
+    handshake_min_free_mb: float = 150.0   # do not start Chromium with less free container memory (0 = off)
+    handshake_memory_floor_mb: float = 40.0  # close Chromium if free memory falls below this (0 = off)
     block_login_assets: bool = True   # no images/fonts/media/stylesheets from the broker during login
     block_third_party: bool = True    # no trackers/ads during login (Google/CAPTCHA always allowed)
     cabinet_switch_delay: float = 3.5 # pause between the Real and Demo cabinet pages (fast switching gets blocked)
@@ -61,6 +65,10 @@ class Config:
             handshake_idle_timeout=_num("AUTOTRADE_HANDSHAKE_IDLE_TIMEOUT", 150),
             headless=_bool("AUTOTRADE_HEADLESS", True),
             low_memory=_bool("AUTOTRADE_LOW_MEMORY", True),
+            chromium_single_process=_bool("AUTOTRADE_CHROMIUM_SINGLE_PROCESS", True),
+            screenshot_interval=_num("AUTOTRADE_SCREENSHOT_INTERVAL", 1.5),
+            handshake_min_free_mb=_num("AUTOTRADE_HANDSHAKE_MIN_FREE_MB", 150),
+            handshake_memory_floor_mb=_num("AUTOTRADE_HANDSHAKE_MEMORY_FLOOR_MB", 40),
             block_login_assets=_bool("AUTOTRADE_BLOCK_LOGIN_ASSETS", True),
             block_third_party=_bool("AUTOTRADE_BLOCK_THIRD_PARTY", True),
             cabinet_switch_delay=_num("AUTOTRADE_CABINET_SWITCH_DELAY", 3.5),
