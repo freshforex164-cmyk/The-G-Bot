@@ -1,4 +1,4 @@
-# GBot — Phase 3 status (2026-11-23)
+# GBot — Phase 3 status (2026-11-23, re-login update)
 
 ## Commits on main (pushed via GitHub API, remote tree verified after each)
 | Checkpoint | Commit | Scope |
@@ -9,7 +9,10 @@
 | 3 | `ed035dd74ccc29ad54ea4aed67a7c4458fb45179` | Fixed / Martingale stake selector, stop-loss exposure |
 | 4 | `3b65f1f118333504ce5ca0b100e4ba2688526ed3` | Min-payout filter and multi-asset payout routing |
 | 5 | `dd1201d1a7bb4ef14f085302fb8929585e2b46c9` | Telegram opened / settled / daily summary tracking |
-| 6 | commit adding this file | Final verification, PostgreSQL Phase 3 test |
+| 6 | `60c93f447581d5bd87a8e8246139864eb4e6ecfe` | Final verification, PostgreSQL Phase 3 test |
+| 1b | `451f531896b0c8b0e985211b177d06e19f42e5c4` | "Sign in again anyway" replaces stale sessions; login view never blank |
+| 2b | `90097575c84aee3617df3cf4d8d6428b864b4d86` | PostgreSQL check: wiping one slot keeps the other |
+| 6b | commit adding this version | Final verification and this report |
 
 ## Implemented
 - Memory (render.yaml, Dockerfile): MALLOC_ARENA_MAX=2, MALLOC_TRIM_THRESHOLD_=131072, NODE_OPTIONS 256 MB
@@ -18,6 +21,11 @@
 - Direct SSID login removed (buttons, menus, `/at_ssid`, `/auth/ssid`); pasted session strings are deleted
   and refused. Sign-in is email/password handshake into the encrypted vault only; passwords never stored.
 - Expired sessions close their pooled connection and prompt `/at_login`.
+- "Sign in again anyway" (force): on success every captured slot is overwritten, uncaptured slots are
+  deleted; no stale SSID survives. Reproduced before the fix (old sessions kept), verified after.
+- Login view: Telegram script async (was render-blocking: blank page), loading panel until the first
+  picture with Try again / Cancel after 30 s, 204 while Chromium starts, 8 s screenshot cap, any phone
+  size clamped, proxy HTTPS headers. Closing the page or 150 s without polling frees Chromium.
 - Demo and Real sessions live in separate vault rows keyed by (user, kind); one never overwrites the other.
 - Balance reads reuse worker or pooled connections with a rate-limit cooldown; no short-lived sockets.
 - Account kind comes from the session's own `isDemo` flag; valid Real (`isDemo=0`) sessions start cleanly.
@@ -31,16 +39,19 @@
 - Unchanged: 1-minute candle price-action engine and candle close timing.
 
 ## Offline verification (Checkpoint 6)
-- `pytest autotrade/tests/` with a throwaway local PostgreSQL 16: 212 passed, 0 failed, 0 skipped (3 runs).
-- Same without a database: 208 passed, 4 PostgreSQL tests skipped.
+- `pytest autotrade/tests/` with a throwaway local PostgreSQL 16: 219 passed, 0 failed, 0 skipped (3 runs).
+- Same without a database: 215 passed, 4 PostgreSQL tests skipped.
+- Login page driven in headless Chromium at 384x661 against a simulated broker: re-login replaces both
+  sessions; loading panel shown, then the live picture; page close cancels the server browser.
 - `pytest tests/`: 170 passed.
-- New tests: Checkpoint 3 (stake ladder), 4 (14 routing), 5 (8 tracking), PostgreSQL settings + dual vault.
+- New tests: re-login override (7), stake ladder, routing (14), tracking (8), PostgreSQL settings + dual vault.
 - Schema applied twice (idempotent); invalid `stake_mode` rejected by its check constraint.
 
 ## Live verification
 - Render deploy and memory under real load: NOT RUN.
 - Production PostgreSQL migration: NOT RUN.
-- Pocket Option login, Turnstile/CAPTCHA/2FA screens, Demo and Real balances: NOT RUN.
+- Pocket Option login, "Sign in again anyway" on the real site, Turnstile/CAPTCHA/2FA: NOT RUN.
+- Login view on a Render instance inside Telegram: NOT RUN. Demo and Real balances: NOT RUN.
 - Live payouts, multi-asset routing and order placement: NOT RUN.
 - Martingale progression on real settlements: NOT RUN.
 - Telegram delivery of trade alerts and daily summary: NOT RUN.
@@ -49,6 +60,8 @@
 ## Risks / limits
 - No payout level is guaranteed; assets without their own valid setup are never traded.
 - Martingale raises exposure after losses; the daily stop-loss is the hard limit.
+- A forced re-login that captures only one account type deletes the other; sign in again to restore it.
+- A running bot keeps its current connection and uses the new session on its next reconnect.
 
 ## Needs your action
 - Deploy, apply `autotrade/schema.sql`, then confirm a Demo login, balance and one Demo trade with alerts
