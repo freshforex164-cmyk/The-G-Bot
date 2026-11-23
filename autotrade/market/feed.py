@@ -30,6 +30,8 @@ class SharedMarketFeed:
         self._backoff_max = backoff_max
         self.state = "idle"       # idle | connected | unconfigured | rejected | reconnecting
         self.stream_starts: Counter[str] = Counter()   # for tests/monitoring
+        self._payouts: dict[str, tuple[int, float]] = {}  # symbol -> (payout %, read at), short-lived
+        self.payout_ttl = 5.0
 
     # -- public API ---------------------------------------------------------------------------
     async def acquire(self, symbols: tuple[str, ...]) -> None:
@@ -51,6 +53,42 @@ class SharedMarketFeed:
                 self._ticks.pop(sym, None)
         if not self._refs:              # nobody needs prices: close the idle WebSocket too
             await self._drop_broker()
+
+    async def payouts(self, symbols: list[str] | tuple[str, ...]) -> dict[str, int]:
+        """Live payouts over the shared feed connection, cached for a few seconds so many users evaluating
+        the same assets cause one broker request. Never opens a socket: empty when the feed is idle."""
+        now = self._clock.monotonic()
+        wanted = list(dict.fromkeys(symbols))
+        out: dict[str, int] = {}
+        for s in wanted:
+            hit = self._payouts.get(s)
+            if hit is not None and now - hit[1] < self.payout_ttl:
+                out[s] = hit[0]
+        missing = [s for s in wanted if s not in out]
+        broker = self._broker
+        if missing and broker is not None:
+            try:
+                fn = getattr(broker, "payouts", None)
+                if callable(fn):
+                    got = await asyncio.wait_for(fn(missing), timeout=6.0)
+                else:
+                    got = {}
+                    for s in missing:
+                        got[s] = await asyncio.wait_for(broker.payout(s), timeout=6.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.info("feed payouts unavailable (%s)", type(exc).__name__)
+                got = {}
+            for s, p in got.items():
+                if p is not None:
+                    self._payouts[s] = (int(p), now)
+                    out[s] = int(p)
+        if len(self._payouts) > 256:                       # bounded cache
+            for s, (_, at) in list(self._payouts.items()):
+                if now - at >= self.payout_ttl:
+                    del self._payouts[s]
+        return out
 
     def latest(self, symbol: str) -> Tick | None:
         return self._ticks.get(symbol)
@@ -78,6 +116,7 @@ class SharedMarketFeed:
         self._refs.clear()
         self._ticks.clear()
         self._listeners.clear()
+        self._payouts.clear()
         await self._drop_broker()
 
     # -- internals ----------------------------------------------------------------------------

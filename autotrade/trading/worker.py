@@ -19,7 +19,8 @@ from ..vault.service import TokenVault
 from .broker import BrokerClient, TradeOutcome, account_is_demo, map_exception
 from .models import DEMO, Decision, TradeRecord, TradingSettings
 from .risk import RiskManager, RiskState
-from .strategy import STRATEGIES, Strategy
+from .router import route
+from .strategy import STRATEGIES, MultiAssetStrategy, Strategy
 
 log = logging.getLogger("autotrade.worker")
 
@@ -124,6 +125,7 @@ class UserWorker:
         self.balance_at: datetime | None = None
         self.signals_received = 0
         self.stakes = StakeTracker()
+        self.last_route: dict | None = None
         self._open_stakes: dict[str, float] = {}
 
     # -- control ------------------------------------------------------------------------------
@@ -144,7 +146,9 @@ class UserWorker:
                 "open_trades": self.open_count, "follow_signals": self.settings.follow_signals,
                 "signals_received": self.signals_received,
                 "balance": self.balance, "balance_account": self.balance_kind,
-                "balance_at": self.balance_at.isoformat() if self.balance_at else None}
+                "balance_at": self.balance_at.isoformat() if self.balance_at else None,
+                "last_route": self.last_route, "stake_step": self.stakes.step,
+                "win_streak": self.stakes.win_streak}
 
     @property
     def follows_signals(self) -> bool:
@@ -191,7 +195,9 @@ class UserWorker:
                 self.settings = await self._repo.get_settings(self.user_id)
                 s = self.settings
                 kind = "demo" if s.mode == DEMO else "real"
-                strategy = self._strategies[s.strategy]()
+                factory = self._strategies[s.strategy]
+                strategy = (MultiAssetStrategy(factory) if not s.follow_signals and s.route_assets
+                            else factory())
                 broker: BrokerClient | None = None
                 try:
                     self.status = WorkerStatus.STARTING
@@ -318,15 +324,24 @@ class UserWorker:
                 if not await broker.is_alive():
                     raise Disconnected("connection is not receiving data")
                 if follow:
+                    batch: list[Decision] = []
                     while self._pending and not self._stop.is_set():
                         d = self._pending.popleft()
                         if self._expired(d):
                             self._note("signal_expired")
                             self._alert_skip(d, "signal_expired")
                             continue
-                        await self._try_trade(broker, d, s, (), pushed=True)
+                        batch.append(d)
+                    if batch:
+                        await self._route_and_trade(broker, batch, s, pushed=True)
                     continue
                 ticks = {sym: self._feed.latest(sym) for sym in symbols}
+                many = getattr(strategy, "on_tick_all", None)
+                if callable(many):
+                    found = many(ticks, s)
+                    if found:
+                        await self._route_and_trade(broker, found, s)
+                    continue
                 decision = strategy.on_tick(ticks, s)
                 if decision is not None:
                     await self._try_trade(broker, decision, s, symbols)
@@ -372,10 +387,58 @@ class UserWorker:
         except Exception:
             log.info("trade alert failed for user %s", self.user_id)
 
-    def _alert_skip(self, d: Decision, reason: str) -> None:
+    def _alert_skip(self, d: Decision, reason: str, *, payout: int | None = None,
+                    routed: tuple[Decision, int] | None = None) -> None:
         if d.signal_id:          # only GBot signals: the user would otherwise hear nothing about them
             self._alert(skipped_text(asset=self._asset_name(d), direction=d.direction, reason=reason,
-                                     setup=d.reason or ""))
+                                     setup=d.reason or "", payout=payout,
+                                     routed_to=self._asset_name(routed[0]) if routed else None,
+                                     routed_payout=routed[1] if routed else None))
+
+    # -- payout routing -----------------------------------------------------------------------
+    async def _payouts(self, broker: BrokerClient, assets: list[str]) -> dict[str, int | None]:
+        """Live payouts: the shared feed first (cached, no new socket), then this user's own connection."""
+        wanted = list(dict.fromkeys(assets))
+        got: dict[str, int | None] = {}
+        reader = getattr(self._feed, "payouts", None)
+        if callable(reader):
+            try:
+                got.update(await reader(wanted))
+            except Exception:
+                pass
+        missing = [a for a in wanted if got.get(a) is None]
+        batch = getattr(broker, "payouts", None)
+        if missing and callable(batch) and len(missing) > 1:
+            try:
+                got.update(await asyncio.wait_for(batch(missing), timeout=6.0))
+            except (BrokerError, asyncio.TimeoutError):
+                pass
+            missing = [a for a in wanted if got.get(a) is None]
+        for a in missing:
+            try:
+                got[a] = await broker.payout(a)
+            except BrokerError:
+                got[a] = None
+        return got
+
+    async def _route_and_trade(self, broker: BrokerClient, decisions: list[Decision], s: TradingSettings,
+                               *, pushed: bool = False) -> None:
+        """Evaluate every candidate that has its own setup, drop those under the minimum payout and place
+        the best ones first. A low-payout setup is never moved onto another asset."""
+        payouts = await self._payouts(broker, [d.asset for d in decisions])
+        res = route(decisions, payouts, s.min_payout)
+        best = res.best
+        self.last_route = {
+            "candidates": [{"asset": d.asset, "payout": payouts.get(d.asset)} for d in decisions][:10],
+            "chosen": best[0].asset if best else None, "payout": best[1] if best else None,
+            "min_payout": s.min_payout}
+        for d, reason, p in res.rejected:
+            self._note(reason)
+            self._alert_skip(d, reason, payout=p, routed=best if reason == "payout_below_minimum" else None)
+        for d, p in res.ranked:
+            if self._stop.is_set():
+                break
+            await self._try_trade(broker, d, s, (d.asset,) if not pushed else (), pushed=pushed, payout=p)
 
     async def _drain(self, broker: BrokerClient) -> None:
         """Let open trades settle so their results are logged before the connection closes."""
@@ -392,7 +455,7 @@ class UserWorker:
         self.last_reject = reason
 
     async def _try_trade(self, broker: BrokerClient, d: Decision, s: TradingSettings, symbols: tuple[str, ...],
-                         *, pushed: bool = False) -> None:
+                         *, pushed: bool = False, payout: int | None = None) -> None:
         now = self._clock.monotonic()
         day = utc_day_start(self._clock.utcnow())
         pnl = await self._repo.realized_pnl_since(self.user_id, day, s.mode)
@@ -412,14 +475,15 @@ class UserWorker:
             self.status = WorkerStatus.PAUSED if verdict.halt else WorkerStatus.RUNNING
             return
         self.status = WorkerStatus.RUNNING
-        try:
-            payout = await broker.payout(d.asset)
-        except BrokerError:
-            payout = None
+        if payout is None:            # the router already read it for routed candidates
+            try:
+                payout = await broker.payout(d.asset)
+            except BrokerError:
+                payout = None
         pv = self._risk.check_payout(s, payout)
         if not pv.ok:
             self._note(pv.reason)
-            self._alert_skip(d, pv.reason)
+            self._alert_skip(d, pv.reason, payout=payout)
             return
         # Demo and Real alike: only trade money that is there. A fresh reading; the last known one if the
         # broker does not answer; no reading at all -> skip (never trade blind).

@@ -25,6 +25,7 @@ class BrokerClient(Protocol):
     async def is_demo(self) -> bool: ...
     async def is_alive(self) -> bool: ...
     async def payout(self, asset: str) -> int | None: ...
+    # Optional: async def payouts(self, assets: list[str]) -> dict[str, int]  (one round trip for many assets)
     async def balance(self) -> float | None: ...
     async def place(self, asset: str, direction: str, amount: float, expiry_seconds: int) -> str: ...
     async def outcome(self, trade_id: str, timeout: float) -> TradeOutcome: ...
@@ -150,6 +151,14 @@ class PocketOptionBroker:
             return await self._need().payout(asset, timeout=5.0)
         except Exception as exc:
             raise map_exception(exc) from None
+
+    async def payouts(self, assets: list[str]) -> dict[str, int]:
+        """Live payouts for several assets in one call (inactive/unknown assets are omitted)."""
+        try:
+            data = await self._need().payouts(list(assets), timeout=5.0)
+        except Exception as exc:
+            raise map_exception(exc) from None
+        return {str(k): int(v) for k, v in (data or {}).items() if v is not None}
 
     async def place(self, asset: str, direction: str, amount: float, expiry_seconds: int) -> str:
         api = self._need()

@@ -98,6 +98,7 @@ class SettingsPatch(BaseModel):
     martingale_multiplier: float | None = None
     martingale_max_steps: int | None = None
     base_stake: float | None = None
+    route_assets: list[str] | None = Field(None, max_length=4)
 
 
 class SignalIn(BaseModel):

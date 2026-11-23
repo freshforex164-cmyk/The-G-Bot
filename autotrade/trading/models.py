@@ -46,8 +46,15 @@ class TradingSettings:
     martingale_multiplier: float = 2.0
     martingale_max_steps: int = 3
     base_stake: float | None = None
+    # Engine mode only: extra OTC symbols scanned with their own candles (e.g. UKBrent_otc, XAUUSD_otc).
+    # Each needs its own valid pattern; the payout router then picks the best one. Empty = symbol_otc only.
+    route_assets: tuple[str, ...] = ()
     # Bumped when defaults change, so saved settings that still hold the old defaults get the new ones.
     defaults_version: int = SETTINGS_DEFAULTS_VERSION
+
+    def __post_init__(self) -> None:
+        if isinstance(self.route_assets, list):
+            object.__setattr__(self, "route_assets", tuple(self.route_assets))
 
     def validate(self, cfg: Config) -> "TradingSettings":
         def bad(msg: str):
@@ -84,6 +91,13 @@ class TradingSettings:
             bad("follow_signals must be true or false")
         if self.symbol_real == self.symbol_otc:
             bad("symbol_real and symbol_otc must differ")
+        if not isinstance(self.route_assets, tuple) or len(self.route_assets) > 4:
+            bad("route_assets takes at most 4 symbols")
+        for v in self.route_assets:
+            if not (isinstance(v, str) and 3 <= len(v) <= 32 and v.replace("_", "").replace("-", "").replace("#", "").isalnum()):
+                bad("route_assets contains an invalid symbol")
+        if len(set(self.route_assets)) != len(self.route_assets) or self.symbol_otc in self.route_assets:
+            bad("route_assets must be distinct and different from symbol_otc")
         if self.stake_mode not in STAKE_MODES:
             bad("stake_mode must be 'fixed' or 'martingale'")
         if not (isinstance(self.martingale_multiplier, (int, float)) and 1.1 <= self.martingale_multiplier <= 5.0):

@@ -106,7 +106,12 @@ class FakeBroker:
         return self._open
 
     async def payout(self, asset):
+        self.w.payout_calls = getattr(self.w, "payout_calls", 0) + 1
         return self.w.payouts.get(asset, self.w.payout)
+
+    async def payouts(self, assets):
+        self.w.batch_payout_calls = getattr(self.w, "batch_payout_calls", 0) + 1
+        return {a: self.w.payouts.get(a, self.w.payout) for a in assets}
 
     async def balance(self):
         if self.w.balance_exc is not None:

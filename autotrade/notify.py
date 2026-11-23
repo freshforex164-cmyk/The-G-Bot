@@ -29,6 +29,8 @@ SKIP_REASONS = {
     "payout_below_minimum": "the payout is below your minimum",
     "signal_expired": "the signal expired before it could be placed",
     "balance_unavailable": "your account balance could not be read, so no money was risked",
+    "no_verified_setup": "that asset has no valid price-action setup of its own",
+    "duplicate_asset": "another setup on the same asset was evaluated at the same time",
 }
 
 
@@ -76,10 +78,17 @@ def settled_text(*, mode: str, asset: str, direction: str, stake: float, outcome
     return "\n".join(lines)
 
 
-def skipped_text(*, asset: str, direction: str, reason: str, setup: str = "") -> str:
+def skipped_text(*, asset: str, direction: str, reason: str, setup: str = "", payout: int | None = None,
+                 routed_to: str | None = None, routed_payout: int | None = None) -> str:
     why = SKIP_REASONS.get(reason, reason.replace("_", " "))
-    return (f"⏭ Auto-Trade skipped a signal: {asset} {direction_line(direction)[2:]}\n"
+    if reason == "payout_below_minimum" and payout is not None:
+        why = f"{why} ({payout}%)"
+    text = (f"⏭ Auto-Trade skipped a signal: {asset} {direction_line(direction)[2:]}\n"
             f"Setup: {setup_name(setup)}\nReason: {why}.")
+    if routed_to:
+        text += f"\n↪ Routed to {routed_to}" + (f" ({routed_payout}%)" if routed_payout is not None else "") + \
+                ", which has its own valid setup."
+    return text
 
 
 def low_balance_text(*, mode: str, asset: str, direction: str, stake: float, balance: float,

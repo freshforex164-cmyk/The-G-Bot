@@ -172,6 +172,8 @@ class TradingManager:
                     changes["live_confirmed"] = False
             elif "mode" in changes:
                 changes.pop("mode")
+            if "route_assets" in changes:
+                changes["route_assets"] = tuple(str(a) for a in changes["route_assets"])
             new = cur.with_changes(**changes).validate(self.cfg)
             await self.repo.save_settings(user_id, new)
             worker = self._workers.get(user_id)
@@ -325,6 +327,8 @@ class TradingManager:
             "mode": s.mode,
             "settings": s.to_dict(),
             "sessions": await self.vault.status(user_id),
+            "routing": {"min_payout": s.min_payout, "route_assets": list(s.route_assets),
+                        "last_route": bot.get("last_route")},
             "today": {**(await self.repo.trade_stats(user_id, day)),
                       "realized_pnl": await self.repo.realized_pnl_since(user_id, day, s.mode),
                       "stop_loss": s.daily_stop_loss, "take_profit": s.daily_take_profit},
