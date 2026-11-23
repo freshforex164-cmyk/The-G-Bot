@@ -52,6 +52,19 @@ class PostgresRepositoryTests(unittest.IsolatedAsyncioTestCase):
         await vault.delete_all("u1")
         self.assertEqual(await self.repo.list_credentials("u1"), [])
 
+    async def test_phase3_settings_round_trip_and_dual_vault(self):
+        s = TradingSettings(stake_mode="martingale", martingale_multiplier=1.5, martingale_max_steps=4,
+                            base_stake=2.0, route_assets=("UKBrent_otc", "XAUUSD_otc"))
+        await self.repo.save_settings("u2", s)
+        self.assertEqual(await self.repo.get_settings("u2"), s)
+        vault = TokenVault(self.repo, KeyRing({1: bytes(32)}, 1))
+        demo, real = build_ssid("D", "demo", uid=4), build_ssid("R", "real", uid=4)
+        await vault.store("u2", "demo", demo)
+        await vault.store("u2", "real", real)
+        await vault.store("u2", "demo", build_ssid("D2", "demo", uid=4))
+        self.assertEqual(await vault.get("u2", "real"), real)
+        await vault.delete_all("u2")
+
     async def test_settings_trades_stats_state(self):
         self.assertEqual((await self.repo.get_settings("u1")).mode, "demo")
         await self.repo.save_settings("u1", TradingSettings(stake=3))
