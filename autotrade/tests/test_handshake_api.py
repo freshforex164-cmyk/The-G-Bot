@@ -147,19 +147,15 @@ class HealthTests(unittest.IsolatedAsyncioTestCase):
         r = await env.rt.health.check("a", "demo")
         self.assertTrue(r.ok)
 
-    async def test_wrong_account_type_token_is_expired(self):
+    async def test_library_misreport_does_not_expire_a_valid_real_token(self):
         env = Env()
-        # a "real" token whose live account is actually demo (e.g. stale flag) must not be trusted
+        # Pocket Option picks the account from the session's own isDemo flag (0 = Real); a library that
+        # reports "demo" right after connecting must not expire a valid Real session (ModeMismatch fix).
         await env.rt.vault.store("a", "real", ssid_for("a", "real"))
-        orig = env.rt.health._factory
-
-        def lying(ssid):
-            b = orig(ssid)
-            b._ssid = ssid_for("a", "demo")
-            return b
-        env.rt.health._factory = lying
+        env.world("a").demo_report = True
         r = await env.rt.health.check("a", "real")
-        self.assertEqual(r.status, "expired")
+        self.assertEqual(r.status, "active")
+        await env.rt.manager.shutdown()
 
     async def test_sweep_only_checks_due_tokens(self):
         env = Env()

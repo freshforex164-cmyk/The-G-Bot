@@ -54,6 +54,27 @@ def map_exception(exc: BaseException) -> Exception:
     return BrokerError(redact(f"{name}: {exc}")[:200])
 
 
+async def account_is_demo(broker: "BrokerClient", ssid: str) -> bool:
+    """Account type of a connected session. The session's own isDemo flag is authoritative: Pocket Option
+    picks the account from that flag, and the vault guarantees it matches its Demo/Real slot. The library's
+    ``is_demo()`` is only a cross-check (it can lag or misreport Real sessions right after connecting), so a
+    valid Real token (isDemo=0) never fails with a mode mismatch."""
+    from ..auth.ssid import DEMO_KIND, account_kind
+
+    flag = account_kind(ssid)
+    try:
+        reported: bool | None = bool(await broker.is_demo())
+    except Exception:
+        reported = None
+    if flag is None:
+        if reported is None:
+            raise BrokerError("account type is unavailable")
+        return reported
+    if reported is not None and reported != (flag == DEMO_KIND):
+        log.warning("broker library reported a different account type than the session flag; using the session flag")
+    return flag == DEMO_KIND
+
+
 class PocketOptionBroker:
     def __init__(self, ssid: str, *, connect_timeout: float = 30.0):
         self._ssid = ssid

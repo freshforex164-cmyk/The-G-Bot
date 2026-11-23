@@ -56,15 +56,23 @@ def build_runtime(cfg: Config, *, repo: Repository | None = None, keyring: KeyRi
         derived = set(meta.get("derived", []))
         # Captured cookies are transient until encrypted; never include them in row metadata/audit.
         browser_session = meta.pop("_browser_session", None)
+        stored: list[str] = []
         for kind, ssid in tokens.items():
+            if kind in derived:
+                # Dual-vault isolation: a session rebuilt from the login cookie never replaces a genuine,
+                # still-active session captured from that account's own WebSocket frame.
+                row = await repo.get_credential(user_id, kind)
+                if row is not None and row.status == "active" and not (row.meta or {}).get("derived"):
+                    continue
             await vault.store(user_id, kind, ssid, {"method": meta.get("method"), "derived": kind in derived},
                               browser_session=browser_session)
+            stored.append(kind)
         await repo.save_settings(user_id, await repo.get_settings(user_id))  # creates the Demo default for new users
         await manager.reset_to_demo(user_id, "new login")
-        await repo.audit(user_id, "tokens_captured", {"kinds": sorted(tokens), "method": meta.get("method")})
+        await repo.audit(user_id, "tokens_captured", {"kinds": sorted(stored), "method": meta.get("method")})
         # Connect each new session over WebSocket now, so balance and status come from this user's account.
         try:
-            await manager.connect_new_sessions(user_id, sorted(tokens))
+            await manager.connect_new_sessions(user_id, sorted(stored))
         except Exception as exc:   # a slow broker must not fail the login; checked again before trading
             log.warning("post-login connection check failed: %s", type(exc).__name__)
 

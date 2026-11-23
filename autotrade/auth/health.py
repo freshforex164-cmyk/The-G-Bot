@@ -9,7 +9,7 @@ from typing import Callable
 from ..clock import Clock
 from ..errors import Disconnected, RateLimited, SessionExpired, VaultError
 from ..storage.repo import Repository
-from ..trading.broker import BrokerClient, map_exception
+from ..trading.broker import BrokerClient, account_is_demo, map_exception
 from ..vault.service import TokenVault
 
 log = logging.getLogger("autotrade.health")
@@ -32,8 +32,14 @@ class SessionHealth:
         self._vault, self._repo, self._factory = vault, repo, broker_factory
         self._clock = clock or Clock()
         self._timeout = timeout
+        self._pool = None
 
-    async def check(self, user_id: str, kind: str) -> HealthResult:
+    def attach_pool(self, pool) -> None:
+        """Run checks through the shared balance pool: one socket per account, reused by balance reads
+        and handed to the trading worker on start, instead of a new short-lived socket per check."""
+        self._pool = pool
+
+    async def check(self, user_id: str, kind: str, *, keep: bool = False) -> HealthResult:
         try:
             ssid = await self._vault.get(user_id, kind)
         except VaultError:
@@ -42,10 +48,12 @@ class SessionHealth:
         if ssid is None:
             row = await self._repo.get_credential(user_id, kind)
             return HealthResult(kind, False, "expired" if row else "missing", (row.last_error or "") if row else "")
+        if self._pool is not None:
+            return await self._check_pooled(user_id, kind, keep)
         broker = self._factory(ssid)
         try:
             await asyncio.wait_for(broker.connect(), timeout=self._timeout)
-            if (await broker.is_demo()) != (kind == "demo"):
+            if (await account_is_demo(broker, ssid)) != (kind == "demo"):
                 raise SessionExpired("stored token does not match its account type")
         except SessionExpired as exc:
             await self._vault.mark_expired(user_id, kind, str(exc))
@@ -60,6 +68,29 @@ class SessionHealth:
             return HealthResult(kind, False, "unreachable", type(mapped).__name__)
         finally:
             await broker.close()
+        await self._vault.mark_valid(user_id, kind)
+        return HealthResult(kind, True, "active")
+
+    async def _check_pooled(self, user_id: str, kind: str, keep: bool) -> HealthResult:
+        try:
+            async with self._pool.connection(user_id, kind):
+                pass
+        except SessionExpired as exc:          # the pool closed it, marked it expired and prompted /at_login
+            await self._vault.mark_expired(user_id, kind, str(exc))
+            return HealthResult(kind, False, "expired", str(exc))
+        except (Disconnected, RateLimited, asyncio.TimeoutError) as exc:
+            return HealthResult(kind, False, "unreachable", str(exc) or "timeout")
+        except VaultError:
+            await self._vault.mark_expired(user_id, kind, "token cannot be decrypted")
+            return HealthResult(kind, False, "expired", "token cannot be decrypted")
+        except Exception as exc:
+            mapped = map_exception(exc)
+            if isinstance(mapped, SessionExpired):
+                await self._vault.mark_expired(user_id, kind, str(mapped))
+                return HealthResult(kind, False, "expired", str(mapped))
+            return HealthResult(kind, False, "unreachable", type(mapped).__name__)
+        if not keep:
+            await self._pool.discard(user_id, kind)     # background sweeps do not hold sockets open
         await self._vault.mark_valid(user_id, kind)
         return HealthResult(kind, True, "active")
 

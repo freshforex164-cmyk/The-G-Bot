@@ -57,6 +57,8 @@ class TradingManager:
                                      limit=min(16, max(2, cfg.max_workers * 2)),
                                      on_expired=self._on_session_expired)
         self._expiry_notified: set[tuple[str, str]] = set()
+        if hasattr(health, "attach_pool"):
+            health.attach_pool(self._balances)
         self.halted = cfg.trading_halted
         self._workers: dict[str, UserWorker] = {}
         self._tasks: dict[str, asyncio.Task] = {}
@@ -107,8 +109,8 @@ class TradingManager:
                 raise LiveDisabled("live trading is not enabled")
             s.validate(self.cfg)
             kind = "demo" if s.mode == DEMO else "real"
-            await self._balances.discard(user_id, kind)
-            res = await self.health.check(user_id, kind)
+            # One socket: the health check opens (or reuses) the pooled connection and the worker adopts it.
+            res = await self.health.check(user_id, kind, keep=True)
             if not res.ok:
                 if res.status in ("missing", "expired"):
                     raise ReauthRequired(kind, res.status)
@@ -116,7 +118,8 @@ class TradingManager:
             worker = UserWorker(user_id, repo=self.repo, vault=self.vault, feed=self.feed,
                                 broker_factory=self._factory, risk=self._risk, clock=self._clock,
                                 is_halted=lambda: self.halted, reconnect_base=self._reconnect_base,
-                                notifier=self._notifier, on_session_expired=self._on_session_expired)
+                                notifier=self._notifier, on_session_expired=self._on_session_expired,
+                                adopt=lambda k, u=user_id: self._balances.take(u, k))
             worker.apply_settings(s)
             self._workers[user_id] = worker
             task = asyncio.create_task(worker.run(), name=f"worker:{user_id}")
@@ -282,8 +285,12 @@ class TradingManager:
         except Exception as exc:
             from ..errors import SessionExpired
             from .broker import map_exception
-            if isinstance(map_exception(exc), SessionExpired):
+            from ..errors import RateLimited
+            mapped = map_exception(exc)
+            if isinstance(mapped, SessionExpired):
                 return None, "session_expired"     # the pool closed it, marked it expired and asked for /at_login
+            if isinstance(mapped, RateLimited):
+                return None, "rate_limited"        # no new socket until the broker's pause is over
             return None, "broker_unreachable"
         if raw is None or float(raw) < 0:
             return None, "balance_unavailable"

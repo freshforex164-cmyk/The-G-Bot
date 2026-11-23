@@ -211,6 +211,7 @@ class IsolationAndErrorTests(EngineBase):
             made.append(b)
             return b
         self.m._factory = spy
+        self.m._balances.factory = spy          # the start-up check's pooled socket is adopted by the worker
         await self.m.start("a")
         worker = self.m._workers["a"]
         await wait_until(lambda: worker.status.value == "running")

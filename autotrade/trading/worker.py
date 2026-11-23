@@ -16,7 +16,7 @@ from ..market.feed import SharedMarketFeed
 from ..notify import NullNotifier, Notifier, failed_text, low_balance_text, opened_text, settled_text, skipped_text
 from ..storage.repo import BalanceRow, BotState, Repository
 from ..vault.service import TokenVault
-from .broker import BrokerClient, TradeOutcome, map_exception
+from .broker import BrokerClient, TradeOutcome, account_is_demo, map_exception
 from .models import DEMO, Decision, TradeRecord, TradingSettings
 from .risk import RiskManager, RiskState
 from .strategy import STRATEGIES, Strategy
@@ -58,7 +58,8 @@ class UserWorker:
                  is_halted: Callable[[], bool] = lambda: False,
                  strategies: dict[str, Callable[[], Strategy]] | None = None,
                  reconnect_base: float = 2.0, notifier: Notifier | None = None,
-                 on_session_expired: Callable[[str, str, str], Awaitable[None]] | None = None):
+                 on_session_expired: Callable[[str, str, str], Awaitable[None]] | None = None,
+                 adopt: Callable[[str], Awaitable[BrokerClient | None]] | None = None):
         self.user_id = user_id
         self._repo, self._vault, self._feed = repo, vault, feed
         self._factory, self._risk, self._clock = broker_factory, risk, clock
@@ -67,6 +68,7 @@ class UserWorker:
         self._reconnect_base = reconnect_base
         self._notifier = notifier or NullNotifier()
         self._on_session_expired = on_session_expired
+        self._adopt = adopt          # first session reuses the pooled connection from the start-up check
         self._broker: BrokerClient | None = None
         self.settings = TradingSettings()
         self.status = WorkerStatus.STARTING
@@ -158,9 +160,16 @@ class UserWorker:
                     ssid = await self._vault.get(self.user_id, kind)
                     if ssid is None:
                         raise SessionExpired("no active token")
-                    broker = self._factory(ssid)
-                    await broker.connect()
-                    self._client_is_demo = await broker.is_demo()
+                    adopt, self._adopt = self._adopt, None
+                    if adopt is not None:
+                        try:
+                            broker = await adopt(kind)
+                        except Exception:
+                            broker = None
+                    if broker is None:
+                        broker = self._factory(ssid)
+                        await broker.connect()
+                    self._client_is_demo = await account_is_demo(broker, ssid)
                     if self._client_is_demo != (s.mode == DEMO):
                         raise ModeMismatch("connected account type does not match the selected mode")
                     reconnects = unexpected = 0

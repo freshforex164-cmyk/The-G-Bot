@@ -53,6 +53,9 @@ class World:
         self.closes = 0
         self.gate: asyncio.Event | None = None   # when set, results wait for it
         self.balance_exc: Exception | None = None  # raised by balance() (e.g. a session rejected mid-use)
+        self.connect_exc: Exception | None = None  # raised by every connect() (e.g. HTTP 429)
+        self.demo_report = None                    # None: from the SSID; a bool or an Exception: library misreport
+        self.payouts: dict[str, int] = {}          # per-asset payout overrides
 
 
 class Bus:
@@ -81,6 +84,8 @@ class FakeBroker:
         self.w.connects += 1
         if self.w.reject:
             raise SessionExpired("broker rejected the session")
+        if self.w.connect_exc is not None:
+            raise self.w.connect_exc
         if self.w.connect_failures > 0:
             self.w.connect_failures -= 1
             raise Disconnected("socket closed")
@@ -92,13 +97,16 @@ class FakeBroker:
         self._open = False
 
     async def is_demo(self):
-        return account_kind(self._ssid) == "demo"
+        r = self.w.demo_report
+        if isinstance(r, Exception):
+            raise r
+        return account_kind(self._ssid) == "demo" if r is None else r
 
     async def is_alive(self):
         return self._open
 
     async def payout(self, asset):
-        return self.w.payout
+        return self.w.payouts.get(asset, self.w.payout)
 
     async def balance(self):
         if self.w.balance_exc is not None:
