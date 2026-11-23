@@ -98,6 +98,9 @@ class PostgresRepository:
     async def delete_credentials(self, user_id) -> None:
         await self._exec("delete from autotrade_credentials where user_id=%s", (user_id,))
 
+    async def delete_credential(self, user_id, kind) -> None:
+        await self._exec("delete from autotrade_credentials where user_id=%s and kind=%s", (user_id, kind))
+
     async def list_credentials_to_recheck(self, older_than, limit):
         rows = await self._all(
             f"select {self._CRED} from autotrade_credentials where status='active' "

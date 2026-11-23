@@ -5,13 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <title>Connect Pocket Option</title>
-<script nonce="{{NONCE}}" src="https://telegram.org/js/telegram-web-app.js"></script>
+<!-- async: a slow or blocked telegram.org must never leave this page blank (the script was render-blocking) -->
+<script nonce="{{NONCE}}" id="tgjs" async src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   :root { color-scheme: dark; --bg:#0f1720; --fg:#e8eef4; --muted:#93a4b5; --accent:#2fb37a; --bad:#e5604f; --card:#18232f; }
   * { box-sizing:border-box; }
   html, body { height:100%; margin:0; }
   body { font:14px/1.4 system-ui, sans-serif; background:var(--bg); color:var(--fg); display:flex; flex-direction:column;
-         height:100dvh; overflow:hidden; overscroll-behavior:none; }
+         height:100vh; height:var(--tg-viewport-stable-height, 100dvh); overflow:hidden; overscroll-behavior:none; }
   header { flex:none; display:flex; align-items:center; gap:8px; padding:6px 10px; padding-top:max(6px, env(safe-area-inset-top));
            max-width:520px; width:100%; margin:0 auto; min-height:40px; }
   #site { flex:none; font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:45%; }
@@ -22,7 +23,16 @@
   /* The stage is exactly the size the remote phone browser is rendered at, so the site fills it edge to edge. */
   #stage { position:relative; flex:1; width:100%; max-width:520px; margin:0 auto; min-height:0; background:#000; overflow:hidden;
            touch-action:none; user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; display:none; }
-  #screen { position:absolute; inset:0; width:100%; height:100%; object-fit:fill; pointer-events:none; }
+  #screen { position:absolute; inset:0; width:100%; height:100%; object-fit:fill; pointer-events:none; visibility:hidden; }
+  #screen.ready { visibility:visible; }
+  /* Shown over the stage until the first picture of the broker page arrives: never a bare black screen. */
+  #stageStatus { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+                 gap:10px; padding:24px; text-align:center; background:var(--bg); z-index:2; touch-action:auto; }
+  #stageStatus p { margin:0; } #stageSub { color:var(--muted); font-size:12px; }
+  #stageActions { display:flex; gap:8px; margin-top:8px; }
+  .spinner { width:34px; height:34px; border-radius:50%; border:3px solid #2a3b4c; border-top-color:var(--accent);
+             animation:spin 0.9s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
   /* A real, native input placed exactly over the field that is focused on the site: the phone's own keyboard,
      autofill and password manager work in it. Its text is invisible; the site's own field shows the result. */
   #proxy { position:absolute; left:0; top:0; width:1px; height:1px; opacity:0; border:0; padding:0; margin:0; background:transparent;
@@ -81,13 +91,30 @@
   <button class="primary" id="startBtn">Open Pocket Option login</button>
 </div>
 <div id="stage">
-  <img id="screen" alt="Pocket Option">
+  <div id="stageStatus" role="status" aria-live="polite">
+    <div class="spinner"></div>
+    <p id="stageText">Opening Pocket Option securely…</p>
+    <p id="stageSub"></p>
+    <div id="stageActions" hidden>
+      <button class="primary" id="stageRetry" type="button">Try again</button>
+      <button id="stageCancel" type="button">Cancel</button>
+    </div>
+  </div>
+  <img id="screen" alt="">
   <input id="proxy" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go" aria-label="Pocket Option field">
 </div>
 <script nonce="{{NONCE}}">
 (() => {
-  const tg = window.Telegram && window.Telegram.WebApp;
-  if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
+  // Telegram's script loads asynchronously; the page works without it (e.g. opened in a normal browser).
+  let tg = null;
+  function initTg() {
+    if (tg || !(window.Telegram && window.Telegram.WebApp)) return;
+    tg = window.Telegram.WebApp;
+    try { tg.ready(); tg.expand(); } catch (e) {}
+  }
+  initTg();
+  const tgjs = document.getElementById("tgjs");
+  if (tgjs) tgjs.addEventListener("load", initTg);
   const token = new URLSearchParams(location.hash.slice(1)).get("t");
   history.replaceState(null, "", location.pathname);           // drop the token from the address bar
   const $ = (id) => document.getElementById(id);
@@ -101,13 +128,37 @@
   let sid = null, looping = false, lastUrl = null, statusTimer = null;
   let vw = 390, vh = 844, inputs = [], field = null, boostUntil = 0, lastTap = 0, nullCount = 0;
   let fieldKey = "", pending = null, sending = false, ended = false, submittedAt = 0, lastNotice = "";
+  let startedAt = 0, startTimer = null, haveFrame = false;
 
   if (!token) { $("credentials").hidden = true; msg("This link is missing its login code. Send /at_login in Telegram to get a new one.", "bad"); return; }
   if (location.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(location.hostname)) {
     $("credentials").hidden = true; msg("A secure HTTPS connection is required.", "bad"); return;
   }
 
+  // Loading panel over the stage (until the first picture) with elapsed time; after 30 s the user can
+  // retry or cancel instead of watching an endless spinner.
+  function stageStatus(text, sub) {
+    $("stageText").textContent = text; $("stageSub").textContent = sub || ""; $("stageStatus").hidden = false;
+  }
+  function startWatch() {
+    clearInterval(startTimer); startedAt = Date.now(); haveFrame = false; img.classList.remove("ready");
+    $("stageActions").hidden = true; stageStatus("Opening Pocket Option securely…", "This can take up to a minute.");
+    startTimer = setInterval(() => {
+      if (haveFrame || ended) { clearInterval(startTimer); startTimer = null; return; }
+      const s = Math.round((Date.now() - startedAt) / 1000);
+      $("stageSub").textContent = s < 30 ? `This can take up to a minute. (${s}s)` : `Still starting (${s}s). You can wait, try again or cancel.`;
+      if (s >= 30) $("stageActions").hidden = false;
+    }, 1000);
+  }
+  img.addEventListener("load", () => {
+    if (!haveFrame) { haveFrame = true; img.classList.add("ready"); $("stageStatus").hidden = true; }
+  });
+  async function cancelServer() {
+    if (!sid) return; const id = sid; sid = null;
+    await api(`auth/handshake/${id}`, { method: "DELETE" }).catch(() => null);
+  }
   function stopAll() { ended = true; looping = false; clearInterval(statusTimer); statusTimer = null; blurProxy();
+    clearInterval(startTimer); startTimer = null;
     $("password").value = ""; proxy.value = ""; pending = null;
     if (lastUrl) { URL.revokeObjectURL(lastUrl); lastUrl = null; img.removeAttribute("src"); } }
   // Every outcome ends on a visible panel with a next step, never on an empty screen.
@@ -122,7 +173,8 @@
   function showForm(error) {
     $("result").hidden = true; $("start").hidden = true; stage.style.display = "none";
     $("cancel").hidden = true; $("site").hidden = true; $("credentials").hidden = false;
-    $("connectBtn").disabled = false; $("formError").textContent = error || ""; sid = null; ended = false;
+    $("connectBtn").disabled = false; $("formError").textContent = error || ""; $("formError").style.color = "";
+    sid = null; ended = false;
     msg("Connect Pocket Option");
   }
   async function errorText(r, fallback) {
@@ -131,12 +183,24 @@
     return fallback;
   }
   function expired() { showResult("bad", "Login link expired", "Send /at_login in Telegram to get a new link.", false); }
-  $("forceBtn").onclick = () => { forceLogin = true; showForm(""); };
-  $("retryBtn").onclick = async () => {
-    if (sid) { const id = sid; sid = null; await api(`auth/handshake/${id}`, { method: "DELETE" }).catch(() => null); }
-    showForm("");
+  // "Sign in again anyway": the next login replaces the saved sessions (old ones are wiped on success).
+  $("forceBtn").onclick = () => {
+    forceLogin = true; showForm("");
+    $("connectBtn").textContent = "Replace saved session";
+    $("formError").textContent = "Enter your password again. Your old saved session is replaced when this sign-in finishes.";
+    $("formError").style.color = "var(--muted)";
+    setTimeout(() => $(($("email").value ? "password" : "email")).focus(), 50);
   };
+  $("retryBtn").onclick = async () => { await cancelServer(); showForm(""); };
+  $("stageRetry").onclick = async () => { await cancelServer(); stopAll(); showForm(""); };
+  $("stageCancel").onclick = () => $("cancel").click();
   $("closeBtn").onclick = () => { if (tg) { try { tg.close(); return; } catch (e) {} } window.close(); };
+  // Page closed mid-login: stop the server's browser now instead of after the full timeout (memory).
+  window.addEventListener("pagehide", () => {
+    if (!sid || ended) return;
+    try { fetch(new URL(`auth/handshake/${sid}`, base), { method: "DELETE", keepalive: true,
+                headers: { "Authorization": "Bearer " + token } }); } catch (e) {}
+  });
 
   // ---- start ------------------------------------------------------------------------------------
   let forceLogin = false;
@@ -144,7 +208,11 @@
     $("credentials").hidden = true; $("result").hidden = true; submittedAt = 0; lastNotice = "";
     $("start").hidden = true; msg("Opening the login page… (this can take ~10 seconds)");
     stage.style.display = "block";            // so we can measure it: the site is rendered at exactly this size
-    const w = Math.round(stage.clientWidth), h = Math.round(stage.clientHeight);
+    startWatch();
+    let w = Math.round(stage.clientWidth), h = Math.round(stage.clientHeight);
+    // Telegram can report a half-open window first: fall back to the window size (server clamps anyway).
+    if (w < 200) w = Math.min(window.innerWidth || 390, 520);
+    if (h < 200) h = Math.max((window.innerHeight || 844) - 48, 480);
     let r;
     try { r = await api("auth/handshake", { method: "POST", body: JSON.stringify({ width: w, height: h, full_view: fullView === true, force: forceLogin }) }); }
     catch (e) { r = null; }
@@ -156,9 +224,12 @@
     }
     const started = await r.json();
     if (started.reused) {      // saved session still works: no new browser sign-in (avoids broker IP blocks)
-      showResult("good", "Already connected",
-        "Your saved Pocket Option session (" + (started.kinds || []).join(" + ") + ") is reused. " +
-        "No new sign-in was needed. Return to Telegram and tap 🤖 Start Auto-Trade.", false);
+      const kinds = (started.kinds || []).map(k => k === "real" ? "Real" : "Demo").join(" + ");
+      showResult("good", "Already connected", started.verified === false
+        ? "A saved Pocket Option session (" + kinds + ") was found but could not be checked right now. " +
+          "If trading fails, tap Sign in again anyway to replace it."
+        : "Your saved Pocket Option session (" + kinds + ") is reused. " +
+          "No new sign-in was needed. Return to Telegram and tap 🤖 Start Auto-Trade.", false);
       $("forceBtn").hidden = false;
       return false;
     }
@@ -201,6 +272,7 @@
       if (ended) return;
       if (!status || status.state !== "waiting_for_login") {
         if (status && !["starting", "waiting_for_login"].includes(status.state)) return refreshStatus();
+        await cancelServer();                    // free the server's browser before giving up
         return showResult("bad", "Pocket Option is not responding", "Try again in a minute.", true);
       }
       msg("Signing in…");
@@ -211,8 +283,14 @@
         const id = sid; sid = null; api(`auth/handshake/${id}`, { method: "DELETE" }).catch(() => null);
         return showResult("bad", "Please wait", text, true);
       }
+      if (r.status === 400) {                    // e.g. HTTPS required: nothing to finish below
+        const text = await errorText(r, "Could not submit sign-in.");
+        await cancelServer();
+        return showResult("bad", "Could not sign in", text, true);
+      }
       if (!r.ok) {
-        msg(await errorText(r, "Could not submit sign-in.") + " You can finish on the Pocket Option page below.", "bad");
+        const text = await errorText(r, "Could not submit sign-in.") + " You can finish on the Pocket Option page below.";
+        msg(text, "bad"); if (!haveFrame) stageStatus(text, "");
         return;
       }
       submittedAt = Date.now();
@@ -234,8 +312,12 @@
     try {
       const [s, v] = await Promise.all([api(`auth/handshake/${sid}/screen`), api(`auth/handshake/${sid}/view`)]);
       if (s.status === 401 || v.status === 401) return expired();
+      if (s.status === 204 || v.status === 204) return;                          // browser still opening
       if (s.status === 409 || v.status === 409) { refreshStatus(); return; }     // browser already closed
-      if (s.ok) { const u = URL.createObjectURL(await s.blob()); img.src = u; if (lastUrl) URL.revokeObjectURL(lastUrl); lastUrl = u; }
+      if (s.ok) {
+        const blob = await s.blob();
+        if (blob.size && !ended) { const u = URL.createObjectURL(blob); img.src = u; if (lastUrl) URL.revokeObjectURL(lastUrl); lastUrl = u; }
+      }
       if (v.ok) applyView(await v.json());
     } catch (e) {}
   }
@@ -293,6 +375,7 @@
   let down = null, scrollSent = 0, scrollAcc = 0;
   stage.addEventListener("pointerdown", (e) => {
     if (!sid || ended) return;
+    if (!$("stageStatus").hidden) return;      // loading panel (and its buttons) is on top: not a tap on the site
     stage.setPointerCapture(e.pointerId);
     down = { x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY, moved: false };
   });
@@ -339,6 +422,7 @@
     let s;
     try { s = await r.json(); } catch (e) { return; }
     if (s.state === "starting") msg("Opening the login page…");
+    else if (!haveFrame && s.state === "waiting_for_login") stageStatus("Loading the Pocket Option page…", "");
     else if (s.state === "waiting_for_login") {
       if (s.hint) msg(s.hint);
       else if (!submittedAt) msg("Log in as you normally would (email and password, or Google).");
@@ -346,7 +430,9 @@
     else if (s.state === "capturing") msg("Logged in. Saving your Demo and Real sessions…");
     else if (s.state === "done") {
       const kinds = (s.kinds || []).map(k => k === "real" ? "Real" : "Demo").join(" and ") || "Pocket Option";
-      showResult("good", "Account connected", `${kinds} account connected and encrypted. Go back to Telegram and send /at_start — your bot starts in Demo mode.`, false);
+      showResult("good", forceLogin ? "Saved session replaced" : "Account connected",
+        `${kinds} account connected and encrypted` + (forceLogin ? " (your old saved session was replaced)" : "") +
+        ". Go back to Telegram and send /at_start — your bot starts in Demo mode.", false);
       if (tg) setTimeout(() => { try { tg.close(); } catch (e) {} }, 4000);
     }
     else if (s.state === "timeout") showResult("bad", "Sign-in timed out", s.message || "Send /at_login for a new link.", false);

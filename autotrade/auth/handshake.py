@@ -53,6 +53,8 @@ LOW_MEMORY_ARGS = (
 )
 BLOCKED_RESOURCE_TYPES = frozenset({"image", "font", "media", "stylesheet"})
 CLOSE_TIMEOUT = 10.0
+SCREENSHOT_TIMEOUT = 8.0      # a frame that takes longer is skipped; the page keeps its last picture
+IDLE_TIMEOUT = 150.0          # no poll from the phone for this long = page closed: free Chromium
 CABINET_SWITCH_DELAY = 3.5   # seconds between Real and Demo cabinet pages (rapid switching -> "Error. Please try later.")
 VIEWPORT = {"width": 390, "height": 844}     # a phone: the site serves its mobile login layout
 DEVICE_SCALE = 2
@@ -388,7 +390,10 @@ class PlaywrightBackend:
         page = self._page
         if page is None:
             raise RuntimeError("browser is not open")
-        return await page.screenshot(type="jpeg", quality=50 if self._low_memory else 60)
+        # Time-boxed and without waiting for animations: a busy or navigating page must never stall the
+        # phone's live view (that showed as a black screen).
+        return await page.screenshot(type="jpeg", quality=50 if self._low_memory else 60,
+                                     timeout=SCREENSHOT_TIMEOUT * 1000, animations="disabled", caret="initial")
 
     async def view(self) -> dict[str, Any]:
         """Phone viewport size, the focused input (if any) and which site is showing. Never a password."""
@@ -568,6 +573,8 @@ class HandshakeSession:
     task: asyncio.Task | None = None
     kinds: list[str] = field(default_factory=list)
     challenge: str | None = None     # turnstile | captcha | two_factor while the broker page shows one
+    replace: bool = False            # "Sign in again anyway": this login replaces every saved session
+    last_seen: float = 0.0           # loop time of the phone's last poll (abandoned pages are closed)
 
     @property
     def hint(self) -> str | None:
@@ -588,7 +595,8 @@ class HandshakeSession:
         return None
 
 
-TokenSink = Callable[[str, dict[str, str], dict[str, Any]], Awaitable[None]]
+# Returns the account kinds actually stored (None = all captured kinds).
+TokenSink = Callable[[str, dict[str, str], dict[str, Any]], Awaitable["list[str] | None"]]
 FailureNotice = Callable[[str, str], None]     # (user_id, user-facing message), e.g. a Telegram alert
 
 
@@ -607,14 +615,16 @@ class HandshakeManager:
                 del self._sessions[sid]
 
     async def start(self, user_id: str, viewport: tuple[int, int] | None = None,
-                    full_view: bool = False) -> HandshakeSession:
+                    full_view: bool = False, replace: bool = False) -> HandshakeSession:
         self._prune()
         for s in list(self._sessions.values()):
             if s.user_id == user_id and s.active:
                 await self.cancel(s.id, user_id)
         if sum(1 for s in self._sessions.values() if s.active) >= self._cfg.max_handshakes:
             raise RuntimeError("too many logins in progress, try again shortly")
-        session = HandshakeSession(secrets.token_urlsafe(24), user_id, created_at=self._clock.utcnow(), backend=self._factory())
+        session = HandshakeSession(secrets.token_urlsafe(24), user_id, created_at=self._clock.utcnow(),
+                                   backend=self._factory(), replace=bool(replace),
+                                   last_seen=asyncio.get_running_loop().time())
         if viewport and hasattr(session.backend, "set_viewport"):
             session.backend.set_viewport(*viewport)
         if full_view and hasattr(session.backend, "show_full_page"):
@@ -627,13 +637,17 @@ class HandshakeManager:
         s = self._sessions.get(session_id)
         if s is None or s.user_id != user_id:   # same answer for "missing" and "someone else's"
             raise KeyError(session_id)
+        try:
+            s.last_seen = asyncio.get_running_loop().time()
+        except RuntimeError:
+            pass
         return s
 
     async def screenshot(self, session_id: str, user_id: str) -> bytes:
         s = self.get(session_id, user_id)
         if not s.active or s.backend is None:
             raise RuntimeError("login session is not active")
-        return await s.backend.screenshot()
+        return await asyncio.wait_for(s.backend.screenshot(), timeout=SCREENSHOT_TIMEOUT + 2)
 
     async def view(self, session_id: str, user_id: str) -> dict[str, Any]:
         s = self.get(session_id, user_id)
@@ -674,10 +688,26 @@ class HandshakeManager:
             log.info("could not deliver the login failure notice")
 
     async def _run(self, s: HandshakeSession) -> None:
+        watchdog = asyncio.create_task(self._watch_idle(s), name=f"handshake-idle:{s.id[:6]}")
         try:
             await self._run_inner(s)
         finally:
+            watchdog.cancel()
             self._report(s)
+
+    async def _watch_idle(self, s: HandshakeSession) -> None:
+        """The phone polls every second or two. If it stops (page closed, Telegram minimised for good),
+        the login is cancelled so its Chromium does not hold memory until the full login timeout."""
+        idle = float(getattr(self._cfg, "handshake_idle_timeout", IDLE_TIMEOUT) or IDLE_TIMEOUT)
+        loop = asyncio.get_running_loop()
+        while s.active:
+            await asyncio.sleep(min(5.0, idle / 3))
+            if s.active and s.state != "capturing" and loop.time() - s.last_seen > idle:
+                log.info("login page stopped polling; closing its browser")
+                s.error = "abandoned"
+                if s.task is not None:
+                    s.task.cancel()
+                return
 
     async def _run_inner(self, s: HandshakeSession) -> None:
         backend = s.backend
@@ -727,8 +757,9 @@ class HandshakeManager:
             await asyncio.shield(backend.close())      # browser is closed before anything else happens
             s.backend = None
         try:
-            await self._sink(s.user_id, tokens, meta)
-            s.kinds, s.state = sorted(tokens), "done"
+            meta["replace"] = s.replace
+            stored = await self._sink(s.user_id, tokens, meta)
+            s.kinds, s.state = sorted(tokens if stored is None else stored), "done"
         except Exception as exc:
             s.state, s.error = "failed", "store_failed"
             log.warning("could not store captured tokens: %s", type(exc).__name__)

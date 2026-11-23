@@ -30,6 +30,7 @@ class Config:
     feed_ssid_env: str = "AUTOTRADE_FEED_SSID"  # name of the env var holding the feed account SSID
     handshake_timeout: float = 300.0
     max_handshakes: int = 1           # one Chromium at a time fits Render's 512 MB instance
+    handshake_idle_timeout: float = 150.0  # login page closed / stopped polling: free its Chromium
     headless: bool = True
     low_memory: bool = True           # single-process Chromium with a small JS heap (512 MB hosts)
     block_login_assets: bool = True   # no images/fonts/media/stylesheets from the broker during login
@@ -57,6 +58,7 @@ class Config:
             max_workers=int(_num("AUTOTRADE_MAX_WORKERS", 200)),
             handshake_timeout=_num("AUTOTRADE_HANDSHAKE_TIMEOUT", 300),
             max_handshakes=int(_num("AUTOTRADE_MAX_HANDSHAKES", 1)),
+            handshake_idle_timeout=_num("AUTOTRADE_HANDSHAKE_IDLE_TIMEOUT", 150),
             headless=_bool("AUTOTRADE_HEADLESS", True),
             low_memory=_bool("AUTOTRADE_LOW_MEMORY", True),
             block_login_assets=_bool("AUTOTRADE_BLOCK_LOGIN_ASSETS", True),

@@ -116,8 +116,10 @@ class SignalIn(BaseModel):
 class HandshakeStart(BaseModel):
     """The phone's own screen size (CSS px), so the site is rendered to fit it."""
     model_config = ConfigDict(extra="forbid")
-    width: int | None = Field(None, ge=200, le=4000)
-    height: int | None = Field(None, ge=200, le=4000)
+    # Any size is accepted and clamped to a phone layout by the browser relay: a Telegram window that is
+    # still half-open (small height) must not turn into an error page.
+    width: int | None = Field(None, ge=0, le=10000)
+    height: int | None = Field(None, ge=0, le=10000)
     full_view: bool = False     # the user will sign in on the broker page itself (styles and pictures load)
     force: bool = False         # sign in again even though a saved session still works
 
@@ -154,8 +156,11 @@ def is_secure_request(request: Request, trust_proxy: bool) -> bool:
     if request.url.scheme == "https":
         return True
     if trust_proxy:
-        proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
-        if proto == "https":
+        h = request.headers
+        proto = h.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+        forwarded = h.get("forwarded", "").split(",")[0].lower().replace(" ", "")
+        if proto == "https" or "proto=https" in forwarded or h.get("x-forwarded-ssl", "").lower() == "on" \
+                or '"scheme":"https"' in h.get("cf-visitor", "").replace(" ", ""):
             return True
     return request.client is not None and request.client.host in {"127.0.0.1", "::1", "testclient"}
 
@@ -336,7 +341,8 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
                 return JSONResponse({"reused": True, "state": "done", **reused}, status_code=200)
         vp = (body.width, body.height) if body and body.width and body.height else None
         try:
-            s = await rt.handshakes.start(p.user_id, vp, full_view=bool(body and body.full_view))
+            s = await rt.handshakes.start(p.user_id, vp, full_view=bool(body and body.full_view),
+                                          replace=bool(body and body.force))
         except RuntimeError:
             raise HTTPException(503, {"error": "busy", "message": TOO_MANY_LOGINS}) from None
         except Exception as exc:     # never a blank 500 page
@@ -359,7 +365,8 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
 
     @app.get("/auth/handshake/{session_id}/screen")
     async def handshake_screen(session_id: str, p: Principal = Depends(login)):
-        _get(session_id, p)
+        if _get(session_id, p).state == "starting":
+            return Response(status_code=204)      # browser still opening: the page keeps its loading panel
         try:
             return Response(await rt.handshakes.screenshot(session_id, p.user_id), media_type="image/jpeg")
         except Exception:       # not active, navigating or the browser just closed
@@ -369,7 +376,8 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
     async def handshake_view(session_id: str, p: Principal = Depends(login)):
         """Phone viewport size + the focused input's position/type, so the page can place a native
         input over it. Password values are never returned."""
-        _get(session_id, p)
+        if _get(session_id, p).state == "starting":
+            return Response(status_code=204)
         try:
             return await rt.handshakes.view(session_id, p.user_id)
         except Exception:

@@ -95,6 +95,12 @@ class TokenVault:
     async def delete_all(self, user_id: str) -> None:
         await self._repo.delete_credentials(user_id)
 
+    async def delete(self, user_id: str, kind: str) -> None:
+        """Erase one account slot (Demo or Real); the other slot is untouched."""
+        if kind not in KINDS:
+            raise VaultError("unknown account kind")
+        await self._repo.delete_credential(user_id, kind)
+
     async def rewrap(self, user_id: str) -> int:
         """Re-encrypt this user's tokens under the active key (key rotation). Returns rows changed."""
         changed = 0
