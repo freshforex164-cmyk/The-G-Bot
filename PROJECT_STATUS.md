@@ -1,5 +1,4 @@
-# GBot — Phase 3 status (2026-11-23, signal pipeline update)
-
+# GBot — Phase 3 status (2026-11-23, CP8: tests 233 passed/4 skipped, tests/ 176 passed)
 ## Commits on main (pushed via GitHub API, remote tree verified after each)
 | Checkpoint | Commit | Scope |
 |---|---|---|
@@ -13,7 +12,8 @@
 | 1b | `451f531896b0c8b0e985211b177d06e19f42e5c4` | "Sign in again anyway" replaces stale sessions; login view never blank |
 | 2b | `90097575c84aee3617df3cf4d8d6428b864b4d86` | PostgreSQL check: wiping one slot keeps the other |
 | 6b | `a2f0443821de9e2b2594b79d3bda37259aea545e` | Re-login verification report |
-| 7 | commit adding this version | Signal → trade pipeline fix, Auto-Trade vs Signal Mode, threaded alerts |
+| 7 | `517acb1fd62f8497f6c86b8f5f3fae9848f50c25` | Signal → trade pipeline fix, Auto-Trade vs Signal Mode, threaded alerts |
+| 8 | `9ff4aac9715695eec1c811a1574735aa81f91fdc` | Login browser memory safety (flags, throttle, guard, verified close) |
 
 ## Implemented
 - Memory (render.yaml, Dockerfile): MALLOC_ARENA_MAX=2, MALLOC_TRIM_THRESHOLD_=131072, NODE_OPTIONS 256 MB
@@ -54,10 +54,6 @@
   sessions; loading panel shown, then the live picture; page close cancels the server browser.
 - New tests: re-login override (7), stake ladder, routing (14), tracking (8), PostgreSQL settings + dual vault.
 - Schema applied twice (idempotent); invalid `stake_mode` rejected by its check constraint.
-
-## Checkpoint 8 - login browser memory (512 MB)
-- `9ff4aac`: no GPU, no /dev/shm, single-process Chromium; picture 1 per 1.5 s; 150/40 MB memory guard;
-  verified close + leftover kill; quiet TargetClosedError. Tests: 233 passed, 4 skipped; tests/ 176 passed.
 
 ## Live verification
 - Render deploy and memory under real load: NOT RUN.
