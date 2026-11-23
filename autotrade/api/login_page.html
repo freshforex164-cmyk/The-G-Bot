@@ -339,7 +339,10 @@
     let s;
     try { s = await r.json(); } catch (e) { return; }
     if (s.state === "starting") msg("Opening the login page…");
-    else if (s.state === "waiting_for_login") { if (!submittedAt) msg("Log in as you normally would (email and password, or Google)."); }
+    else if (s.state === "waiting_for_login") {
+      if (s.hint) msg(s.hint);
+      else if (!submittedAt) msg("Log in as you normally would (email and password, or Google).");
+    }
     else if (s.state === "capturing") msg("Logged in. Saving your Demo and Real sessions…");
     else if (s.state === "done") {
       const kinds = (s.kinds || []).map(k => k === "real" ? "Real" : "Demo").join(" and ") || "Pocket Option";

@@ -117,12 +117,6 @@ class HandshakeStart(BaseModel):
     force: bool = False         # sign in again even though a saved session still works
 
 
-class DirectSsid(BaseModel):
-    """Direct SSID login: the user's own ``42["auth",{...}]`` value; no browser is started."""
-    model_config = ConfigDict(extra="forbid")
-    ssid: SecretStr = Field(min_length=20, max_length=4096)
-
-
 class StopBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     drain: bool = True
@@ -352,31 +346,11 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
         except KeyError:
             raise HTTPException(404, "unknown login session") from None
 
-    @app.post("/auth/ssid")
-    async def direct_ssid(body: DirectSsid, p: Principal = Depends(full)):
-        """Store a pasted SSID (Demo or Real by its isDemo flag) after one WebSocket check."""
-        try:
-            limited(credentials_limit, p.user_id)
-        except HTTPException:
-            body.ssid = SecretStr("")
-            raise
-        try:
-            res = await rt.manager.store_direct_ssid(p.user_id, body.ssid.get_secret_value().strip())
-        except Exception as exc:          # malformed: never echo the value back
-            log.info("direct SSID refused: %s", type(exc).__name__)
-            raise HTTPException(422, {"error": "invalid_ssid",
-                                      "message": "That is not a valid Pocket Option SSID."}) from None
-        finally:
-            body.ssid = SecretStr("")
-        if res["status"] == "rejected":
-            raise HTTPException(409, {"error": "ssid_rejected", "kind": res["kind"],
-                                      "message": "Pocket Option rejected this SSID (expired or logged out)."})
-        return res
-
     @app.get("/auth/handshake/{session_id}")
     async def handshake_status(session_id: str, p: Principal = Depends(login)):
         s = _get(session_id, p)
-        return {"session_id": s.id, "state": s.state, "error": s.error, "message": s.message, "kinds": s.kinds}
+        return {"session_id": s.id, "state": s.state, "error": s.error, "message": s.message, "kinds": s.kinds,
+                "challenge": s.challenge, "hint": s.hint}
 
     @app.get("/auth/handshake/{session_id}/screen")
     async def handshake_screen(session_id: str, p: Principal = Depends(login)):

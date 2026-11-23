@@ -61,6 +61,10 @@ ADMIN_ONLY_COMMANDS = {
     "testsignal",
 }
 COMMAND_REPLY_COOLDOWN_SECONDS = 20.0
+SSID_REFUSED_TEXT = (
+    "🔒 Session codes are not accepted any more, so your message was deleted and nothing was saved.\n"
+    "Connect with the secure Pocket Option login instead: send /at_login."
+)
 
 
 class TelegramBotClient:
@@ -446,19 +450,24 @@ class TelegramCommandHandler:
             except (TypeError, ValueError):
                 pass
         text = message.get("text")
-        if (chat_id is not None and isinstance(text, str) and text.lstrip().startswith('42["auth"')
-                and sender_id is not None and int(chat_id) == sender_id):
-            text = "/at_ssid " + text.strip()     # a pasted SSID frame without the command: same as /at_ssid
+        if chat_id is not None and isinstance(text, str) and '42["auth"' in text:
+            # Direct SSID login was removed. A pasted session value is still a secret: delete it from the
+            # chat, never store it, and point the user at the secure login.
+            if isinstance(message.get("message_id"), int):
+                try:
+                    await self.client.delete_message(chat_id, message["message_id"])
+                except Exception:
+                    logger.warning("Could not delete a pasted session message.")
+            try:
+                await self.client.send_message(chat_id, SSID_REFUSED_TEXT, parse_mode=None)
+            except Exception:
+                logger.warning("Could not answer a pasted session message.")
+            return
         if chat_id is None or not isinstance(text, str) or not text.startswith("/"):
             return
         parts = text.split(maxsplit=1)
         command = parts[0][1:].split("@", 1)[0].lower()
         args = parts[1] if len(parts) > 1 else ""
-        if command == "at_ssid" and args and isinstance(message.get("message_id"), int):
-            try:  # the pasted SSID is a login secret: remove it from the chat at once
-                await self.client.delete_message(chat_id, message["message_id"])
-            except Exception:
-                logger.warning("Could not delete the pasted SSID message.")
         await self._dispatch(command, chat_id, sender_id=sender_id, args=args)
 
     async def _dispatch(
@@ -878,8 +887,7 @@ class TelegramCommandHandler:
         if data.startswith("at:") and not data.startswith(("at:stake:", "at:go")):
             command, args = {"at:balance": ("at_balance", ""), "at:stats": ("at_stats", ""),
                              "at:demo": ("at_demo", ""), "at:live": ("at_live", ""),
-                             "at:liveconfirm": ("at_live", "confirm"), "at:ssid": ("at_ssid", ""),
-                             "at:ssid:demo": ("at_ssid", "demo"), "at:ssid:real": ("at_ssid", "real"),
+                             "at:liveconfirm": ("at_live", "confirm"),
                              "at:login": ("at_login", "")}.get(data, ("", ""))
             if command and private:
                 await self._autotrade_safe(command, chat_id, int(sender_id), args, False)

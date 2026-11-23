@@ -1,4 +1,4 @@
-"""Saved-session reuse (no extra browser logins), Direct SSID login, the pause between the Real and
+"""Saved-session reuse (no extra browser logins), removed Direct SSID login, the pause between the Real and
 Demo cabinet pages, Real trading switched on, and the balance check before every auto-trade."""
 import asyncio
 import unittest
@@ -69,29 +69,13 @@ class SessionReuseApiTests(unittest.TestCase):
             self.assertEqual(c.post("/auth/handshake", headers=self.h, json={"force": True}).status_code, 201)
         self.assertEqual(len(self.launched), 1)
 
-    def test_direct_ssid_stores_demo_and_real_by_their_own_flag(self):
-        with TestClient(self.app) as c:
-            demo = c.post("/auth/ssid", headers=self.h, json={"ssid": ssid_for("u1", "demo")})
-            real = c.post("/auth/ssid", headers=self.h, json={"ssid": ssid_for("u1", "real")})
-            status = c.get("/auth/status", headers=self.h).json()
-        self.assertEqual((demo.status_code, demo.json()["kind"], demo.json()["status"]), (200, "demo", "active"))
-        self.assertEqual((real.status_code, real.json()["kind"]), (200, "real"))
-        self.assertEqual((status["demo"]["status"], status["real"]["status"]), ("active", "active"))
-        self.assertEqual(self.launched, [])
-
-    def test_direct_ssid_rejected_by_broker_or_malformed_is_refused(self):
-        self.env.world("u1").reject = True
+    def test_direct_ssid_endpoint_is_removed(self):
         with TestClient(self.app) as c:
             r = c.post("/auth/ssid", headers=self.h, json={"ssid": ssid_for("u1", "demo")})
-            self.assertEqual((r.status_code, r.json()["detail"]["error"]), (409, "ssid_rejected"))
-            bad = c.post("/auth/ssid", headers=self.h, json={"ssid": "not-a-session-value-at-all"})
-            self.assertEqual((bad.status_code, bad.json()["detail"]["error"]), (422, "invalid_ssid"))
-            self.assertNotIn("not-a-session", bad.text)
-
-    def test_login_link_token_cannot_store_an_ssid(self):
-        login = {"Authorization": f"Bearer {token(self.env.cfg.jwt_secret, scope='login')}"}
-        with TestClient(self.app) as c:
-            self.assertEqual(c.post("/auth/ssid", headers=login, json={"ssid": ssid_for("u1")}).status_code, 403)
+            status = c.get("/auth/status", headers=self.h).json()
+        self.assertIn(r.status_code, (404, 405))
+        self.assertEqual(status["demo"]["status"], "missing")
+        self.assertFalse(hasattr(self.env.rt.manager, "store_direct_ssid"))
 
 
 class CabinetSwitchDelayTests(unittest.IsolatedAsyncioTestCase):

@@ -54,11 +54,37 @@ class TradingManager:
         self._risk = risk or RiskManager()
         self._clock = clock or Clock()
         self._balances = BalancePool(repo, vault, broker_factory, self._clock,
-                                     limit=min(16, max(2, cfg.max_workers * 2)))
+                                     limit=min(16, max(2, cfg.max_workers * 2)),
+                                     on_expired=self._on_session_expired)
+        self._expiry_notified: set[tuple[str, str]] = set()
         self.halted = cfg.trading_halted
         self._workers: dict[str, UserWorker] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+
+    async def _on_session_expired(self, user_id: str, kind: str, reason: str) -> None:
+        """A stored session was rejected by the broker: mark it expired and prompt /at_login (once)."""
+        await self.vault.mark_expired(user_id, kind, reason)
+        key = (user_id, kind)
+        if key in self._expiry_notified:
+            return
+        if len(self._expiry_notified) >= 10000:      # bounded: never grows with abandoned users
+            self._expiry_notified.clear()
+        self._expiry_notified.add(key)
+        try:
+            await self.repo.audit(user_id, "session_expired", {"kind": kind})
+        except Exception:
+            pass
+        if self._notifier is not None:
+            from ..notify import session_expired_text
+            try:
+                self._notifier.send(user_id, session_expired_text(kind))
+            except Exception:
+                log.info("could not send the re-login prompt for user %s", user_id)
+
+    def _session_renewed(self, user_id: str, kinds) -> None:
+        for kind in kinds:
+            self._expiry_notified.discard((user_id, kind))
 
     def _lock(self, user_id: str) -> asyncio.Lock:
         return self._locks.setdefault(user_id, asyncio.Lock())
@@ -90,7 +116,7 @@ class TradingManager:
             worker = UserWorker(user_id, repo=self.repo, vault=self.vault, feed=self.feed,
                                 broker_factory=self._factory, risk=self._risk, clock=self._clock,
                                 is_halted=lambda: self.halted, reconnect_base=self._reconnect_base,
-                                notifier=self._notifier)
+                                notifier=self._notifier, on_session_expired=self._on_session_expired)
             worker.apply_settings(s)
             self._workers[user_id] = worker
             task = asyncio.create_task(worker.run(), name=f"worker:{user_id}")
@@ -182,25 +208,6 @@ class TradingManager:
         return {"kinds": sorted(k for k, v in (await self.vault.status(user_id)).items()
                                 if v.get("status") == "active"), "verified": res.ok}
 
-    async def store_direct_ssid(self, user_id: str, ssid: str) -> dict[str, Any]:
-        """Direct SSID login: the user pastes their own Pocket Option ``42["auth",...]`` value. The
-        account type comes from its isDemo flag (never converted). Checked over WebSocket once."""
-        from ..auth.ssid import account_kind
-        kind = account_kind(ssid)
-        if kind is None:
-            raise SettingsError("not a Pocket Option SSID")
-        await self.vault.store(user_id, kind, ssid, {"method": "direct", "derived": False})
-        await self._balances.discard(user_id, kind)
-        await self.repo.save_settings(user_id, await self.repo.get_settings(user_id))  # Demo default for new users
-        if self.is_running(user_id):
-            return {"kind": kind, "verified": False, "status": "saved"}
-        res = await self.health.check(user_id, kind)
-        if res.status in ("missing", "expired"):
-            await self.repo.audit(user_id, "direct_ssid_rejected", {"kind": kind})
-            return {"kind": kind, "verified": False, "status": "rejected"}
-        await self.repo.audit(user_id, "direct_ssid_saved", {"kind": kind})
-        return {"kind": kind, "verified": res.ok, "status": "active" if res.ok else "saved"}
-
     # -- GBot signals -------------------------------------------------------------------------
     async def submit_signal(self, user_id: str, decision: Decision) -> dict[str, Any]:
         """Hand a signal the user just received in Telegram to their running bot. Never raises for
@@ -246,6 +253,7 @@ class TradingManager:
         """Right after a login: open a WebSocket with each newly captured session, confirm the broker
         accepts it and read that account's own balance. Never places a trade."""
         out: dict[str, Any] = {}
+        self._session_renewed(user_id, kinds)
         for kind in kinds:
             value, error = await self._read_balance_once(user_id, kind)
             out[kind] = {"balance": value, "error": error}
@@ -275,8 +283,7 @@ class TradingManager:
             from ..errors import SessionExpired
             from .broker import map_exception
             if isinstance(map_exception(exc), SessionExpired):
-                await self.vault.mark_expired(user_id, kind, "rejected during balance check")
-                return None, "session_expired"
+                return None, "session_expired"     # the pool closed it, marked it expired and asked for /at_login
             return None, "broker_unreachable"
         if raw is None or float(raw) < 0:
             return None, "balance_unavailable"

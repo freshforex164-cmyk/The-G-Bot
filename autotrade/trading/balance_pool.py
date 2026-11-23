@@ -2,6 +2,8 @@
 
 Never used for orders. Connections expire after 60 seconds of inactivity; a
 changed ciphertext invalidates only its account slot. No SSIDs are retained here.
+A session the broker rejects is torn down at once and reported through ``on_expired``
+(the manager marks it expired and sends the user an /at_login prompt).
 """
 from __future__ import annotations
 
@@ -21,8 +23,9 @@ class Entry:
 
 
 class BalancePool:
-    def __init__(self, repo, vault, factory, clock, *, limit=16, idle_seconds=60):
+    def __init__(self, repo, vault, factory, clock, *, limit=16, idle_seconds=60, on_expired=None):
         self.repo, self.vault, self.factory, self.clock = repo, vault, factory, clock
+        self.on_expired = on_expired
         self.limit, self.idle_seconds = max(1, limit), idle_seconds
         self.entries = {}
         self.lock = asyncio.Lock()
@@ -35,6 +38,18 @@ class BalancePool:
                 await asyncio.wait_for(entry.broker.close(), timeout=5)
             except Exception:
                 pass
+
+    async def _report_expired(self, user_id, kind, reason):
+        if self.on_expired is None:
+            return
+        try:
+            await self.on_expired(user_id, kind, reason)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_expiry(exc):
+        return isinstance(exc, Exception) and isinstance(map_exception(exc), SessionExpired)
 
     async def _expire(self):
         now = self.clock.monotonic()
@@ -78,18 +93,22 @@ class BalancePool:
                     await asyncio.wait_for(broker.connect(), timeout=25)
                     if await broker.is_demo() != (kind == "demo"):
                         raise SessionExpired("stored session account mismatch")
-                except BaseException:
+                except BaseException as exc:
                     try:
                         await asyncio.wait_for(broker.close(), timeout=5)
                     except Exception:
                         pass
+                    if self._is_expiry(exc):
+                        await self._report_expired(user_id, kind, "rejected by the broker")
                     raise
                 entry = Entry(broker, row.ciphertext, self.clock.monotonic())
                 self.entries[key] = entry
             try:
                 yield entry.broker
-            except BaseException:
-                await self._drop(key)
+            except BaseException as exc:
+                await self._drop(key)          # clean teardown: the socket is closed before anything else
+                if self._is_expiry(exc):
+                    await self._report_expired(user_id, kind, "rejected during balance check")
                 raise
             finally:
                 entry.used_at = self.clock.monotonic()

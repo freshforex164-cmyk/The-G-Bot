@@ -91,6 +91,12 @@ def low_balance_text(*, mode: str, asset: str, direction: str, stake: float, bal
             "Top up your account or lower the stake with /at_set stake <amount>.")
 
 
+def session_expired_text(kind: str) -> str:
+    which = "Real" if kind == "real" else "Demo"
+    return (f"🔐 Your Pocket Option {which} session has expired, so its connection was closed and no trades "
+            "will be placed on it.\nSend /at_login to reconnect.")
+
+
 def failed_text(*, asset: str, direction: str, setup: str = "") -> str:
     return (f"⚠️ Auto-Trade could not place {asset} {direction_line(direction)[2:]} ({setup_name(setup)}). "
             "Pocket Option did not accept the order; nothing was traded.")

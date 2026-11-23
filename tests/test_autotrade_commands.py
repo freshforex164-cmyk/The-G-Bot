@@ -74,8 +74,6 @@ class FakeService:
         self._record("auth_status", uid)
         return self.sessions
 
-    async def submit_ssid(self, uid, ssid):
-        self._record("submit_ssid", uid, ssid)
         return {"kind": "real" if '"isDemo":0' in ssid else "demo", "verified": True, "status": "active"}
 
     def login_link(self, uid):
@@ -205,25 +203,27 @@ class AutotradeCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.send("/at_login")
         self.assertIn("Already connected (Demo ✅ · Real ✅)", self.chat.last())
         rows = self.chat.sent[-1][2]["inline_keyboard"]
-        self.assertEqual(rows[1][0]["callback_data"], "at:ssid")
+        texts = [b["text"] for row in rows for b in row]
+        self.assertEqual(rows[0][0]["text"], "Log in to Pocket Option")
+        self.assertFalse(any("SSID" in t for t in texts))
 
-    async def test_login_menu_offers_direct_ssid_login(self):
+    async def test_login_menu_has_no_direct_ssid_option(self):
         await self.send("/at_login")
-        self.assertEqual(self.chat.sent[-1][2]["inline_keyboard"][1][0]["text"], "🔑 Advanced: Direct SSID Login")
+        texts = [b["text"] for row in self.chat.sent[-1][2]["inline_keyboard"] for b in row]
+        self.assertFalse(any("SSID" in t for t in texts))
 
-    async def test_direct_ssid_is_saved_and_the_message_deleted(self):
+    async def test_at_ssid_command_is_not_registered(self):
+        from autotrade_commands import ALL_COMMANDS
+        self.assertNotIn("at_ssid", ALL_COMMANDS)
+
+    async def test_pasted_ssid_is_deleted_and_not_submitted(self):
         ssid = '42["auth",{"session":"abc","isDemo":0,"uid":1,"platform":2}]'
         update = message(f"/at_ssid {ssid}")
         update["message"]["message_id"] = 77
         await self.handler.handle_update(update)
-        self.assertIn(("submit_ssid", USER, ssid), self.service.calls)
         self.assertEqual(self.chat.deleted, [(USER, 77)])
-        self.assertIn("Connected to your Pocket Option Real account", self.chat.last())
-
-    async def test_ssid_without_value_shows_help(self):
-        await self.send("/at_ssid")
-        self.assertIn("Direct SSID Login", self.chat.last())
-        self.assertFalse(any(c[0] == "submit_ssid" for c in self.service.calls))
+        self.assertIn("/at_login", self.chat.last())
+        self.assertNotIn("abc", self.chat.last())
 
     async def test_kill_switch_only_for_admin_in_admin_chat(self):
         await self.send("/at_halt")                                     # normal user

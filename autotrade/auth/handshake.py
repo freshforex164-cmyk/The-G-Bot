@@ -112,6 +112,55 @@ NOTICE_JS = """() => {
   }
   return null;
 }"""
+# Raw challenge signals only (iframe sources, a few selectors, page title/text excerpts); never input values.
+# ``classify_challenge`` turns them into turnstile | captcha | two_factor so the logic is testable offline.
+CHALLENGE_JS = """() => {
+  const vis = (el) => { const r = el.getBoundingClientRect(); const st = getComputedStyle(el);
+    return r.width >= 40 && r.height >= 40 && st.visibility !== 'hidden' && st.display !== 'none'; };
+  const frames = Array.from(document.querySelectorAll('iframe')).filter(vis).map(f => String(f.src || '').slice(0, 300));
+  const q = (s) => { try { return Array.from(document.querySelectorAll(s)).some(vis); } catch (e) { return false; } };
+  return {
+    frames: frames.slice(0, 20),
+    title: String(document.title || '').slice(0, 120),
+    text: String((document.body && document.body.innerText) || '').replace(/\\s+/g, ' ').slice(0, 4000),
+    turnstile: q('.cf-turnstile, #challenge-form, #cf-challenge-running, #challenge-stage, [name="cf-turnstile-response"]'),
+    captcha: q('.g-recaptcha, .h-captcha, #captcha, [class*="captcha" i]'),
+    otp: q('input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="2fa" i], input[name*="totp" i], input[name="code"], input[name*="verification" i]'),
+  };
+}"""
+TWO_FACTOR_WORDS = ("two-factor", "two factor", "2fa", "verification code", "authenticator", "one-time code",
+                    "code we sent", "code was sent", "enter the code", "confirmation code")
+TURNSTILE_WORDS = ("verify you are human", "checking your browser", "checking if the site connection is secure",
+                   "needs to review the security of your connection")
+CHALLENGE_HINTS = {
+    "turnstile": "Pocket Option is showing a Cloudflare security check. Tick \"Verify you are human\" on the "
+                 "Pocket Option page and wait for it to finish.",
+    "captcha": "Pocket Option is asking for a CAPTCHA. Solve the picture check on the Pocket Option page, then "
+               "continue signing in.",
+    "two_factor": "Pocket Option is asking for a two-factor (2FA) code. Type the code from your email or "
+                  "authenticator app into the Pocket Option page.",
+}
+
+
+def classify_challenge(sig: dict[str, Any] | None) -> str | None:
+    """turnstile | captcha | two_factor | None from CHALLENGE_JS signals. Invisible reCAPTCHA badges (always
+    present on some login pages) are not a challenge; only visible challenge widgets count."""
+    if not isinstance(sig, dict):
+        return None
+    frames = [str(f).lower() for f in (sig.get("frames") or [])]
+    title = str(sig.get("title") or "").lower()
+    text = str(sig.get("text") or "").lower()
+    if (sig.get("turnstile") or any("challenges.cloudflare.com" in f or "turnstile" in f for f in frames)
+            or "just a moment" in title or any(w in text for w in TURNSTILE_WORDS)):
+        return "turnstile"
+    if sig.get("otp") or any(w in text for w in TWO_FACTOR_WORDS):
+        return "two_factor"
+    visible_captcha = [f for f in frames if ("recaptcha" in f or "hcaptcha" in f) and "size=invisible" not in f]
+    if sig.get("captcha") or visible_captcha:
+        return "captcha"
+    return None
+
+
 ERROR_MESSAGES = {
     "broker_unreachable": "Pocket Option did not respond in time. Try again in a minute.",
     "browser_unavailable": "The secure sign-in browser could not start on the server. Try again in a minute.",
@@ -120,7 +169,18 @@ ERROR_MESSAGES = {
     "login_timeout": "The sign-in took too long and was closed. Send /at_login for a new link.",
     "store_failed": "You signed in, but the session could not be saved. Send /at_login to try again.",
     "capture_failed": "The sign-in could not be completed. Send /at_login to try again.",
+    "turnstile_blocked": "Pocket Option showed a Cloudflare security check (Turnstile) that was not completed, "
+                         "so the sign-in was closed and nothing was saved. Wait 10-15 minutes, send /at_login, "
+                         "and tick \"Verify you are human\" on the Pocket Option page as soon as it appears. "
+                         "If the check keeps looping, Pocket Option is limiting the server; try again later.",
+    "captcha_required": "Pocket Option asked for a CAPTCHA that was not solved in time, so the sign-in was closed "
+                        "and nothing was saved. Send /at_login and solve the picture check on the Pocket Option "
+                        "page before submitting.",
+    "two_factor_required": "Pocket Option asked for a two-factor (2FA) code that was not entered in time, so the "
+                           "sign-in was closed and nothing was saved. Send /at_login, sign in, and type the code "
+                           "from your email or authenticator app into the Pocket Option page within a few minutes.",
 }
+CHALLENGE_ERRORS = {"turnstile": "turnstile_blocked", "captcha": "captcha_required", "two_factor": "two_factor_required"}
 ALLOWED_KEYS = {"Enter", "Tab", "Backspace", "Delete", "Escape", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Space"}
 
 
@@ -158,6 +218,14 @@ def host_allowed(url: str, *, navigation: bool, hosts: tuple[str, ...] = ALLOWED
 
 class BrowserCrashed(RuntimeError):
     """Chromium died (usually out of memory) while the login was in progress."""
+
+
+class ChallengeBlocked(TimeoutError):
+    """The login timed out while the broker page was showing Turnstile, a CAPTCHA or a 2FA prompt."""
+
+    def __init__(self, challenge: str):
+        super().__init__(f"login blocked by {challenge}")
+        self.challenge = challenge
 
 
 def _host_in(host: str, hosts: tuple[str, ...]) -> bool:
@@ -203,6 +271,32 @@ class PlaywrightBackend:
         self._event = asyncio.Event()
         self._credential_lock = asyncio.Lock()
         self._crashed = False
+        self.challenge: str | None = None          # last verification step seen on the broker page
+        self._on_challenge: Callable[[str | None], None] | None = None
+        self._challenge_checked = 0.0
+
+    def set_challenge_listener(self, fn: Callable[[str | None], None]) -> None:
+        self._on_challenge = fn
+
+    async def detect_challenge(self) -> str | None:
+        """Look for Cloudflare Turnstile, CAPTCHA or 2FA on the visible broker page (best effort)."""
+        page = self._page
+        if page is None:
+            return self.challenge
+        try:
+            found = classify_challenge(await page.evaluate(CHALLENGE_JS))
+        except Exception:          # navigating: keep the last answer
+            return self.challenge
+        if found != self.challenge:
+            if found:
+                log.info("broker page shows a %s step", found)
+            self.challenge = found
+            if self._on_challenge is not None:
+                try:
+                    self._on_challenge(found)
+                except Exception:
+                    pass
+        return found
 
     def set_viewport(self, width: int, height: int) -> None:
         """Match the user's own screen so the site fills the phone edge to edge. Before open()."""
@@ -313,8 +407,10 @@ class PlaywrightBackend:
             except Exception:
                 notice = None
         host = (urlparse(page.url).hostname or "") if page.url else ""
+        challenge = await self.detect_challenge()
         return {"width": self._vp["width"], "height": self._vp["height"], "field": field,
-                "inputs": inputs, "host": host, "notice": notice}
+                "inputs": inputs, "host": host, "notice": notice, "challenge": challenge,
+                "hint": CHALLENGE_HINTS.get(challenge or "")}
 
     async def interact(self, event: dict[str, Any]) -> None:
         self.show_full_page()       # the user is using the broker page directly
@@ -353,12 +449,18 @@ class PlaywrightBackend:
         on_status("waiting_for_login")
         while not self._frames:
             self._check_alive()
+            if loop.time() - self._challenge_checked >= 2.0:
+                self._challenge_checked = loop.time()
+                await self.detect_challenge()
             remaining = deadline - loop.time()
             if remaining <= 0:
                 cookie = await self._session_cookie()
                 if cookie:  # fallback: same method as BinaryOptionsToolsV2.login()
                     return ({DEMO_KIND: build_ssid(cookie, DEMO_KIND), REAL_KIND: build_ssid(cookie, REAL_KIND)},
                             await self._capture_metadata("cookie", list(KINDS)))
+                await self.detect_challenge()
+                if self.challenge:
+                    raise ChallengeBlocked(self.challenge)
                 raise TimeoutError("login was not completed in time")
             try:
                 await asyncio.wait_for(self._event.wait(), timeout=min(remaining, 2.0))
@@ -465,6 +567,12 @@ class HandshakeSession:
     backend: CaptureBackend | None = None
     task: asyncio.Task | None = None
     kinds: list[str] = field(default_factory=list)
+    challenge: str | None = None     # turnstile | captcha | two_factor while the broker page shows one
+
+    @property
+    def hint(self) -> str | None:
+        """What the user must do on the broker page right now (None when nothing is blocking)."""
+        return CHALLENGE_HINTS.get(self.challenge or "") if self.active else None
 
     @property
     def active(self) -> bool:
@@ -474,18 +582,21 @@ class HandshakeSession:
     def message(self) -> str | None:
         """User-facing explanation of a failed/timed-out login (never internal details)."""
         if self.state == "timeout":
-            return ERROR_MESSAGES["login_timeout"]
+            return ERROR_MESSAGES.get(self.error or "", ERROR_MESSAGES["login_timeout"])
         if self.state == "failed":
             return ERROR_MESSAGES.get(self.error or "", ERROR_MESSAGES["capture_failed"])
         return None
 
 
 TokenSink = Callable[[str, dict[str, str], dict[str, Any]], Awaitable[None]]
+FailureNotice = Callable[[str, str], None]     # (user_id, user-facing message), e.g. a Telegram alert
 
 
 class HandshakeManager:
-    def __init__(self, cfg: Config, backend_factory: Callable[[], CaptureBackend], sink: TokenSink, clock: Clock | None = None):
+    def __init__(self, cfg: Config, backend_factory: Callable[[], CaptureBackend], sink: TokenSink, clock: Clock | None = None,
+                 on_failure: FailureNotice | None = None):
         self._cfg, self._factory, self._sink = cfg, backend_factory, sink
+        self._on_failure = on_failure
         self._clock = clock or Clock()
         self._sessions: dict[str, HandshakeSession] = {}
 
@@ -553,11 +664,28 @@ class HandshakeManager:
             backend, s.backend = s.backend, None
             await backend.close()
 
+    def _report(self, s: HandshakeSession) -> None:
+        """Tell the user (Telegram) why the login ended, with what to do next. Never internal details."""
+        if self._on_failure is None or s.state not in ("failed", "timeout"):
+            return
+        try:
+            self._on_failure(s.user_id, f"🔐 Pocket Option login: {s.message}")
+        except Exception:
+            log.info("could not deliver the login failure notice")
+
     async def _run(self, s: HandshakeSession) -> None:
+        try:
+            await self._run_inner(s)
+        finally:
+            self._report(s)
+
+    async def _run_inner(self, s: HandshakeSession) -> None:
         backend = s.backend
         assert backend is not None
         tokens: dict[str, str] = {}
         meta: dict[str, Any] = {}
+        if hasattr(backend, "set_challenge_listener"):
+            backend.set_challenge_listener(lambda c: setattr(s, "challenge", c))
         try:
             try:
                 await backend.open()
@@ -581,6 +709,11 @@ class HandshakeManager:
         except BrowserCrashed:
             s.state, s.error = "failed", "browser_crashed"
             log.warning("handshake browser crashed (likely out of memory)")
+            return
+        except ChallengeBlocked as exc:
+            s.challenge = exc.challenge
+            s.state, s.error = "timeout", CHALLENGE_ERRORS.get(exc.challenge, "login_timeout")
+            log.info("login timed out at a %s step", exc.challenge)
             return
         except TimeoutError:
             s.state, s.error = "timeout", "login_timeout"

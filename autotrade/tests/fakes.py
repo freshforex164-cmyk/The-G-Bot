@@ -52,6 +52,7 @@ class World:
         self.connects = 0
         self.closes = 0
         self.gate: asyncio.Event | None = None   # when set, results wait for it
+        self.balance_exc: Exception | None = None  # raised by balance() (e.g. a session rejected mid-use)
 
 
 class Bus:
@@ -100,6 +101,8 @@ class FakeBroker:
         return self.w.payout
 
     async def balance(self):
+        if self.w.balance_exc is not None:
+            raise self.w.balance_exc
         settled = sum(1 for _ in self.w.placed)
         return 10000.0 + settled   # changes after each trade so refreshes are observable
 

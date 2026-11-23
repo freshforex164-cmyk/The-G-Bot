@@ -1,5 +1,5 @@
 """Asset-first menu, the Auto-Trade setup screen (connection check, Demo/Real, trade amounts, balance
-check) and the /at_ssid Demo/Real menu."""
+check). Direct SSID login is gone: pasted session codes are deleted and refused."""
 from __future__ import annotations
 
 import unittest
@@ -94,25 +94,24 @@ class RefinementTests(unittest.IsolatedAsyncioTestCase):
         await self.handler.handle_update(tap("at:go"))
         self.assertLess(self.service.calls.index(("balance", USER, True)), self.service.calls.index(("start", USER)))
 
-    async def test_at_ssid_offers_demo_or_real(self):
-        await self.handler.handle_update(message("/at_ssid"))
-        self.assertEqual(buttons(self.last()["markup"])[:2], ["🧪 Demo Account", "💵 Real Account"])
-        await self.handler.handle_update(tap("at:ssid:real"))
-        self.assertIn('"isDemo":0', self.last()["text"])
+    async def test_ssid_menu_buttons_do_nothing(self):
+        before = len(self.client.visible.get(USER, {}))
+        for data in ("at:ssid", "at:ssid:demo", "at:ssid:real"):
+            await self.handler.handle_update(tap(data))
+        self.assertEqual(len(self.client.visible.get(USER, {})), before)
+        self.assertFalse(any(c[0] == "submit_ssid" for c in self.service.calls))
 
-    async def test_pasted_ssid_frame_connects_and_is_deleted(self):
-        update = message(REAL_SSID)
-        update["message"]["message_id"] = 88
-        await self.handler.handle_update(update)
-        self.assertIn(("submit_ssid", USER, REAL_SSID), self.service.calls)
-        self.assertIn(88, self.client.deletes)
-        self.assertIn("Connected to your Pocket Option Real account", self.last()["text"])
-
-    async def test_ssid_for_the_other_account_type_is_flagged(self):
-        await self.handler.handle_update(message("/at_ssid"))
-        await self.handler.handle_update(tap("at:ssid:real"))
-        await self.handler.handle_update(message(f"/at_ssid {DEMO_SSID}"))
-        self.assertIn("you chose Real, but this SSID is for your Demo account", self.last()["text"])
+    async def test_pasted_ssid_frame_is_deleted_and_never_submitted(self):
+        for text in (REAL_SSID, f"/at_ssid {DEMO_SSID}"):
+            update = message(text)
+            update["message"]["message_id"] = 88
+            await self.handler.handle_update(update)
+            self.assertIn(88, self.client.deletes)
+            self.client.deletes.clear()
+            reply = list(self.client.visible[USER].values())[-1]["text"]
+            self.assertIn("/at_login", reply)
+            self.assertNotIn("abc", reply)
+        self.assertFalse(any(c[0] == "submit_ssid" for c in self.service.calls))
 
 
 if __name__ == "__main__":

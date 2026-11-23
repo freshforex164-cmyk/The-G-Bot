@@ -154,9 +154,6 @@ class AutotradeClient:
         """Saved session state per account type (no broker connection)."""
         return await self._call("GET", "/auth/status", uid)
 
-    async def submit_ssid(self, uid: int | str, ssid: str) -> dict[str, Any]:
-        return await self._call("POST", "/auth/ssid", uid, {"ssid": ssid}, timeout=60)
-
     async def balance(self, uid: int | str, fresh: bool = True) -> dict[str, Any]:
         return await self._call("GET", f"/trading/balance?fresh={'true' if fresh else 'false'}", uid, timeout=45)
 

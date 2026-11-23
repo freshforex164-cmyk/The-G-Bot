@@ -8,7 +8,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable
+from typing import Awaitable, Callable
 
 from ..clock import Clock, utc_day_start
 from ..errors import (BrokerError, Disconnected, ModeMismatch, RateLimited, SessionExpired, VaultError)
@@ -57,7 +57,8 @@ class UserWorker:
                  broker_factory: Callable[[str], BrokerClient], risk: RiskManager, clock: Clock,
                  is_halted: Callable[[], bool] = lambda: False,
                  strategies: dict[str, Callable[[], Strategy]] | None = None,
-                 reconnect_base: float = 2.0, notifier: Notifier | None = None):
+                 reconnect_base: float = 2.0, notifier: Notifier | None = None,
+                 on_session_expired: Callable[[str, str, str], Awaitable[None]] | None = None):
         self.user_id = user_id
         self._repo, self._vault, self._feed = repo, vault, feed
         self._factory, self._risk, self._clock = broker_factory, risk, clock
@@ -65,6 +66,7 @@ class UserWorker:
         self._strategies = strategies or STRATEGIES
         self._reconnect_base = reconnect_base
         self._notifier = notifier or NullNotifier()
+        self._on_session_expired = on_session_expired
         self._broker: BrokerClient | None = None
         self.settings = TradingSettings()
         self.status = WorkerStatus.STARTING
@@ -166,11 +168,11 @@ class UserWorker:
                     await self._persist()
                     await self._session(broker, strategy, s)
                 except SessionExpired as exc:
-                    await self._vault.mark_expired(self.user_id, kind, str(exc))
+                    await self._session_expired_now(kind, str(exc))
                     await self._finish(WorkerStatus.REAUTH_REQUIRED, str(exc))
                     return
                 except VaultError:
-                    await self._vault.mark_expired(self.user_id, kind, "token cannot be decrypted")
+                    await self._session_expired_now(kind, "token cannot be decrypted")
                     await self._finish(WorkerStatus.REAUTH_REQUIRED, "token cannot be decrypted")
                     return
                 except ModeMismatch as exc:
@@ -209,6 +211,16 @@ class UserWorker:
             self.status = WorkerStatus.STOPPED
             await self._persist()
             raise
+
+    async def _session_expired_now(self, kind: str, reason: str) -> None:
+        """Mark the session expired and prompt /at_login (the manager de-duplicates the prompt)."""
+        if self._on_session_expired is not None:
+            try:
+                await self._on_session_expired(self.user_id, kind, reason)
+                return
+            except Exception:
+                log.info("re-login prompt failed for user %s", self.user_id)
+        await self._vault.mark_expired(self.user_id, kind, reason)
 
     async def _sleep(self, seconds: float) -> None:
         try:

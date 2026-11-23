@@ -11,6 +11,7 @@ COPY strategy strategy
 COPY config.py strategy.json ./
 # 512 MB Render instance: cap the Playwright driver's (Node) heap well below 4096 so it collects garbage
 # early, and limit glibc malloc arenas so Python's long-running asyncio threads do not fragment memory.
-ENV PYTHONUNBUFFERED=1 PORT=8100 NODE_OPTIONS="--max-old-space-size=256" MALLOC_ARENA_MAX=2
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PORT=8100 NODE_OPTIONS="--max-old-space-size=256" \
+    MALLOC_ARENA_MAX=2 MALLOC_TRIM_THRESHOLD_=131072
 EXPOSE 8100
 CMD ["python", "-m", "autotrade.main"]

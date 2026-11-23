@@ -3,7 +3,8 @@
 Signals stay read-only. These commands only work in a private chat with the bot and only when
 AUTOTRADE_API_URL and AUTOTRADE_JWT_SECRET are set; otherwise they answer "not set up".
 New users always start in Demo; Real (Live) needs /at_live confirm. /at_login reuses a saved session
-instead of a new browser sign-in; /at_ssid stores a pasted SSID without any browser.
+instead of a new browser sign-in. The only way to connect is the secure email/password handshake;
+pasted SSIDs are never accepted.
 """
 from __future__ import annotations
 
@@ -18,7 +19,6 @@ logger = logging.getLogger(__name__)
 AUTOTRADE_COMMANDS = [
     {"command": "autotrade", "description": "Auto-trading overview (Demo by default)"},
     {"command": "at_login", "description": "Connect your Pocket Option account"},
-    {"command": "at_ssid", "description": "Direct SSID login (paste your Pocket Option SSID)"},
     {"command": "at_start", "description": "Start your auto-trading bot"},
     {"command": "at_stop", "description": "Stop your auto-trading bot"},
     {"command": "at_stats", "description": "Today's trades and results"},
@@ -67,26 +67,6 @@ LIVE_WARNING = (
     "Your daily stop-loss and stake limits still apply. To switch, send:\n/at_live confirm"
 )
 
-SSID_MENU_TEXT = (
-    "🔑 Direct SSID Login (no browser sign-in)\n"
-    "Which Pocket Option account is this SSID for? Demo and Real use separate SSIDs."
-)
-
-
-def ssid_steps(kind: str) -> str:
-    which, flag = ("Real", "0") if kind == "real" else ("Demo", "1")
-    return (
-        f"🔑 {which} account SSID\n"
-        f"1. Open Pocket Option in a desktop browser, log in and open your {which} cabinet.\n"
-        "2. Developer tools → Network → WS → the frame starting with 42[\"auth\",\n"
-        f"3. Check it contains \"isDemo\":{flag}, copy the whole frame and send it here "
-        "(with or without /at_ssid in front).\n\n"
-        "Your message is deleted right away and the SSID is stored encrypted."
-    )
-
-
-SSID_HELP = SSID_MENU_TEXT       # kept for older imports
-
 # Trade amounts offered in the Auto-Trade setup menu: (button label, stake).
 STAKE_OPTIONS: tuple[tuple[str, float], ...] = (
     ("$1.00", 1.0), ("$1.50", 1.5), ("$2.00", 2.0),
@@ -118,10 +98,6 @@ def error_text(exc: AutotradeError) -> str:
     if exc.code == "reauth_required":
         which = "Real" if exc.kind == "real" else "Demo"
         return f"Your Pocket Option {which} session is missing or has expired. Send /at_login to connect again."
-    if exc.code == "invalid_ssid":
-        return "That isn't a valid Pocket Option SSID. It must start with 42[\"auth\",. Send /at_ssid for help."
-    if exc.code == "ssid_rejected":
-        return "Pocket Option rejected that SSID (expired or logged out). Copy a fresh one, or use /at_login."
     if exc.code == "live_disabled":
         return "Live trading is switched off on this service. You can keep trading in Demo."
     if exc.code == "invalid_settings":
@@ -242,7 +218,6 @@ class AutotradeCommands:
         self.client = client
         self._send = send
         self.roster = roster          # AutotradeRoster: who gets trades instead of signal cards
-        self._ssid_wanted: dict[int, str] = {}   # Demo/Real picked in the /at_ssid menu (small, per user)
 
     def _roster_add(self, uid: int) -> None:
         if self.roster is not None:
@@ -258,12 +233,7 @@ class AutotradeCommands:
         button: dict[str, Any] = (
             {"text": "Log in to Pocket Option", "web_app": {"url": link}} if link.startswith("https://")
             else {"text": "Log in to Pocket Option", "url": link})
-        return {"inline_keyboard": [[button], [{"text": "🔑 Advanced: Direct SSID Login", "callback_data": "at:ssid"}]]}
-
-    @staticmethod
-    def ssid_menu_markup() -> dict[str, Any]:
-        return {"inline_keyboard": [[{"text": "🧪 Demo Account", "callback_data": "at:ssid:demo"},
-                                     {"text": "💵 Real Account", "callback_data": "at:ssid:real"}]]}
+        return {"inline_keyboard": [[button]]}
 
     @staticmethod
     def stake_rows(current: Any = None) -> list[list[dict[str, str]]]:
@@ -401,7 +371,7 @@ class AutotradeCommands:
         assert c is not None
         if command == "autotrade":
             stats = await c.stats(uid)
-            await self.reply(chat_id, overview_text(stats) + "\n\nCommands: /at_login /at_ssid /at_start /at_stop "
+            await self.reply(chat_id, overview_text(stats) + "\n\nCommands: /at_login /at_start /at_stop "
                              "/at_stats /at_balance /at_set /at_live /at_demo /at_logout")
         elif command == "at_login":
             # Saved session first: a new browser login per /at_login gets the server's IP blocked.
@@ -413,7 +383,7 @@ class AutotradeCommands:
             if connected:
                 await self.reply(chat_id, f"✅ Already connected ({connected}). Your saved session is reused, "
                                  "so no new sign-in is needed: tap 🤖 Start Auto-Trade or send /at_start.\n\n"
-                                 "Only if Pocket Option logged you out, sign in again or paste an SSID:",
+                                 "Only if Pocket Option logged you out, sign in again:",
                                  self.login_markup(uid))
                 return
             # Inside Telegram as a Mini App when the service is on HTTPS; plain link otherwise (local testing).
@@ -421,27 +391,6 @@ class AutotradeCommands:
                              "and is only for you, so don't forward it. After logging in, pick an asset with "
                              "/start and tap 🤖 Start Auto-Trade (or send /at_start).",
                              self.login_markup(uid))
-        elif command == "at_ssid":
-            if not args:
-                await self.reply(chat_id, SSID_MENU_TEXT, self.ssid_menu_markup())
-                return
-            if args.lower() in {"demo", "real"}:
-                self._ssid_wanted[uid] = args.lower()
-                await self.reply(chat_id, ssid_steps(args.lower()))
-                return
-            res = await c.submit_ssid(uid, args)
-            kind = "real" if res.get("kind") == "real" else "demo"
-            which = "Real" if kind == "real" else "Demo"
-            wanted = self._ssid_wanted.pop(uid, None)
-            mismatch = (f"\nNote: you chose {wanted.capitalize()}, but this SSID is for your {which} account."
-                        if wanted and wanted != kind else "")
-            if res.get("verified"):
-                head = f"✅ Connected to your Pocket Option {which} account. Your session is saved."
-            else:
-                head = (f"✅ {which} session saved. Pocket Option couldn't be reached to confirm it right now; "
-                        "it is checked again before the first trade.")
-            await self.reply(chat_id, f"{head}{mismatch}\nNo browser sign-in needed: choose an asset with /start "
-                             "and tap 🤖 Start Auto-Trade.")
         elif command == "at_start":
             await c.start(uid)
             stats = await c.stats(uid)
