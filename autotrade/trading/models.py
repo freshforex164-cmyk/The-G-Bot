@@ -14,6 +14,9 @@ _V1_DEFAULTS = {"max_concurrent": (1, 2), "cooldown_seconds": (60, 5)}
 DEMO = "demo"
 LIVE = "live"
 MODES = (DEMO, LIVE)
+FIXED = "fixed"
+MARTINGALE = "martingale"
+STAKE_MODES = (FIXED, MARTINGALE)
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,13 @@ class TradingSettings:
     # True: place exactly the GBot signals this user receives (no separate engine).
     # False: the service runs its own price-action engine on symbol_otc.
     follow_signals: bool = True
+    # Stake strategy. "fixed": every trade uses ``stake``. "martingale": start at ``base_stake`` (or ``stake``
+    # when unset), multiply by ``martingale_multiplier`` after each loss for at most ``martingale_max_steps``
+    # steps, back to the base stake after a win or after the last step.
+    stake_mode: str = FIXED
+    martingale_multiplier: float = 2.0
+    martingale_max_steps: int = 3
+    base_stake: float | None = None
     # Bumped when defaults change, so saved settings that still hold the old defaults get the new ones.
     defaults_version: int = SETTINGS_DEFAULTS_VERSION
 
@@ -74,7 +84,36 @@ class TradingSettings:
             bad("follow_signals must be true or false")
         if self.symbol_real == self.symbol_otc:
             bad("symbol_real and symbol_otc must differ")
+        if self.stake_mode not in STAKE_MODES:
+            bad("stake_mode must be 'fixed' or 'martingale'")
+        if not (isinstance(self.martingale_multiplier, (int, float)) and 1.1 <= self.martingale_multiplier <= 5.0):
+            bad("martingale_multiplier must be between 1.1 and 5")
+        if not (isinstance(self.martingale_max_steps, int) and 1 <= self.martingale_max_steps <= 6):
+            bad("martingale_max_steps must be between 1 and 6")
+        if self.base_stake is not None:
+            if not (1.0 <= self.base_stake <= cap):
+                bad(f"base_stake must be between 1 and {cap:g} in {self.mode} mode")
+            if self.base_stake > self.daily_stop_loss:
+                bad("base_stake must not exceed daily_stop_loss")
+        if self.stake_mode == MARTINGALE and self.max_ladder_stake > cap:
+            bad(f"the martingale ladder reaches {self.max_ladder_stake:g}, above the {cap:g} stake limit; "
+                "lower base_stake, martingale_multiplier or martingale_max_steps")
         return self
+
+    @property
+    def effective_base_stake(self) -> float:
+        return float(self.base_stake if self.base_stake is not None else self.stake)
+
+    def ladder_stake(self, step: int) -> float:
+        """Stake for a ladder step (0 = base). Fixed mode always returns ``stake``."""
+        if self.stake_mode != MARTINGALE:
+            return float(self.stake)
+        step = max(0, min(int(step), self.martingale_max_steps))
+        return round(self.effective_base_stake * self.martingale_multiplier ** step, 2)
+
+    @property
+    def max_ladder_stake(self) -> float:
+        return self.ladder_stake(self.martingale_max_steps)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

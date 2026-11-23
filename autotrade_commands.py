@@ -46,7 +46,12 @@ SETTINGS: dict[str, tuple[str, type]] = {
     "cooldown": ("cooldown_seconds", int),
     "min_payout": ("min_payout", int),
     "follow": ("follow_signals", bool),
+    "stake_mode": ("stake_mode", str),
+    "multiplier": ("martingale_multiplier", float),
+    "max_steps": ("martingale_max_steps", int),
+    "base_stake": ("base_stake", float),
 }
+STAKE_MODE_WORDS = {"fixed": "fixed", "martingale": "martingale", "mg": "martingale"}
 ON_WORDS, OFF_WORDS = {"on", "yes", "true", "1"}, {"off", "no", "false", "0"}
 SET_USAGE = (
     "Usage: /at_set <name> <value>\n"
@@ -57,7 +62,11 @@ SET_USAGE = (
     "  take_profit 20  stop for the day after winning this much\n"
     "  cooldown 5      seconds between trades (5-3600)\n"
     "  min_payout 80   skip trades below this payout % (50-100)\n"
-    "  follow on       place the GBot signals you receive (off = bot's own engine)"
+    "  follow on       place the GBot signals you receive (off = bot's own engine)\n"
+    "  stake_mode martingale   fixed (same stake) or martingale (raise after a loss)\n"
+    "  multiplier 2    martingale: stake x this after each loss (1.1-5)\n"
+    "  max_steps 3     martingale: raises before going back to the base stake (1-6)\n"
+    "  base_stake 1    martingale: first stake of the ladder"
 )
 NOT_SET_UP = "Auto-trading isn't set up on this bot yet."
 PRIVATE_ONLY = "For your account's safety, auto-trading commands only work in a private chat with the bot."
@@ -116,8 +125,14 @@ def error_text(exc: AutotradeError) -> str:
 def settings_summary(s: dict[str, Any]) -> str:
     source = ("Trades: the GBot signals you receive" if s.get("follow_signals", True)
               else f"Trades: own price-action engine on {s.get('symbol_otc')}")
+    if s.get("stake_mode") == "martingale":
+        base = s.get("base_stake") if s.get("base_stake") is not None else s.get("stake")
+        stake_line = (f"Stake: Martingale from {_num(base)} ×{_num(s.get('martingale_multiplier', 2.0))} "
+                      f"up to {_num(s.get('martingale_max_steps', 3))} steps · ")
+    else:
+        stake_line = f"Stake {_num(s.get('stake'))} · "
     return (
-        f"Stake {_num(s.get('stake'))} · expiry {_num(s.get('expiry_seconds'))} s · "
+        f"{stake_line}expiry {_num(s.get('expiry_seconds'))} s · "
         f"max open {_num(s.get('max_concurrent'))} · cooldown {_num(s.get('cooldown_seconds'))} s\n"
         f"Daily stop-loss {_num(s.get('daily_stop_loss'))} · take-profit {_num(s.get('daily_take_profit'))} · "
         f"min payout {_num(s.get('min_payout'))}%\n"
@@ -442,6 +457,14 @@ class AutotradeCommands:
             await self.reply(chat_id, f"Unknown setting '{name[:20]}'.\n\n" + SET_USAGE)
             return
         field, kind = SETTINGS[name]
+        if kind is str:
+            mode = STAKE_MODE_WORDS.get(raw.lower())
+            if mode is None:
+                await self.reply(chat_id, "Use '/at_set stake_mode fixed' or '/at_set stake_mode martingale'.")
+                return
+            s = await self.client.update_settings(uid, {field: mode})  # type: ignore[union-attr]
+            await self.reply(chat_id, f"Saved: stake_mode = {mode}.\n\n" + settings_summary(s))
+            return
         if kind is bool:
             word = raw.lower()
             if word not in ON_WORDS | OFF_WORDS:

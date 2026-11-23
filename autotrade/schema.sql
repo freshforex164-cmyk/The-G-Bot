@@ -22,6 +22,22 @@ create table if not exists autotrade_settings (
   settings   jsonb       not null,                            -- TradingSettings (validated in code)
   updated_at timestamptz not null default now()
 );
+-- Stake strategy keys inside settings (Phase 3): stake_mode 'fixed' | 'martingale' (default 'fixed'),
+-- martingale_multiplier (default 2.0), martingale_max_steps (default 3), base_stake (null = use stake).
+-- Older rows without these keys read as the defaults; the checks below only reject invalid values.
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'autotrade_settings_stake_mode') then
+    alter table autotrade_settings add constraint autotrade_settings_stake_mode
+      check (coalesce(settings->>'stake_mode', 'fixed') in ('fixed', 'martingale'));
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'autotrade_settings_martingale') then
+    alter table autotrade_settings add constraint autotrade_settings_martingale
+      check (coalesce((settings->>'martingale_multiplier')::numeric, 2.0) between 1.1 and 5
+             and coalesce((settings->>'martingale_max_steps')::int, 3) between 1 and 6
+             and (settings->>'base_stake' is null or (settings->>'base_stake')::numeric >= 1));
+  end if;
+end $$;
 
 create table if not exists autotrade_trades (
   id              bigserial   primary key,

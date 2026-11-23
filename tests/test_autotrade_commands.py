@@ -216,6 +216,16 @@ class AutotradeCommandTests(unittest.IsolatedAsyncioTestCase):
         from autotrade_commands import ALL_COMMANDS
         self.assertNotIn("at_ssid", ALL_COMMANDS)
 
+    async def test_set_stake_mode_martingale(self):
+        await self.send("/at_set stake_mode martingale")
+        self.assertIn(("update_settings", USER, {"stake_mode": "martingale"}), self.service.calls)
+        await self.send("/at_set multiplier 1.5")
+        self.assertIn(("update_settings", USER, {"martingale_multiplier": 1.5}), self.service.calls)
+        before = len(self.service.calls)
+        await self.send("/at_set stake_mode doubling")
+        self.assertEqual(len(self.service.calls), before)
+        self.assertIn("stake_mode martingale", self.chat.last())
+
     async def test_pasted_ssid_is_deleted_and_not_submitted(self):
         ssid = '42["auth",{"session":"abc","isDemo":0,"uid":1,"platform":2}]'
         update = message(f"/at_ssid {ssid}")

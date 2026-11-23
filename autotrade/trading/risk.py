@@ -14,6 +14,8 @@ class RiskState:
     tick_ages: list[float] = field(default_factory=list)  # seconds, one per required symbol (inf if none)
     client_is_demo: bool = True
     halted: bool = False              # global kill switch
+    stake: float | None = None        # stake of this order (Martingale ladder); None = settings stake
+    open_exposure: float | None = None  # sum of open trades' stakes; None = settings stake x open trades
 
 
 @dataclass(frozen=True)
@@ -39,8 +41,10 @@ class RiskManager:
             return Verdict(False, "daily_stop_loss", halt=True)
         if st.daily_pnl >= s.daily_take_profit:
             return Verdict(False, "daily_take_profit", halt=True)
-        # Open trades could all lose: count their stake (plus this one) as exposure.
-        if st.daily_pnl - s.stake * (st.open_count + 1) < -s.daily_stop_loss:
+        # Open trades could all lose: count their stakes (plus this one) as exposure.
+        stake = s.stake if st.stake is None else st.stake
+        open_exposure = s.stake * st.open_count if st.open_exposure is None else st.open_exposure
+        if st.daily_pnl - open_exposure - stake < -s.daily_stop_loss:
             return Verdict(False, "stop_loss_exposure")
         if st.open_count >= s.max_concurrent:
             return Verdict(False, "max_concurrent")

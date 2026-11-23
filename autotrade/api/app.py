@@ -94,6 +94,10 @@ class SettingsPatch(BaseModel):
     min_payout: int | None = None
     max_tick_age_seconds: float | None = None
     follow_signals: bool | None = None
+    stake_mode: Literal["fixed", "martingale"] | None = None
+    martingale_multiplier: float | None = None
+    martingale_max_steps: int | None = None
+    base_stake: float | None = None
 
 
 class SignalIn(BaseModel):

@@ -29,6 +29,42 @@ MAX_PENDING_SIGNALS = 20
 SEEN_SIGNAL_IDS = 500
 
 
+class StakeTracker:
+    """Stateful stake ladder for one user (in memory; a restart starts again at the base stake).
+
+    fixed: always ``stake``. martingale: after a loss move one step up (stake x multiplier); after a win, or
+    a loss on the last step, back to the base stake. A draw keeps the step. An unknown result (timeout) never
+    escalates: it resets to the base stake, the lowest exposure. Settings changes and a new UTC day reset it."""
+
+    def __init__(self) -> None:
+        self.step = 0
+        self.win_streak = 0
+        self.loss_streak = 0
+        self._key: tuple | None = None
+
+    def sync(self, s: TradingSettings, day: object = None) -> None:
+        key = (s.stake_mode, s.effective_base_stake, s.martingale_multiplier, s.martingale_max_steps, s.stake, day)
+        if key != self._key:
+            self._key, self.step = key, 0
+
+    def stake_for(self, s: TradingSettings) -> float:
+        return s.ladder_stake(self.step)
+
+    def record(self, s: TradingSettings, outcome: str | None) -> None:
+        if outcome == "win":
+            self.win_streak, self.loss_streak, self.step = self.win_streak + 1, 0, 0
+        elif outcome == "loss":
+            self.win_streak, self.loss_streak = 0, self.loss_streak + 1
+            if s.stake_mode == "martingale":
+                self.step = 0 if self.step >= s.martingale_max_steps else self.step + 1
+        elif outcome == "draw":
+            pass
+        else:
+            self.step = 0
+        if s.stake_mode != "martingale":
+            self.step = 0
+
+
 class WorkerStatus(str, Enum):
     STARTING = "starting"
     RUNNING = "running"
@@ -87,6 +123,8 @@ class UserWorker:
         self.balance_kind: str | None = None
         self.balance_at: datetime | None = None
         self.signals_received = 0
+        self.stakes = StakeTracker()
+        self._open_stakes: dict[str, float] = {}
 
     # -- control ------------------------------------------------------------------------------
     def request_stop(self, drain: bool = True) -> None:
@@ -356,12 +394,17 @@ class UserWorker:
     async def _try_trade(self, broker: BrokerClient, d: Decision, s: TradingSettings, symbols: tuple[str, ...],
                          *, pushed: bool = False) -> None:
         now = self._clock.monotonic()
-        pnl = await self._repo.realized_pnl_since(self.user_id, utc_day_start(self._clock.utcnow()), s.mode)
+        day = utc_day_start(self._clock.utcnow())
+        pnl = await self._repo.realized_pnl_since(self.user_id, day, s.mode)
+        self.stakes.sync(s, day)
+        stake = self.stakes.stake_for(s)
         # A pushed GBot signal was produced from a fresh closed candle; its freshness is its valid_until.
         ages = [0.0] if pushed else [self._feed.age(sym) for sym in symbols]
         state = RiskState(now=now, last_trade_at=self._last_trade_at, open_count=self.open_count, daily_pnl=pnl,
                           tick_ages=ages, client_is_demo=self._client_is_demo,
-                          halted=self._is_halted())
+                          halted=self._is_halted(), stake=stake,
+                          open_exposure=sum(self._open_stakes.values()) if self._open_stakes else
+                          float(s.stake) * self.open_count)
         verdict = self._risk.check(s, d, state)
         if not verdict.ok:
             self._note(verdict.reason)
@@ -383,25 +426,26 @@ class UserWorker:
         balance = await self._refresh_balance(broker)
         if balance is None:
             balance = self.balance
-        if balance is None or balance < s.stake:
+        if balance is None or balance < stake:
             reason = "balance_unavailable" if balance is None else "insufficient_balance"
             self._note(reason)
             if balance is None:
                 self._alert_skip(d, reason)
             else:
                 self._alert(low_balance_text(mode=s.mode, asset=self._asset_name(d), direction=d.direction,
-                                             stake=s.stake, balance=balance, setup=d.reason or ""))
+                                             stake=stake, balance=balance, setup=d.reason or ""))
             return
         self.last_reject = None
         self._last_trade_at = now          # cooldown starts before the order, so a failure cannot cause rapid retries
         ref = uuid.uuid4().hex
-        meta = {**d.meta, **({"signal_id": d.signal_id, "source": "gbot_signal"} if d.signal_id else {})}
+        meta = {**d.meta, **({"signal_id": d.signal_id, "source": "gbot_signal"} if d.signal_id else {}),
+                "stake_mode": s.stake_mode, "stake_step": self.stakes.step}
         name = self._asset_name(d)
-        rec = TradeRecord(self.user_id, ref, s.mode, d.asset, d.direction, s.stake, d.expiry_seconds,
+        rec = TradeRecord(self.user_id, ref, s.mode, d.asset, d.direction, stake, d.expiry_seconds,
                           payout=payout, reason=d.reason, meta=meta, opened_at=self._clock.utcnow())
         await self._repo.insert_trade(rec)
         try:
-            trade_id = await broker.place(d.asset, d.direction, s.stake, d.expiry_seconds)
+            trade_id = await broker.place(d.asset, d.direction, stake, d.expiry_seconds)
         except BrokerError as exc:
             await self._repo.update_trade(self.user_id, ref, status="failed", error=str(exc)[:200])
             self._alert(failed_text(asset=name, direction=d.direction, setup=d.reason or ""))
@@ -415,14 +459,15 @@ class UserWorker:
             raise
         await self._repo.update_trade(self.user_id, ref, status="open", broker_trade_id=trade_id)
         setup = d.reason if d.reason and d.reason != "gbot_signal" else ""
-        self._alert(opened_text(mode=s.mode, asset=name, direction=d.direction, setup=setup, stake=s.stake,
+        self._alert(opened_text(mode=s.mode, asset=name, direction=d.direction, setup=setup, stake=stake,
                                 payout=payout, expiry_seconds=d.expiry_seconds))
-        self._spawn_tracker(broker, ref, trade_id, s.stake, payout, d.expiry_seconds + 45,
+        self._spawn_tracker(broker, ref, trade_id, stake, payout, d.expiry_seconds + 45,
                             info={"mode": s.mode, "asset": name, "direction": d.direction, "setup": setup})
 
     # -- results ------------------------------------------------------------------------------
     def _spawn_tracker(self, broker: BrokerClient, ref: str, trade_id: str, stake: float,
                        payout: int | None, timeout: float, info: dict | None = None) -> None:
+        self._open_stakes[ref] = float(stake)
         self._trackers[ref] = asyncio.create_task(
             self._track(broker, ref, trade_id, stake, payout, timeout, info or {}))
 
@@ -430,6 +475,7 @@ class UserWorker:
         try:
             out = await broker.outcome(trade_id, timeout)
             profit = compute_profit(out, stake, payout)
+            self.stakes.record(self.settings, out.result if profit is not None else "unknown")
             if profit is None:
                 await self._repo.update_trade(self.user_id, ref, status="unknown", error="result unavailable")
             else:
@@ -443,9 +489,11 @@ class UserWorker:
         except asyncio.CancelledError:
             raise  # left 'open'; the next session adopts it
         except Exception as exc:
+            self.stakes.record(self.settings, "unknown")
             await self._repo.update_trade(self.user_id, ref, status="unknown", error=type(map_exception(exc)).__name__)
         finally:
             self._trackers.pop(ref, None)
+            self._open_stakes.pop(ref, None)
 
     async def _adopt_open_trades(self, broker: BrokerClient, mode: str) -> None:
         for t in await self._repo.open_trades(self.user_id):
