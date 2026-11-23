@@ -56,10 +56,8 @@
 - Schema applied twice (idempotent); invalid `stake_mode` rejected by its check constraint.
 
 ## Checkpoint 8 - login browser memory (512 MB)
-- Chromium: no GPU, no /dev/shm, single process (AUTOTRADE_CHROMIUM_SINGLE_PROCESS), 128 MB JS heap.
-- Live picture throttled to 1 per 1.5 s; memory guard (150 MB free to start, closed under 40 MB free).
-- close() verified: pages, context, browser, driver; leftover processes killed; TargetClosedError silenced.
-- Tests: autotrade/tests 233 passed, 4 skipped (no DB); tests/ 176 passed.
+- `9ff4aac`: no GPU, no /dev/shm, single-process Chromium; picture 1 per 1.5 s; 150/40 MB memory guard;
+  verified close + leftover kill; quiet TargetClosedError. Tests: 233 passed, 4 skipped; tests/ 176 passed.
 
 ## Live verification
 - Render deploy and memory under real load: NOT RUN.
@@ -71,7 +69,7 @@
 - Telegram delivery of trade alerts and daily summary: NOT RUN.
 - Signal → order rate on the live scanner and broker (checkpoint 7): NOT RUN.
 - Login browser memory on the 512 MB Render instance (checkpoint 8): NOT RUN.
-- No secrets were printed or logged; tests use fake brokers and fake sessions.
+- No secrets printed or logged; tests use fake brokers and sessions.
 
 ## Risks / limits
 - No payout level is guaranteed; assets without their own valid setup are never traded.
