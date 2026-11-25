@@ -172,6 +172,12 @@ class ConsolidationAndResetTests(unittest.TestCase):
         range_valid=True,
     )
 
+    def setUp(self) -> None:
+        # Consolidation signals are paused by default; these tests cover the state machine itself.
+        enabled = patch("strategy.price_action.CONSOLIDATION_SIGNALS_ENABLED", True)
+        enabled.start()
+        self.addCleanup(enabled.stop)
+
     def evaluate(
         self,
         strategy: PriceActionStrategy,
@@ -277,3 +283,20 @@ class BootstrapAndDebugTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConsolidationPausedTests(unittest.TestCase):
+    def test_consolidation_rejection_sends_no_signal_by_default(self) -> None:
+        import strategy.price_action as pa
+        self.assertFalse(pa.CONSOLIDATION_SIGNALS_ENABLED)
+        strategy = strategy_with_level("CONSOLIDATION")
+        with patch("strategy.price_action.classify_regime", return_value=ConsolidationAndResetTests.RANGE):
+            out = strategy.on_closed_candles(
+                "PAIR_otc", [bar(0, 8, 9.5, 8, 9.0), bar(60, 9.4, 9.8, 8.5, 9.2)], asset_name="Test asset"
+            )
+        self.assertIsNone(out)
+
+    def test_only_trend_setups_are_active(self) -> None:
+        from strategy.price_action import TREND_SETUPS
+        self.assertEqual(TREND_SETUPS, {"UP_CONTINUATION_BUY", "UP_PULLBACK_SELL",
+                                        "DOWN_CONTINUATION_SELL", "DOWN_PULLBACK_BUY"})

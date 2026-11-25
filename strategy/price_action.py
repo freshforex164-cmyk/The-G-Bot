@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import isfinite
@@ -33,6 +35,12 @@ class Regime:
     range_key: tuple[int, int] | None = None
     range_valid: bool = False
 
+
+# Temporarily paused: consolidation (range) setups neither send signals nor auto-trade.
+# The range state machine still runs (emit=False) so regime handling is unchanged.
+# Set STRATEGY_ENABLE_CONSOLIDATION=true to bring them back.
+CONSOLIDATION_SIGNALS_ENABLED = os.getenv("STRATEGY_ENABLE_CONSOLIDATION", "").strip().lower() in {"1", "true", "yes", "on"}
+TREND_SETUPS = frozenset({"UP_CONTINUATION_BUY", "UP_PULLBACK_SELL", "DOWN_CONTINUATION_SELL", "DOWN_PULLBACK_BUY"})
 
 SETUP_LABELS = {
     "UP_CONTINUATION_BUY": "Uptrend Continuation",
@@ -284,7 +292,7 @@ class PriceActionStrategy:
                 candles, pair, asset_name, payout, emit=emit
             )
         return self._consolidation_signal(
-            candle, pair, asset_name, payout, emit=emit
+            candle, pair, asset_name, payout, emit=emit and CONSOLIDATION_SIGNALS_ENABLED
         )
 
     def _start_regime(self, regime: Regime, candles: Sequence[Candle]) -> None:
