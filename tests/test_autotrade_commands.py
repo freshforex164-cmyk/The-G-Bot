@@ -311,7 +311,7 @@ class RegisterCommandsTests(unittest.IsolatedAsyncioTestCase):
         await Bot("t").register_commands(ADMIN, extra_public=AUTOTRADE_COMMANDS, extra_admin=AUTOTRADE_ADMIN_COMMANDS)
         public = [c["command"] for c in calls[0][1]["commands"]]
         admin = [c["command"] for c in calls[1][1]["commands"]]
-        self.assertEqual(public, ["start"])
+        self.assertEqual(public, ["start", "stop"])
         self.assertNotIn("at_halt", public)
         self.assertIn("at_halt", admin)
         self.assertIn("at_resume", admin)

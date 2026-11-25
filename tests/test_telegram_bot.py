@@ -254,7 +254,7 @@ class TelegramApiAndPollingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(requests), 2)
         self.assertEqual(requests[0][1]["scope"], {"type": "default"})
         default_names = [item["command"] for item in requests[0][1]["commands"]]
-        self.assertEqual(default_names, ["start"])
+        self.assertEqual(default_names, ["start", "stop"])
         self.assertTrue(ADMIN_ONLY_COMMANDS.isdisjoint(default_names))
         self.assertEqual(requests[1][1]["scope"], {"type": "chat", "chat_id": 900})
         admin_names = {item["command"] for item in requests[1][1]["commands"]}

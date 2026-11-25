@@ -17,7 +17,10 @@ SubscriberFanoutNotifier = core.SubscriberFanoutNotifier
 TelegramPollingService = core.TelegramPollingService
 configured_timezone = core.configured_timezone
 COMMAND_REPLY_COOLDOWN_SECONDS = core.COMMAND_REPLY_COOLDOWN_SECONDS
-PUBLIC_COMMANDS = [{"command": "start", "description": "Open G-Bot"}]
+PUBLIC_COMMANDS = [
+    {"command": "start", "description": "Open G-Bot"},
+    {"command": "stop", "description": "Stop receiving signals"},
+]
 ADMIN_ONLY_COMMANDS = core.ADMIN_ONLY_COMMANDS | {"at_halt", "at_resume"}
 ADMIN_COMMANDS = PUBLIC_COMMANDS + core.ADMIN_COMMANDS[len(core.PUBLIC_COMMANDS):] + AUTOTRADE_ADMIN_COMMANDS
 WELCOME_TEXT = "<b>G-Bot · Goodness AI Trader</b>\nClosed 1-minute price-action signals. Choose your next action."
