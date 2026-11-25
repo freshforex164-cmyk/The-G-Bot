@@ -13,7 +13,7 @@ from ..storage.repo import Repository
 from ..vault.service import TokenVault
 from .broker import BrokerClient
 from .balance_pool import BalancePool
-from .models import DEMO, LIVE, Decision, TradingSettings
+from .models import DEMO, LIVE, OPTIONAL_LIMITS, Decision, TradingSettings
 from .risk import RiskManager
 from .strategy import STRATEGIES
 from .worker import UserWorker, WorkerStatus
@@ -157,6 +157,9 @@ class TradingManager:
         async with self._lock(user_id):
             cur = await self.repo.get_settings(user_id)
             changes = {k: v for k, v in patch.items() if v is not None}
+            for name in OPTIONAL_LIMITS:          # 0 turns an optional limit off
+                if name in changes and changes[name] == 0:
+                    changes[name] = None
             if "strategy" in changes and changes["strategy"] not in STRATEGIES:
                 raise SettingsError("unknown strategy")
             if "mode" in changes and changes["mode"] != cur.mode:
@@ -331,7 +334,8 @@ class TradingManager:
                         "last_route": bot.get("last_route")},
             "today": {**(await self.repo.trade_stats(user_id, day)),
                       "realized_pnl": await self.repo.realized_pnl_since(user_id, day, s.mode),
-                      "stop_loss": s.daily_stop_loss, "take_profit": s.daily_take_profit},
+                      "stop_loss": s.daily_stop_loss, "take_profit": s.daily_take_profit,
+                      "stop_balance": s.stop_balance},
             "all_time": await self.repo.trade_stats(user_id, None),
             "recent_trades": [
                 {"opened_at": t.opened_at.isoformat() if t.opened_at else None, "mode": t.mode, "asset": t.asset,

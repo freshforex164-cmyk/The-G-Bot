@@ -68,6 +68,13 @@ SSID_REFUSED_TEXT = (
 )
 
 
+def _stop_balance_text(value) -> str:
+    """Optional floor; set with /at_set stop_balance <amount> (0 = off)."""
+    if isinstance(value, (int, float)) and value > 0:
+        return f"<b>${value:,.2f}</b> (auto-trading pauses at or below it)"
+    return "not set (optional: /at_set stop_balance 80)"
+
+
 class TelegramBotClient:
     """Small Bot API client that never includes its token in error messages."""
 
@@ -959,7 +966,9 @@ class TelegramCommandHandler:
         balance_line = f"Balance: ${balance:,.2f}" if balance is not None else "Balance: checked before you start"
         text = (f"{notice}🤖 <b>Auto-Trade setup</b> · {name}\n"
                 f"Account: <b>{account}</b> (connected ✅)\n{balance_line}\n"
-                f"Trade amount: <b>${stake:.2f}</b>\n\nPick a trade amount, then start:")
+                f"Trade amount: <b>${stake:.2f}</b>\n"
+                f"Stop Balance: {_stop_balance_text(settings.get('stop_balance'))}\n\n"
+                "Pick a trade amount, then start:")
         rows = [[{"text": f"🚀 Start Auto-Trade · ${stake:.2f}", "callback_data": "at:go"}], switch_row]
         rows += self.autotrade.stake_rows(stake)
         await self._render_menu(chat_id, text, {"inline_keyboard": rows})

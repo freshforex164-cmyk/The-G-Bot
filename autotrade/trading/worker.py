@@ -536,6 +536,14 @@ class UserWorker:
             balance = None
         if balance is None:
             balance = self.balance
+        sb = self._risk.check_balance(s, balance)
+        if not sb.ok:
+            self._note(sb.reason)
+            self.status = WorkerStatus.PAUSED
+            if self._alerted_reason != sb.reason:
+                self._alerted_reason = sb.reason
+                self._alert_skip(d, sb.reason)
+            return
         if balance is None or balance < stake:
             reason = "balance_unavailable" if balance is None else "insufficient_balance"
             self._note(reason)

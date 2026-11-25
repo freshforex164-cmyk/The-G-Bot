@@ -7,9 +7,13 @@ from typing import Any
 from ..config import Config
 from ..errors import SettingsError
 
-SETTINGS_DEFAULTS_VERSION = 2
+SETTINGS_DEFAULTS_VERSION = 3
 # v1 -> v2: follow-mode max_concurrent 1 -> 2 and cooldown 60 s -> 5 s; the "gap" setting was removed.
 _V1_DEFAULTS = {"max_concurrent": (1, 2), "cooldown_seconds": (60, 5)}
+# v2 -> v3: the hard-coded daily stop-loss/take-profit (10/20) were removed; saved defaults become "off".
+_V2_DEFAULTS = {"daily_stop_loss": (10.0, None), "daily_take_profit": (20.0, None), "martingale_max_steps": (3, 2)}
+# Settings that accept 0 in an update to mean "off" (stored as None).
+OPTIONAL_LIMITS = ("daily_stop_loss", "daily_take_profit", "stop_balance")
 
 DEMO = "demo"
 LIVE = "live"
@@ -31,8 +35,10 @@ class TradingSettings:
     stake: float = 1.0
     expiry_seconds: int = 60
     max_concurrent: int = 2            # follow mode: two back-to-back signals can both be placed
-    daily_stop_loss: float = 10.0      # > 0 required: cannot be disabled
-    daily_take_profit: float = 20.0    # > 0 required: cannot be disabled
+    daily_stop_loss: float | None = None     # optional, user-set; None = no daily stop-loss
+    daily_take_profit: float | None = None   # optional, user-set; None = no daily take-profit
+    # Optional "Stop Balance": auto-trading pauses once the account balance falls to this amount or below.
+    stop_balance: float | None = None
     cooldown_seconds: int = 5          # follow mode: a signal right after another one is not skipped
     min_payout: int = 80
     max_tick_age_seconds: float = 3.0
@@ -44,7 +50,7 @@ class TradingSettings:
     # steps, back to the base stake after a win or after the last step.
     stake_mode: str = FIXED
     martingale_multiplier: float = 2.0
-    martingale_max_steps: int = 3
+    martingale_max_steps: int = 2      # 2-step recovery: base, x2, x4, then back to base
     base_stake: float | None = None
     # Engine mode only: extra OTC symbols scanned with their own candles (e.g. UKBrent_otc, XAUUSD_otc).
     # Each needs its own valid pattern; the payout router then picks the best one. Empty = symbol_otc only.
@@ -71,11 +77,11 @@ class TradingSettings:
             bad("expiry_seconds must be 60 (1 minute)")
         if not (1 <= self.max_concurrent <= 5):
             bad("max_concurrent must be between 1 and 5")
-        if not (self.daily_stop_loss > 0):
-            bad("daily_stop_loss must be greater than 0")
-        if not (self.daily_take_profit > 0):
-            bad("daily_take_profit must be greater than 0")
-        if self.stake > self.daily_stop_loss:
+        for name in OPTIONAL_LIMITS:
+            v = getattr(self, name)
+            if v is not None and not (isinstance(v, (int, float)) and v > 0):
+                bad(f"{name} must be greater than 0 (or 0 to turn it off)")
+        if self.daily_stop_loss is not None and self.stake > self.daily_stop_loss:
             bad("stake must not exceed daily_stop_loss")
         if not (5 <= self.cooldown_seconds <= 3600):
             bad("cooldown_seconds must be between 5 and 3600")
@@ -107,7 +113,7 @@ class TradingSettings:
         if self.base_stake is not None:
             if not (1.0 <= self.base_stake <= cap):
                 bad(f"base_stake must be between 1 and {cap:g} in {self.mode} mode")
-            if self.base_stake > self.daily_stop_loss:
+            if self.daily_stop_loss is not None and self.base_stake > self.daily_stop_loss:
                 bad("base_stake must not exceed daily_stop_loss")
         if self.stake_mode == MARTINGALE and self.max_ladder_stake > cap:
             bad(f"the martingale ladder reaches {self.max_ladder_stake:g}, above the {cap:g} stake limit; "
@@ -139,6 +145,10 @@ class TradingSettings:
         if int(values.get("defaults_version") or 1) < 2:
             for name, (old, new) in _V1_DEFAULTS.items():
                 if values.get(name, old) == old:
+                    values[name] = new
+        if int(values.get("defaults_version") or 1) < 3:
+            for name, (old, new) in _V2_DEFAULTS.items():
+                if name in values and values[name] == old:
                     values[name] = new
         if values.get("strategy") == "gap":                        # removed alias of price_action
             values["strategy"] = "price_action"

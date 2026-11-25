@@ -23,6 +23,7 @@ SKIP_REASONS = {
     "account_mode_mismatch": "the connected account type does not match Demo/Live",
     "daily_stop_loss": "your daily stop-loss is reached (trading resumes tomorrow, UTC)",
     "daily_take_profit": "your daily take-profit is reached (trading resumes tomorrow, UTC)",
+    "stop_balance": "your balance reached your Stop Balance (auto-trading paused)",
     "stop_loss_exposure": "open trades could exceed your daily stop-loss",
     "max_concurrent": "the maximum number of open trades is reached",
     "cooldown": "the cooldown between trades is still running",

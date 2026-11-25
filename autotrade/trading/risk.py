@@ -37,21 +37,29 @@ class RiskManager:
             return Verdict(False, "trading_halted")
         if st.client_is_demo != (s.mode == "demo"):
             return Verdict(False, "account_mode_mismatch")
-        if st.daily_pnl <= -s.daily_stop_loss:
+        # Daily limits are optional (user-set); None = no limit.
+        if s.daily_stop_loss is not None and st.daily_pnl <= -s.daily_stop_loss:
             return Verdict(False, "daily_stop_loss", halt=True)
-        if st.daily_pnl >= s.daily_take_profit:
+        if s.daily_take_profit is not None and st.daily_pnl >= s.daily_take_profit:
             return Verdict(False, "daily_take_profit", halt=True)
-        # Open trades could all lose: count their stakes (plus this one) as exposure.
-        stake = s.stake if st.stake is None else st.stake
-        open_exposure = s.stake * st.open_count if st.open_exposure is None else st.open_exposure
-        if st.daily_pnl - open_exposure - stake < -s.daily_stop_loss:
-            return Verdict(False, "stop_loss_exposure")
+        if s.daily_stop_loss is not None:
+            # Open trades could all lose: count their stakes (plus this one) as exposure.
+            stake = s.stake if st.stake is None else st.stake
+            open_exposure = s.stake * st.open_count if st.open_exposure is None else st.open_exposure
+            if st.daily_pnl - open_exposure - stake < -s.daily_stop_loss:
+                return Verdict(False, "stop_loss_exposure")
         if st.open_count >= s.max_concurrent:
             return Verdict(False, "max_concurrent")
         if st.last_trade_at is not None and st.now - st.last_trade_at < s.cooldown_seconds:
             return Verdict(False, "cooldown")
         if not st.tick_ages or max(st.tick_ages) > s.max_tick_age_seconds:
             return Verdict(False, "stale_prices")
+        return OK
+
+    def check_balance(self, s: TradingSettings, balance: float | None) -> Verdict:
+        """Optional Stop Balance: pause once the balance is at or below the user's floor."""
+        if s.stop_balance is not None and balance is not None and balance <= s.stop_balance:
+            return Verdict(False, "stop_balance", halt=True)
         return OK
 
     def check_payout(self, s: TradingSettings, payout: int | None) -> Verdict:

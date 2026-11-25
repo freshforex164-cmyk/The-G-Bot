@@ -91,6 +91,7 @@ class SettingsPatch(BaseModel):
     max_concurrent: int | None = None
     daily_stop_loss: float | None = None
     daily_take_profit: float | None = None
+    stop_balance: float | None = None
     cooldown_seconds: int | None = None
     min_payout: int | None = None
     max_tick_age_seconds: float | None = None

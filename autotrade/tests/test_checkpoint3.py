@@ -31,7 +31,7 @@ class FixedStakeTests(unittest.TestCase):
     def test_defaults(self):
         s = TradingSettings()
         self.assertEqual((s.stake_mode, s.martingale_multiplier, s.martingale_max_steps, s.base_stake),
-                         ("fixed", 2.0, 3, None))
+                         ("fixed", 2.0, 2, None))
         self.assertEqual(TradingSettings.from_dict({"stake": 3.0}).stake_mode, "fixed")
 
 

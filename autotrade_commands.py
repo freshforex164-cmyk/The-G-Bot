@@ -43,6 +43,7 @@ SETTINGS: dict[str, tuple[str, type]] = {
     "max_trades": ("max_concurrent", int),
     "stop_loss": ("daily_stop_loss", float),
     "take_profit": ("daily_take_profit", float),
+    "stop_balance": ("stop_balance", float),
     "cooldown": ("cooldown_seconds", int),
     "min_payout": ("min_payout", int),
     "follow": ("follow_signals", bool),
@@ -58,14 +59,15 @@ SET_USAGE = (
     "  stake 2         amount per trade\n"
     "  expiry 60       fixed 1-minute trade length\n"
     "  max_trades 2    open trades at once (1-5)\n"
-    "  stop_loss 10    stop for the day after losing this much\n"
-    "  take_profit 20  stop for the day after winning this much\n"
+    "  stop_loss 10    stop for the day after losing this much (0 = off)\n"
+    "  take_profit 20  stop for the day after winning this much (0 = off)\n"
+    "  stop_balance 80 pause auto-trading when the balance falls to this (0 = off)\n"
     "  cooldown 5      seconds between trades (5-3600)\n"
     "  min_payout 80   skip trades below this payout % (50-100)\n"
     "  follow on       place the GBot signals you receive (off = bot's own engine)\n"
     "  stake_mode martingale   fixed (same stake) or martingale (raise after a loss)\n"
     "  multiplier 2    martingale: stake x this after each loss (1.1-5)\n"
-    "  max_steps 3     martingale: raises before going back to the base stake (1-6)\n"
+    "  max_steps 2     martingale: raises before going back to the base stake (1-6)\n"
     "  base_stake 1    martingale: first stake of the ladder"
 )
 NOT_SET_UP = "Auto-trading isn't set up on this bot yet."
@@ -122,6 +124,10 @@ def error_text(exc: AutotradeError) -> str:
     return "Sorry, that didn't work. Try again in a minute."
 
 
+def _limit(v: Any) -> str:
+    return "off" if v in (None, 0) else _num(v)
+
+
 def settings_summary(s: dict[str, Any]) -> str:
     source = ("Trades: the GBot signals you receive" if s.get("follow_signals", True)
               else f"Trades: own price-action engine on {s.get('symbol_otc')}")
@@ -134,7 +140,8 @@ def settings_summary(s: dict[str, Any]) -> str:
     return (
         f"{stake_line}expiry {_num(s.get('expiry_seconds'))} s · "
         f"max open {_num(s.get('max_concurrent'))} · cooldown {_num(s.get('cooldown_seconds'))} s\n"
-        f"Daily stop-loss {_num(s.get('daily_stop_loss'))} · take-profit {_num(s.get('daily_take_profit'))} · "
+        f"Stop Balance {_limit(s.get('stop_balance'))} · daily stop-loss {_limit(s.get('daily_stop_loss'))} · "
+        f"take-profit {_limit(s.get('daily_take_profit'))} · "
         f"min payout {_num(s.get('min_payout'))}%\n"
         f"{source}"
     )
@@ -214,7 +221,7 @@ SKIP_LABELS = {
     "signal_expired": "expired", "duplicate_asset": "same asset", "stop_loss_exposure": "stop-loss limit",
     "insufficient_balance": "low balance", "balance_unavailable": "balance unreadable",
     "payout_unavailable": "payout unreadable", "daily_stop_loss": "daily stop-loss",
-    "daily_take_profit": "daily take-profit",
+    "daily_take_profit": "daily take-profit", "stop_balance": "Stop Balance reached",
 }
 
 
@@ -324,10 +331,11 @@ class AutotradeCommands:
         patch: dict[str, Any] = {"stake": value}
         note = ""
         try:
-            stop_loss = float(current.get("daily_stop_loss", 0))
+            stop_loss = current.get("daily_stop_loss")
+            stop_loss = None if stop_loss is None else float(stop_loss)
         except (TypeError, ValueError):
-            stop_loss = 0.0
-        if value > stop_loss:
+            stop_loss = None
+        if stop_loss is not None and value > stop_loss:     # only a user-set daily stop-loss
             patch["daily_stop_loss"] = value
             note = (f"Daily stop-loss raised to ${value:.2f} so this amount is allowed "
                     "(change it with /at_set stop_loss <amount>).")
