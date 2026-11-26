@@ -480,6 +480,7 @@ class SignalScanner:
         if minutes is not None and minutes <= 0:
             raise ValueError("minutes must be greater than zero")
         self._stopping = False
+        self._ready.clear()
         stop_event = asyncio.Event()
         monitor: asyncio.Task[None] | None = None
         refresher: asyncio.Task[None] | None = None
@@ -535,5 +536,8 @@ class SignalScanner:
             )
             self._preparation_tasks.clear()
             self._tasks.clear()
+            # Repeated run() calls must rebuild streams, not retain cancelled pair states.
+            self.pairs.clear()
+            self._ready.clear()
             self.output(self.stream_health_line())
             await self.broker.close()

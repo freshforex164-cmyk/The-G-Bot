@@ -113,7 +113,7 @@ class TelegramCommandHandler(core.TelegramCommandHandler):
             except (TelegramSendError, AttributeError):
                 pass
         self._menu_context[chat_id] = "main"
-        image_url = os.environ.get("WELCOME_IMAGE_URL", "https://project--47b83d1f-e152-421a-8f32-8b4029bda188-dev.lovable.app/__l5e/assets-v1/e2da1dfc-7177-4452-8eb0-6919e87aad5a/g-bot-welcome.jpg").strip()
+        image_url = os.getenv("WELCOME_IMAGE_URL", "").strip()
         if image_url.startswith("https://") and callable(getattr(self.client, "send_photo", None)):
             try:
                 result = await self.client.send_photo(chat_id, image_url, WELCOME_TEXT,

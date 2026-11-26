@@ -154,6 +154,12 @@ class TelegramBotClient:
             self.request_timeout if timeout is None else timeout,
         )
 
+    async def delete_webhook(self) -> None:
+        """Switch this bot to local polling without discarding queued updates."""
+        result = await self.call("deleteWebhook", {"drop_pending_updates": False})
+        if result is not True:
+            raise TelegramSendError("Telegram did not confirm webhook removal.")
+
     async def get_updates(
         self, *, offset: int | None, poll_timeout: int = 25
     ) -> list[Mapping[str, Any]]:
@@ -1477,16 +1483,27 @@ class TelegramPollingService:
 
     async def run(self, stop_event: asyncio.Event) -> None:
         backoff = self.min_backoff
+        prepared = False
         while not stop_event.is_set():
             try:
+                if not prepared:
+                    await self.client.delete_webhook()
+                    prepared = True
+                    logger.info("Telegram long polling started on this host.")
                 await self.poll_once()
                 backoff = self.min_backoff
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("Telegram polling failed (%s).", type(exc).__name__)
+                status = exc.status_code if isinstance(exc, TelegramSendError) else None
+                if status in (401, 403, 409):
+                    logger.error("Telegram polling cannot continue (HTTP %s); check the token and stop duplicate pollers.", status)
+                    raise
+                logger.warning("Telegram polling failed (%s); retrying.", status or type(exc).__name__)
+                retry_after = exc.retry_after if isinstance(exc, TelegramSendError) else None
+                delay = max(backoff, retry_after or 0)
                 try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+                    await asyncio.wait_for(stop_event.wait(), timeout=delay)
                 except TimeoutError:
                     pass
                 backoff = min(self.max_backoff, max(self.min_backoff, backoff * 2))

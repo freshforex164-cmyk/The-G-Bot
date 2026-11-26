@@ -76,17 +76,32 @@ Review `deploy/nginx.conf.example`, replacing its example domain/certificate pat
 For systemd installations, install the reviewed units and reload the daemon. Stop/disable the previous supervisor's bot and engine before enabling these units. During a maintenance window with **no open trades**, restart the bot and engine; do not reset or kill active orders merely to deploy.
 
 ```bash
+sudo install -m 644 deploy/gbot.service /etc/systemd/system/gbot.service
+sudo install -m 644 deploy/gbot-autotrade.service /etc/systemd/system/gbot-autotrade.service
 sudo systemctl daemon-reload
 sudo systemctl enable gbot-autotrade gbot
 sudo systemctl restart gbot-autotrade gbot
 sudo systemctl status gbot-autotrade gbot --no-pager
 ```
 
-The units use automatic failure restart, network ordering, restricted environment-file permissions, and a graceful shutdown window. The bot's scanner and Telegram polling retain separate asyncio tasks; the auto-trading process remains independent.
+`python main.py` now defaults to the persistent service; `--run watch` remains an explicitly finite diagnostic. The bot unit uses an absolute execution target and `Restart=always` without a restart-count cutoff; an explicit systemctl stop still stops it. The engine retains its separate failure-restart policy. Both retain network ordering, restricted environment-file permissions, and a graceful shutdown window.
+
+Telegram polling, health serving, and scanner recovery run concurrently. Broker startup timeouts no longer cancel Telegram polling. Scanner retries are bounded at 30 seconds and reset stale stream state; no order is replayed. Unexpected return from a required service triggers cleanup and a nonzero exit for systemd recovery. Ctrl+C/systemd SIGINT cancels all service tasks and closes resources.
+
+After installing the unit, confirm its **effective** command (including any existing overrides) and inspect sanitized startup logs:
+
+```bash
+sudo systemctl cat gbot
+sudo systemctl show gbot -p ExecStart -p Restart -p NRestarts -p ActiveState -p SubState
+sudo journalctl -u gbot -n 80 --no-pager
+curl --fail http://127.0.0.1:5000/health
+```
+
+Adapt the health port if PORT is overridden. The bot health path is `/health`; the separate engine exposes `/healthz` on port 8100. `WELCOME_IMAGE_URL` is optional and now has no hosted-development default; leave it blank for the text menu or set your own public HTTPS image. Do not share logs containing secrets. A repository pull alone does not replace an already installed systemd unit or its overrides.
 
 ## VPS acceptance checklist (not yet performed)
 
-1. Confirm exactly one bot poller and one engine process. Existing webhooks must be absent before polling; remove a stale webhook through your secure Telegram administration path, not by printing the bot token.
+1. Confirm exactly one bot poller and one engine process. Startup automatically removes any stale webhook without dropping pending updates before long polling. HTTP 409 indicates a conflicting poller: stop the old instance, rather than running competing processes. Invalid-token HTTP 401/403 is reported explicitly.
 2. Confirm loopback `/healthz` responds and public `/login` loads with a valid HTTPS certificate. Do not print token fragments, sessions, passwords, or connection strings in diagnostics.
 3. Complete secure broker login from Telegram, including any required CAPTCHA/2FA. Confirm both saved Demo and Real slots, and verify their balances belong to the expected account. CAPTCHA bypass is not part of this refactor.
 4. Start Demo auto-trading with a valid, available asset and your intended stake. Observe a new signal, broker order, settlement, saved result, balance readback, and Telegram alerts. Confirm payout/market-unavailable signals are skipped rather than forced.

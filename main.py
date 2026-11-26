@@ -692,24 +692,42 @@ async def run_serve() -> None:
     await status_server.start()
 
     async def scan_forever() -> None:
-        service_state["scanner_running"] = True
-        try:
-            await scanner.run()
-        finally:
-            service_state["scanner_running"] = False
+        backoff = 1.0
+        while not stop_event.is_set():
+            service_state["scanner_running"] = True
+            started = asyncio.get_running_loop().time()
+            try:
+                await scanner.run()
+                logger.warning("Scanner returned unexpectedly; reconnecting the feed.")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Read-only feed recovery must never stop Telegram or replay trade orders.
+                logger.warning("Scanner feed unavailable (%s); retrying in background.", type(exc).__name__)
+            finally:
+                service_state["scanner_running"] = False
+            if asyncio.get_running_loop().time() - started >= 60:
+                backoff = 1.0
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+            except TimeoutError:
+                pass
+            backoff = min(30.0, backoff * 2)
+            if not stop_event.is_set():
+                # scanner.run() closes its broker; never reuse that closed instance.
+                scanner.broker = PocketOptionBroker(config.load_ssid())
 
-    queue.start()
-    scan_task = asyncio.create_task(scan_forever(), name="gbot-selected-asset-scanner")
-    poll_task = asyncio.create_task(polling.run(stop_event), name="gbot-telegram-polling")
-    http_task = asyncio.create_task(status_server.serve_forever(), name="gbot-health-http")
-    try:
-        await asyncio.wait_for(
-            scanner.wait_until_ready(),
-            timeout=config.INITIAL_CONNECT_TIMEOUT_SECONDS + 10,
-        )
+    async def startup_status() -> None:
+        try:
+            await asyncio.wait_for(
+                scanner.wait_until_ready(),
+                timeout=config.INITIAL_CONNECT_TIMEOUT_SECONDS + 10,
+            )
+        except TimeoutError:
+            logger.warning("Initial feed connection timed out; Telegram polling remains active.")
         database_label = "postgres" if subscribers.backend == "postgres" else "file"
         message = (
-            f"GBot started. Feed {'OK' if scanner.broker.is_connected else 'NOT OK'}, "
+            f"GBot started. Feed {'OK' if scanner.broker.is_connected else 'NOT OK (retrying)'}, "
             f"{len(scanner.pairs)} selected assets, {subscribers.count()} subscribers, "
             f"database {database_label}."
         )
@@ -723,21 +741,31 @@ async def run_serve() -> None:
                 "Startup status message could not be sent (%s).",
                 exc.status_code or type(exc).__name__,
             )
+
+    queue.start()
+    scan_task = asyncio.create_task(scan_forever(), name="gbot-selected-asset-scanner")
+    poll_task = asyncio.create_task(polling.run(stop_event), name="gbot-telegram-polling")
+    http_task = asyncio.create_task(status_server.serve_forever(), name="gbot-health-http")
+    status_task = asyncio.create_task(startup_status(), name="gbot-startup-status")
+    service_tasks = (scan_task, poll_task, http_task)
+    try:
         done, _pending = await asyncio.wait(
-            {scan_task, poll_task, http_task}, return_when=asyncio.FIRST_EXCEPTION
+            service_tasks, return_when=asyncio.FIRST_COMPLETED
         )
         for task in done:
             if task.cancelled():
-                continue
+                raise RuntimeError(f"Required service {task.get_name()} was cancelled.")
             error = task.exception()
             if error is not None:
                 raise error
+        # A clean return from a required infinite loop is still a service failure.
+        raise RuntimeError("A required GBot service stopped unexpectedly.")
     finally:
         stop_event.set()
-        for task in (scan_task, poll_task, http_task):
+        for task in (*service_tasks, status_task):
             if not task.done():
                 task.cancel()
-        await asyncio.gather(scan_task, poll_task, http_task, return_exceptions=True)
+        await asyncio.gather(*service_tasks, status_task, return_exceptions=True)
         await status_server.close()
         await queue.close()
         outcomes.print_summary()
@@ -812,7 +840,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "telegram-setup",
             "testsignal",
         ),
-        default="watch",
+        default="serve",
     )
     parser.add_argument(
         "--pair",
