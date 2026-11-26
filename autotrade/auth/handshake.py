@@ -186,6 +186,8 @@ ERROR_MESSAGES = {
     "low_memory": "The sign-in server is short of memory right now, so the secure browser was stopped before "
                   "it could crash the service (running trades are protected). Nothing was saved. Try again in a "
                   "minute; if this keeps happening the autotrade service needs a bigger Render instance.",
+    "broker_rate_limited": "Pocket Option is limiting sign-ins from the server right now (too many requests). "
+                           "Nothing was saved. Wait a few minutes, then send /at_login again.",
     "login_timeout": "The sign-in took too long and was closed. Send /at_login for a new link.",
     "store_failed": "You signed in, but the session could not be saved. Send /at_login to try again.",
     "capture_failed": "The sign-in could not be completed. Send /at_login to try again.",
@@ -238,6 +240,39 @@ def host_allowed(url: str, *, navigation: bool, hosts: tuple[str, ...] = ALLOWED
 
 class BrowserCrashed(RuntimeError):
     """Chromium died (usually out of memory) while the login was in progress."""
+
+
+class BrokerRateLimited(RuntimeError):
+    """Pocket Option answered 429 Too Many Requests (or 503 with Retry-After) during the sign-in."""
+
+    def __init__(self, retry_after: float | None = None):
+        super().__init__("broker rate limited the sign-in")
+        self.retry_after = retry_after
+
+
+class LoginCooldown(Exception):
+    """A new sign-in was refused because the broker recently rate-limited or timed out (backoff)."""
+
+    def __init__(self, wait: float, message: str):
+        super().__init__(message)
+        self.wait, self.message = wait, message
+
+
+# Backoff after broker 429/timeouts: base * 2^n seconds, capped. Spacing between any two Chromium launches.
+BACKOFF_BASE, BACKOFF_CAP, LAUNCH_SPACING = 60.0, 1800.0, 5.0
+
+
+def backoff_delay(failures: int, retry_after: float | None = None) -> float:
+    exp = BACKOFF_BASE * (2 ** max(0, failures - 1))
+    return float(min(BACKOFF_CAP, max(exp, float(retry_after or 0))))
+
+
+def _retry_after(headers: Any) -> float | None:
+    try:
+        v = (headers or {}).get("retry-after")
+        return float(v) if v is not None else None
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 class ChallengeBlocked(TimeoutError):
@@ -302,6 +337,7 @@ class PlaywrightBackend:
         self._event = asyncio.Event()
         self._credential_lock = asyncio.Lock()
         self._crashed = False
+        self.rate_limited: float | None = None     # set (Retry-After seconds, 0 = unknown) on a broker 429
         self.challenge: str | None = None          # last verification step seen on the broker page
         self._on_challenge: Callable[[str | None], None] | None = None
         self._challenge_checked = 0.0
@@ -371,10 +407,12 @@ class PlaywrightBackend:
         page = await self._context.new_page()
         # "commit" returns as soon as the broker answers; slow scripts/ads must not fail the login.
         await page.goto(self._login_url, wait_until="commit", timeout=60000)
+        self._check_alive()
         try:
             await page.wait_for_load_state("domcontentloaded", timeout=30000)
         except Exception:
             log.info("broker login page is still loading; continuing")
+        self._check_alive()
 
     async def _route(self, route, request) -> None:
         nav = request.is_navigation_request()
@@ -396,13 +434,34 @@ class PlaywrightBackend:
             self._crashed = True
             self._event.set()
 
+    def _on_response(self, response) -> None:
+        try:
+            status = int(response.status)
+            if status not in (429, 503):
+                return
+            host = (urlparse(response.url).hostname or "").lower()
+            if not _host_in(host, BROKER_HOSTS):
+                return
+            ra = _retry_after(response.headers)
+            if status == 503 and ra is None:
+                return
+            if self.rate_limited is None:
+                log.warning("broker answered %d during sign-in", status)
+            self.rate_limited = ra or 0.0
+            self._event.set()
+        except Exception:
+            pass
+
     def _check_alive(self) -> None:
+        if self.rate_limited is not None:
+            raise BrokerRateLimited(self.rate_limited or None)
         if self._crashed:
             raise BrowserCrashed("the browser stopped")
 
     def _attach(self, page) -> None:
         self._pages.append(page)
         page.on("crash", lambda _p: self._mark_crashed())
+        page.on("response", self._on_response)
         page.on("websocket", lambda ws: ws.on("framesent", self._on_frame))
         page.on("close", lambda _p=page: self._pages.remove(_p) if _p in self._pages else None)
 
@@ -674,6 +733,7 @@ class HandshakeSession:
     kinds: list[str] = field(default_factory=list)
     challenge: str | None = None     # turnstile | captcha | two_factor while the broker page shows one
     replace: bool = False            # "Sign in again anyway": this login replaces every saved session
+    retry_after: float | None = None  # broker Retry-After seconds on a 429
     last_seen: float = 0.0           # loop time of the phone's last poll (abandoned pages are closed)
 
     @property
@@ -709,6 +769,30 @@ class HandshakeManager:
         self._on_failure = on_failure
         self._clock = clock or Clock()
         self._sessions: dict[str, HandshakeSession] = {}
+        self._failures: dict[str, int] = {}          # user -> consecutive broker 429/timeout failures
+        self._cooldown_until: dict[str, float] = {}  # user -> loop time a new sign-in is allowed
+        self._global_until = 0.0                     # whole server backs off after any broker 429
+        self._last_launch: float | None = None
+
+    def cooldown_left(self, user_id: str) -> float:
+        now = asyncio.get_running_loop().time()
+        return max(0.0, self._cooldown_until.get(user_id, 0.0) - now, self._global_until - now)
+
+    def _note_result(self, s: "HandshakeSession", retry_after: float | None = None) -> None:
+        loop = asyncio.get_running_loop()
+        if s.state == "done":
+            self._failures.pop(s.user_id, None)
+            self._cooldown_until.pop(s.user_id, None)
+            return
+        if s.error not in ("broker_rate_limited", "broker_unreachable"):
+            return
+        n = self._failures.get(s.user_id, 0) + 1
+        self._failures[s.user_id] = n
+        delay = backoff_delay(n, retry_after)
+        self._cooldown_until[s.user_id] = loop.time() + delay
+        if s.error == "broker_rate_limited":
+            self._global_until = max(self._global_until, loop.time() + backoff_delay(1, retry_after))
+        log.info("sign-in backoff %.0fs after %s (attempt %d)", delay, s.error, n)
 
     def _prune(self) -> None:
         now = self._clock.utcnow()
@@ -722,6 +806,11 @@ class HandshakeManager:
         for s in list(self._sessions.values()):
             if s.user_id == user_id and s.active:
                 await self.cancel(s.id, user_id)
+        wait = self.cooldown_left(user_id)
+        if wait > 0:
+            mins = max(1, int((wait + 59) // 60))
+            raise LoginCooldown(wait, "Pocket Option is limiting sign-ins right now. Please wait about "
+                                      f"{mins} minute{'s' if mins != 1 else ''}, then send /at_login again.")
         if sum(1 for s in self._sessions.values() if s.active) >= self._cfg.max_handshakes:
             raise RuntimeError("too many logins in progress, try again shortly")
         session = HandshakeSession(secrets.token_urlsafe(24), user_id, created_at=self._clock.utcnow(),
@@ -812,6 +901,10 @@ class HandshakeManager:
             await self._run_inner(s)
         finally:
             watchdog.cancel()
+            try:
+                self._note_result(s, getattr(s, "retry_after", None))
+            except Exception:
+                pass
             self._report(s)
 
     async def _watch_idle(self, s: HandshakeSession) -> None:
@@ -838,6 +931,17 @@ class HandshakeManager:
                     s.task.cancel()
                 return
 
+    async def _space_launch(self, backend: Any) -> None:
+        """Real Chromium launches are spaced out server-wide so the broker never sees a burst of sign-ins."""
+        if not isinstance(backend, PlaywrightBackend):
+            return
+        loop = asyncio.get_running_loop()
+        if self._last_launch is not None:
+            gap = LAUNCH_SPACING - (loop.time() - self._last_launch)
+            if gap > 0:
+                await asyncio.sleep(gap)
+        self._last_launch = loop.time()
+
     async def _run_inner(self, s: HandshakeSession) -> None:
         backend = s.backend
         assert backend is not None
@@ -854,9 +958,12 @@ class HandshakeManager:
                     log.warning("login browser not started: %d MB free, %d MB needed", free, need)
                     s.state, s.error = "failed", "low_memory"
                     return
+            await self._space_launch(backend)
             try:
                 await backend.open()
             except asyncio.CancelledError:
+                raise
+            except BrokerRateLimited:
                 raise
             except Exception as exc:
                 name = type(exc).__name__
@@ -872,6 +979,11 @@ class HandshakeManager:
             tokens, meta = await backend.capture_tokens(self._cfg.handshake_timeout, lambda st: setattr(s, "state", st))
         except asyncio.CancelledError:
             s.state = "failed" if s.error == "low_memory" else "cancelled"
+            return
+        except BrokerRateLimited as exc:
+            s.state, s.error = "failed", "broker_rate_limited"
+            s.retry_after = exc.retry_after
+            log.warning("broker rate-limited the sign-in (429)")
             return
         except BrowserCrashed:
             s.state, s.error = "failed", "browser_crashed"

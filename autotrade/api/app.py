@@ -19,6 +19,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from ..auth.browser_memory import container_memory, install_quiet_playwright_handler
+from ..auth.handshake import LoginCooldown
 from ..errors import ReauthRequired, SettingsError
 from .ratelimit import RateLimiter, parse_rate, wait_text
 from ..runtime import Runtime
@@ -349,6 +350,10 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
         try:
             s = await rt.handshakes.start(p.user_id, vp, full_view=bool(body and body.full_view),
                                           replace=bool(body and body.force))
+        except LoginCooldown as exc:
+            raise HTTPException(429, {"error": "broker_cooldown", "message": exc.message,
+                                      "retry_after": int(exc.wait) + 1},
+                                headers={"Retry-After": str(int(exc.wait) + 1)}) from None
         except RuntimeError:
             raise HTTPException(503, {"error": "busy", "message": TOO_MANY_LOGINS}) from None
         except Exception as exc:     # never a blank 500 page
