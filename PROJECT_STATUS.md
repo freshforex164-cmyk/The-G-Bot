@@ -1,4 +1,4 @@
-# GBot — Phase 3 status (2026-11-23, CP8: tests 233 passed/4 skipped, tests/ 176 passed)
+# GBot — stability checkpoint 1 (2026-11-26)
 ## Commits on main (pushed via GitHub API, remote tree verified after each)
 | Checkpoint | Commit | Scope |
 |---|---|---|
@@ -47,9 +47,9 @@
   balance and limits are told once. The settled alert replies to its TRADE OPENED message.
 - Unchanged: 1-minute candle price-action engine and candle close timing.
 
-## Offline verification (Checkpoint 6)
-- Checkpoint 7: `pytest autotrade/tests/` 223 passed, 4 PostgreSQL tests skipped (no database);
-  `pytest tests/` 176 passed. New: pipeline (8), dispatch / mode (6). Earlier with PostgreSQL 16: 219 passed.
+## Offline verification
+- Stability 1: pool checkout checks, keep-alives, bounded read retries; writes never replayed.
+- Full suite: 432 passed, 4 PostgreSQL tests skipped, 21 subtests passed; SSL faults simulated.
 - Login page driven in headless Chromium at 384x661 against a simulated broker: re-login replaces both
   sessions; loading panel shown, then the live picture; page close cancels the server browser.
 - New tests: re-login override (7), stake ladder, routing (14), tracking (8), PostgreSQL settings + dual vault.

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from ..trading.models import TradeRecord, TradingSettings
 from .repo import BalanceRow, BotState, CredentialRow
+from .transient import is_transient
+
+log = logging.getLogger("autotrade.postgres")
 
 # Always applied at start-up (idempotent), even without AUTOTRADE_APPLY_SCHEMA, so tables added after the
 # first deploy exist on databases that were set up earlier.
@@ -38,8 +43,23 @@ class PostgresRepository:
 
     def __init__(self, dsn: str, *, min_size: int = 1, max_size: int = 10):
         from psycopg_pool import AsyncConnectionPool
+        from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
-        self._pool = AsyncConnectionPool(dsn, min_size=min_size, max_size=max_size, open=False)
+        # Preserve explicit DSN/SSL options; only supply missing liveness defaults.
+        options = conninfo_to_dict(dsn)
+        for key, value in {"connect_timeout": "10", "keepalives": "1", "keepalives_idle": "30",
+                           "keepalives_interval": "10", "keepalives_count": "3"}.items():
+            options.setdefault(key, value)
+        self._pool = AsyncConnectionPool(
+            make_conninfo(**options), min_size=min_size, max_size=max_size, open=False,
+            check=AsyncConnectionPool.check_connection, timeout=10, max_waiting=32,
+            max_idle=60, max_lifetime=900, reconnect_timeout=60,
+            reconnect_failed=self._reconnect_failed)
+
+    @staticmethod
+    async def _reconnect_failed(pool) -> None:
+        # Do not log conninfo: it contains the database password.
+        log.warning("database reconnect window exhausted; next checkout will retry")
 
     async def open(self, *, apply_schema: bool = False) -> None:
         await self._pool.open()
@@ -58,13 +78,23 @@ class PostgresRepository:
         await self._pool.close()
 
     async def _exec(self, sql: str, params: tuple = ()) -> None:
+        # Never replay writes after an SSL drop: COMMIT might already have succeeded.
         async with self._pool.connection() as conn:
             await conn.execute(sql, params)
 
     async def _all(self, sql: str, params: tuple = ()) -> list[tuple]:
-        async with self._pool.connection() as conn:
-            cur = await conn.execute(sql, params)
-            return await cur.fetchall()
+        # SELECT-only callers can safely retry with a new checked-out transaction.
+        for attempt in range(3):
+            try:
+                async with self._pool.connection() as conn:
+                    cur = await conn.execute(sql, params)
+                    return await cur.fetchall()
+            except Exception as exc:
+                if not is_transient(exc) or attempt == 2:
+                    raise
+                log.warning("database read interrupted (%s); retry %d/2", type(exc).__name__, attempt + 1)
+                await asyncio.sleep(0.1 * 2 ** attempt)
+        raise RuntimeError("unreachable read retry state")
 
     # credentials -----------------------------------------------------------------------------
     async def upsert_credential(self, row: CredentialRow) -> None:
