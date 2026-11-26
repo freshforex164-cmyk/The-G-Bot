@@ -589,7 +589,7 @@ async def run_serve() -> None:
 
     bot = TelegramBotClient(token)
     try:
-        # None unless AUTOTRADE_API_URL and AUTOTRADE_JWT_SECRET are set.
+        # None unless AUTOTRADE_JWT_SECRET is set; API defaults to the local engine.
         autotrade = AutotradeClient.from_env()
     except ValueError as exc:
         raise config.ConfigurationError(str(exc)) from None
@@ -678,7 +678,7 @@ async def run_serve() -> None:
             **handler.admin_metrics(),
             "active_pairs": len(scanner.pairs),
             "active_signals": len(scanner.active_signals),
-            "ssid_configured": bool(os.environ.get("PO_SSID", "").strip()),
+            "ssid_configured": bool(os.getenv("PO_SSID", "").strip() or os.getenv("AUTOTRADE_FEED_SSID", "").strip()),
             "account_type": config.account_type(),
         }
 
@@ -686,7 +686,7 @@ async def run_serve() -> None:
         health_provider=public_health,
         admin_provider=admin_status,
         admin_token=os.environ.get("ADMIN_TOKEN"),
-        host="0.0.0.0",
+        host=os.getenv("HOST", "127.0.0.1"),
         port=port,
     )
     await status_server.start()

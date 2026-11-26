@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import broker.pocket_option as pocket_option_module
 from broker.pocket_option import PocketOptionBroker, PocketOptionOperationError
@@ -161,7 +161,8 @@ class ReadOnlyBrokerTests(unittest.IsolatedAsyncioTestCase):
         FakePocketOptionClient.instances.clear()
         FakePocketOptionClient.is_demo_value = True
         self.client_patch = patch.object(
-            pocket_option_module, "PocketOptionAsync", FakePocketOptionClient
+            pocket_option_module, "open_pocket_option",
+            AsyncMock(side_effect=lambda ssid, config, timeout: FakePocketOptionClient(ssid, config))
         )
         self.client_patch.start()
         self.addCleanup(self.client_patch.stop)

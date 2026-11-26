@@ -63,6 +63,7 @@ class TradingManager:
         self._workers: dict[str, UserWorker] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._starting: set[str] = set()
 
     async def _on_session_expired(self, user_id: str, kind: str, reason: str) -> None:
         """A stored session was rejected by the broker: mark it expired and prompt /at_login (once)."""
@@ -102,32 +103,37 @@ class TradingManager:
                 return self._workers[user_id].snapshot()
             if self.halted:
                 raise TradingHalted("trading is halted by the operator")
-            if sum(1 for u in self._tasks if self.is_running(u)) >= self.cfg.max_workers:
+            if sum(1 for u in self._tasks if self.is_running(u)) + len(self._starting) >= self.cfg.max_workers:
                 raise CapacityError("the service is at capacity, try again later")
-            s = await self.repo.get_settings(user_id)
-            if s.mode == LIVE and not (self.cfg.allow_live and s.live_confirmed):
-                raise LiveDisabled("live trading is not enabled")
-            s.validate(self.cfg)
-            kind = "demo" if s.mode == DEMO else "real"
-            # One socket: the health check opens (or reuses) the pooled connection and the worker adopts it.
-            res = await self.health.check(user_id, kind, keep=True)
-            if not res.ok:
-                if res.status in ("missing", "expired"):
-                    raise ReauthRequired(kind, res.status)
-                raise ServiceUnavailable(f"broker unreachable: {res.reason}")
-            worker = UserWorker(user_id, repo=self.repo, vault=self.vault, feed=self.feed,
-                                broker_factory=self._factory, risk=self._risk, clock=self._clock,
-                                is_halted=lambda: self.halted, reconnect_base=self._reconnect_base,
-                                notifier=self._notifier, on_session_expired=self._on_session_expired,
-                                adopt=lambda k, u=user_id: self._balances.take(u, k))
-            worker.apply_settings(s)
-            self._workers[user_id] = worker
-            task = asyncio.create_task(worker.run(), name=f"worker:{user_id}")
-            task.add_done_callback(lambda t, u=user_id: self._on_done(u, t))
-            self._tasks[user_id] = task
-            await worker._persist()
-            await self.repo.audit(user_id, "bot_started", {"mode": s.mode})
-            return worker.snapshot()
+            # Admission is atomic in this event loop, before any external await.
+            self._starting.add(user_id)
+            try:
+                s = await self.repo.get_settings(user_id)
+                if s.mode == LIVE and not (self.cfg.allow_live and s.live_confirmed):
+                    raise LiveDisabled("live trading is not enabled")
+                s.validate(self.cfg)
+                kind = "demo" if s.mode == DEMO else "real"
+                # One socket: the health check opens (or reuses) the pooled connection and the worker adopts it.
+                res = await self.health.check(user_id, kind, keep=True)
+                if not res.ok:
+                    if res.status in ("missing", "expired"):
+                        raise ReauthRequired(kind, res.status)
+                    raise ServiceUnavailable(f"broker unreachable: {res.reason}")
+                worker = UserWorker(user_id, repo=self.repo, vault=self.vault, feed=self.feed,
+                                    broker_factory=self._factory, risk=self._risk, clock=self._clock,
+                                    is_halted=lambda: self.halted, reconnect_base=self._reconnect_base,
+                                    notifier=self._notifier, on_session_expired=self._on_session_expired,
+                                    adopt=lambda k, u=user_id: self._balances.take(u, k))
+                worker.apply_settings(s)
+                self._workers[user_id] = worker
+                task = asyncio.create_task(worker.run(), name=f"worker:{user_id}")
+                task.add_done_callback(lambda t, u=user_id: self._on_done(u, t))
+                self._tasks[user_id] = task
+                await worker._persist()
+                await self.repo.audit(user_id, "bot_started", {"mode": s.mode})
+                return worker.snapshot()
+            finally:
+                self._starting.discard(user_id)
 
     def _on_done(self, user_id: str, task: asyncio.Task) -> None:
         if not task.cancelled() and task.exception():

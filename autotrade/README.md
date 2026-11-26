@@ -1,9 +1,9 @@
 # autotrade - multi-user auto-trading module
 
-Separate service. It is not in `render.yaml`, and GBot's signal scanner still never trades. GBot only
+Separate process on the same VPS; GBot's signal scanner still never places orders itself. GBot only
 *controls* this service through the optional `/autotrade` Telegram commands (`autotrade_client.py`,
 `autotrade_commands.py` at the repo root), which stay "not set up" until you deploy the service and
-set `AUTOTRADE_API_URL` + `AUTOTRADE_JWT_SECRET` on GBot.
+set the shared `AUTOTRADE_JWT_SECRET` and a public HTTPS login URL on GBot.
 
 ## Layout
 ```text
@@ -20,7 +20,7 @@ autotrade/
   tests/     80 offline tests (+3 Postgres tests when AUTOTRADE_TEST_DATABASE_URL is set)
   Dockerfile                 image with Chromium (build from repo root)
 
-repo root (GBot side, standard library only, no new GBot dependencies)
+repo root (GBot side; python-dotenv loads the standard .env)
   autotrade_client.py        signs short-lived tokens for tg:<telegram user id> and calls the service
   autotrade_commands.py      /autotrade, /at_* Telegram commands
   tests/test_autotrade_commands.py
@@ -103,37 +103,28 @@ Real session, an explicit `confirm_live`, and a lower stake cap (`AUTOTRADE_LIVE
 A new login resets the user to Demo. Orders are never retried; an order that fails mid-flight is stored
 as `unknown` for review. Errors in one worker never reach another.
 
-## Setup
-Deploy as its own service from the repo root with `autotrade/Dockerfile` (e.g. a Render *Docker* web
-service, Dockerfile path `./autotrade/Dockerfile`, context `.`), plus a Postgres database. Without Docker:
-```bash
-pip install -r autotrade/requirements.txt && playwright install --with-deps chromium
-python -c "from autotrade.vault.crypto import KeyRing; print(KeyRing.generate_key())"   # -> AUTOTRADE_VAULT_KEY
-```
-Environment: `DATABASE_URL`, `AUTOTRADE_VAULT_KEY` (or `AUTOTRADE_VAULT_KEYS` + `AUTOTRADE_VAULT_ACTIVE`),
-`AUTOTRADE_JWT_SECRET` (32+ chars, shared with your auth), `AUTOTRADE_FEED_SSID` (Demo account),
-optional `AUTOTRADE_ALLOW_LIVE`, `AUTOTRADE_MAX_STAKE`, `AUTOTRADE_MAX_WORKERS`, `AUTOTRADE_CORS_ORIGINS`,
-`AUTOTRADE_TRUST_PROXY` (default true: trust `X-Forwarded-Proto` from Render's HTTPS proxy) and `FORWARDED_ALLOW_IPS` (default `*`).
-`TELEGRAM_BOT_TOKEN` (same bot token as GBot) enables the trade opened/closed alerts; without it trading
-still works but users get no alerts.
+## Setup on the Oracle Ubuntu VPS
 
-### 512 MB instances (Render free/starter)
-Login runs one Chromium at a time (`AUTOTRADE_MAX_HANDSHAKES=1`) in low-memory mode (`AUTOTRADE_LOW_MEMORY`,
-default true): `--single-process --no-zygote --no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage
---disable-gpu --js-flags=--max-old-space-size=256` plus low-end-device mode, device scale 1, no service
-workers. During login the broker's images, fonts, media and stylesheets (`AUTOTRADE_BLOCK_LOGIN_ASSETS`) and
-third-party trackers (`AUTOTRADE_BLOCK_THIRD_PARTY`) are not loaded; Google sign-in and CAPTCHA pages load in
-full. The browser is closed as soon as the Demo and Real sessions are captured, every close step is time-boxed,
-and a crash ends on a readable "browser stopped unexpectedly, try again" page instead of a blank screen.
-Run `AUTOTRADE_APPLY_SCHEMA=1 python -m autotrade.main` once (applies `schema.sql`), then without the flag.
-New tables added later (`autotrade_balances`) are created automatically at start-up.
-Keep the vault key out of the database and out of git. Run as its own service (needs Chromium and a
-long-lived process, so not a serverless function and not the Render GBot service).
+Run the bot and auto-trading engine as separate supervised processes on the **same VPS**.
+See [the Oracle deployment guide](../docs/oracle-vps.md) for `.env`, systemd, HTTPS proxy,
+Neon pooling, verification, and rollback. No hosted-web-service router or webhook is required.
 
-GBot (the existing Render service) gets three variables and no new packages:
-`AUTOTRADE_API_URL` (URL GBot calls), `AUTOTRADE_PUBLIC_URL` (HTTPS URL users open for login; defaults to the
-API URL; must be HTTPS for the in-Telegram button) and `AUTOTRADE_JWT_SECRET` (same value as the service).
-The commands are registered in Telegram's menu only when these are set.
+`AUTOTRADE_API_URL` defaults to `http://127.0.0.1:8100`; `AUTOTRADE_PUBLIC_URL` must be your
+actual public HTTPS login URL. Both processes load the repository `.env` without overriding
+service environment values. The engine accepts `AUTOTRADE_FEED_SSID`, falling back to `PO_SSID`;
+the scanner accepts `PO_SSID`, falling back to `AUTOTRADE_FEED_SSID`. Prefer a dedicated Demo feed.
+
+`AUTOTRADE_ALLOW_LIVE=1` enables Live eligibility, not automatic real-money trading: an active
+Real session and explicit per-user confirmation are still required. Existing risk checks remain.
+
+VPS defaults use normal multi-process Chromium and full login assets. Smaller hosts may opt into
+`AUTOTRADE_LOW_MEMORY=1`, `AUTOTRADE_CHROMIUM_SINGLE_PROCESS=1`, and `AUTOTRADE_BLOCK_LOGIN_ASSETS=1`.
+Browser concurrency remains bounded and configurable via `AUTOTRADE_MAX_HANDSHAKES`; CAPTCHA,
+2FA, rate limits, cancellation cleanup, and memory guards are retained.
+
+For containers, build `autotrade/Dockerfile` from the repository root. Publish port 8100 only to
+loopback on the VPS and run the bot alongside it. The container also needs the required environment
+variables. Do not expose the unencrypted engine port publicly.
 
 ## Integrating with your codebase
 - Auth: set the same JWT secret, or pass your own dependency: `create_app(rt, auth=your_dependency)`

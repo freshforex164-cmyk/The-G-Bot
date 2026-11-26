@@ -1,0 +1,21 @@
+# Substitute your real domain and existing certificate paths before installing.
+server {
+    listen 80;
+    server_name bot.example.invalid;
+    return 301 https://$host$request_uri;
+}
+server {
+    listen 443 ssl;
+    server_name bot.example.invalid;
+    ssl_certificate /etc/letsencrypt/live/bot.example.invalid/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/bot.example.invalid/privkey.pem;
+    location / {
+        proxy_pass http://127.0.0.1:8100;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # Replace, do not append untrusted client-supplied forwarding headers.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Forwarded "";
+        proxy_read_timeout 210s;
+    }
+}

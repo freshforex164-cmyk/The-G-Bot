@@ -155,7 +155,7 @@ class InputEvent(BaseModel):
 
 
 def is_secure_request(request: Request, trust_proxy: bool) -> bool:
-    """True for HTTPS, including TLS terminated by the hosting proxy (Render, Fly, etc.)."""
+    """True for HTTPS, including TLS terminated by the configured local TLS proxy."""
     if request.url.scheme == "https":
         return True
     if trust_proxy:
@@ -415,8 +415,8 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
         except HTTPException:
             body.password = SecretStr("")
             raise
-        # TLS is mandatory outside local tests. Behind Render's proxy TLS ends at the proxy, so the
-        # forwarded protocol is trusted (AUTOTRADE_TRUST_PROXY, default on).
+        # TLS is mandatory outside local tests. Uvicorn accepts forwarded protocol only
+        # from configured proxy IPs; raw forwarded headers are not trusted by default.
         if not is_secure_request(request, rt.cfg.trust_proxy):
             body.password = SecretStr("")
             raise HTTPException(400, {"error": "https_required", "message": "A secure HTTPS connection is required."})

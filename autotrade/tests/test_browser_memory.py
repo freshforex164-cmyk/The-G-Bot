@@ -1,4 +1,4 @@
-"""Checkpoint 8: login browser memory safety (512 MB Render) - flags, throttled pictures, memory guard,
+"""Checkpoint 8: login browser memory safety (optional low-memory configuration) - flags, throttled pictures, memory guard,
 verified cleanup of pages/context/browser/driver, and quiet handling of TargetClosedError futures."""
 import asyncio
 import os
@@ -21,7 +21,7 @@ class FlagTests(unittest.TestCase):
         self.assertNotIn("--single-process", hs.launch_args(True, single_process=False))
         self.assertIn("--disable-dev-shm-usage", hs.launch_args(True, single_process=False))
         self.assertEqual(len(args), len(set(args)))
-        self.assertTrue(Config().chromium_single_process)
+        self.assertFalse(Config().chromium_single_process)
 
 
 class Closable:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,12 @@ class PostgresRepository:
         for key, value in {"connect_timeout": "10", "keepalives": "1", "keepalives_idle": "30",
                            "keepalives_interval": "10", "keepalives_count": "3"}.items():
             options.setdefault(key, value)
+        self._sql_timeouts = tuple(os.getenv(name, default).strip() for name, default in (
+            ("AUTOTRADE_DB_STATEMENT_TIMEOUT_MS", "15000"),
+            ("AUTOTRADE_DB_LOCK_TIMEOUT_MS", "5000"),
+            ("AUTOTRADE_DB_IDLE_TRANSACTION_TIMEOUT_MS", "30000")))
+        if any(not value.isdigit() for value in self._sql_timeouts):
+            raise ValueError("database timeout settings must be non-negative integer milliseconds")
         self._pool = AsyncConnectionPool(
             make_conninfo(**options), min_size=min_size, max_size=max_size, open=False,
             check=AsyncConnectionPool.check_connection, timeout=10, max_waiting=32,
@@ -77,9 +84,23 @@ class PostgresRepository:
     async def close(self) -> None:
         await self._pool.close()
 
+    async def _set_timeouts(self, conn) -> None:
+        # Transaction-local settings work with Neon transaction pooling. Preserve
+        # nonzero database/DSN operator settings; never blindly replay writes.
+        await conn.execute("""select
+            set_config('statement_timeout', case when current_setting('statement_timeout') = '0'
+                then %s else current_setting('statement_timeout') end, true),
+            set_config('lock_timeout', case when current_setting('lock_timeout') = '0'
+                then %s else current_setting('lock_timeout') end, true),
+            set_config('idle_in_transaction_session_timeout',
+                case when current_setting('idle_in_transaction_session_timeout') = '0'
+                then %s else current_setting('idle_in_transaction_session_timeout') end, true)
+            """, self._sql_timeouts)
+
     async def _exec(self, sql: str, params: tuple = ()) -> None:
         # Never replay writes after an SSL drop: COMMIT might already have succeeded.
         async with self._pool.connection() as conn:
+            await self._set_timeouts(conn)
             await conn.execute(sql, params)
 
     async def _all(self, sql: str, params: tuple = ()) -> list[tuple]:
@@ -87,6 +108,7 @@ class PostgresRepository:
         for attempt in range(3):
             try:
                 async with self._pool.connection() as conn:
+                    await self._set_timeouts(conn)
                     cur = await conn.execute(sql, params)
                     return await cur.fetchall()
             except Exception as exc:

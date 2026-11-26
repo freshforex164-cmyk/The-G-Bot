@@ -10,6 +10,7 @@ from typing import Any, TypeVar
 
 from BinaryOptionsToolsV2.config import Config as LibraryConfig
 from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
+from broker.sdk_async import open_pocket_option
 
 from config import (
     CONNECTION_MONITOR_INTERVAL_SECONDS,
@@ -99,7 +100,7 @@ class PocketOptionBroker:
             timeout_secs=int(RECONNECT_CALL_TIMEOUT_SECONDS),
         )
         try:
-            client = PocketOptionAsync(ssid=self._ssid, config=library_config)
+            client = await open_pocket_option(self._ssid, config=library_config, timeout=INITIAL_CONNECT_TIMEOUT_SECONDS)
         except Exception as exc:
             raise PocketOptionAuthenticationError(
                 f"Pocket Option could not initialize the configured session "

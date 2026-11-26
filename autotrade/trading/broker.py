@@ -83,35 +83,36 @@ class PocketOptionBroker:
         self._api = None
 
     async def connect(self) -> None:
-        from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
+        from broker.sdk_async import open_pocket_option
 
+        if self._api is not None:
+            return
         try:
-            self._api = PocketOptionAsync(self._ssid)
-        except ValueError as exc:
-            raise SessionExpired("ssid is malformed") from exc
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._timeout
-        while loop.time() < deadline:
-            if self._api.is_ssid_valid():
-                return
-            client = getattr(self._api, "client", None)
-            try:
-                rejected = bool(client.auth_error()) if client is not None else False
-            except Exception:
-                rejected = False
-            if rejected:
-                await self.close()
-                raise SessionExpired("broker rejected the session")
-            await asyncio.sleep(0.25)
-        await self.close()
-        raise Disconnected("broker did not confirm the session in time")
+            async with asyncio.timeout(self._timeout):
+                self._api = await open_pocket_option(self._ssid, timeout=self._timeout)
+                while True:
+                    if self._api.is_ssid_valid():
+                        return
+                    client = getattr(self._api, "client", None)
+                    if client is not None and client.auth_error():
+                        raise SessionExpired("broker rejected the session")
+                    await asyncio.sleep(0.25)
+        except asyncio.CancelledError:
+            await self.close()
+            raise
+        except ValueError:
+            await self.close()
+            raise SessionExpired("ssid is malformed") from None
+        except Exception as exc:
+            await self.close()
+            raise map_exception(exc) from None
 
     async def close(self) -> None:
         api, self._api = self._api, None
         if api is not None:
             try:
-                await api.shutdown()
-            except Exception:  # best effort
+                await asyncio.wait_for(api.shutdown(), timeout=5)
+            except Exception:
                 log.debug("shutdown failed", exc_info=False)
 
     def _need(self):

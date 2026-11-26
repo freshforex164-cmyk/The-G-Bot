@@ -45,7 +45,7 @@ class LowMemoryBrowserTests(unittest.TestCase):
     def test_one_login_browser_at_a_time_by_default(self):
         from ..config import Config
         self.assertEqual(Config().max_handshakes, 1)
-        self.assertTrue(Config().low_memory)
+        self.assertFalse(Config().low_memory)
 
 
 class BrokerPageVisibleWhenNeededTests(unittest.IsolatedAsyncioTestCase):

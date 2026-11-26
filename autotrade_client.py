@@ -18,6 +18,10 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable
 
+from runtime_env import load_environment
+
+load_environment()
+
 API_TOKEN_TTL_SECONDS = 120
 LOGIN_LINK_TTL_SECONDS = 900          # the /at_login link works for 15 minutes
 SIGNAL_TOKEN_TTL_SECONDS = 30         # a signal hand-off token only places that one signal
@@ -71,8 +75,8 @@ class AutotradeClient:
 
     @classmethod
     def from_env(cls) -> "AutotradeClient | None":
-        """None (auto-trading commands answer "not set up") unless both variables are set."""
-        url = os.environ.get("AUTOTRADE_API_URL", "").strip()
+        """Use the local service by default; no trading commands without a JWT secret."""
+        url = os.getenv("AUTOTRADE_API_URL", "").strip() or "http://127.0.0.1:8100"
         secret = os.environ.get("AUTOTRADE_JWT_SECRET", "").strip()
         if not url or not secret:
             return None

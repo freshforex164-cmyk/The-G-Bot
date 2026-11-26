@@ -3,6 +3,10 @@
 import json
 import os
 
+from runtime_env import load_environment
+
+load_environment()
+
 from strategy.settings import STRATEGY_SETTINGS
 
 def _positive_int_setting(name: str, default: int) -> int:
@@ -74,10 +78,10 @@ class ConfigurationError(ValueError):
 def load_ssid() -> str:
     """Load and validate the single Pocket Option session without logging it."""
     secret_name = "PO_SSID"
-    ssid = os.environ.get(secret_name, "").strip()
+    ssid = (os.getenv(secret_name, "").strip() or os.getenv("AUTOTRADE_FEED_SSID", "").strip())
     if not ssid:
         raise ConfigurationError(
-            "Missing required secret PO_SSID. Add PO_SSID in Replit Secrets."
+            "Missing PO_SSID (or AUTOTRADE_FEED_SSID). Set it in the environment or repository .env file."
         )
     if not ssid.startswith('42["auth",'):
         raise ConfigurationError(
@@ -101,7 +105,7 @@ def load_ssid() -> str:
 
 def account_type(ssid: str | None = None) -> str:
     """Return DEMO or REAL from the SSID's isDemo flag; never returns SSID data."""
-    raw = (ssid if ssid is not None else os.environ.get("PO_SSID", "")).strip()
+    raw = (ssid if ssid is not None else (os.getenv("PO_SSID", "").strip() or os.getenv("AUTOTRADE_FEED_SSID", "").strip())).strip()
     try:
         payload = json.loads(raw[2:]) if raw.startswith("42[") else None
         flag = payload[1].get("isDemo") if isinstance(payload, list) else None

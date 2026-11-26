@@ -1,0 +1,24 @@
+[Unit]
+Description=The G Bot auto-trading engine and broker login
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=gbot
+Group=gbot
+WorkingDirectory=/opt/The-G-Bot
+EnvironmentFile=/opt/The-G-Bot/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/The-G-Bot/.venv/bin/python -m autotrade.main
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=210
+KillSignal=SIGINT
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

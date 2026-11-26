@@ -1,4 +1,5 @@
-# Extra dependencies for the autotrade service only. The GBot bot (render.yaml) does not need them.
+# Dependencies for the VPS autotrade service (install alongside the root project).
+python-dotenv>=1.0,<2
 binaryoptionstoolsv2==0.2.18
 cryptography>=43
 fastapi>=0.115

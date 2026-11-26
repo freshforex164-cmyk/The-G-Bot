@@ -41,6 +41,7 @@ class SharedMarketFeed:
                 self._tasks[sym] = asyncio.create_task(self._run(sym), name=f"feed:{sym}")
 
     async def release(self, symbols: tuple[str, ...]) -> None:
+        cancelled = []
         for sym in set(symbols):
             if self._refs[sym] <= 0:
                 continue
@@ -50,7 +51,9 @@ class SharedMarketFeed:
                 task = self._tasks.pop(sym, None)
                 if task:
                     task.cancel()
+                    cancelled.append(task)
                 self._ticks.pop(sym, None)
+        await asyncio.gather(*cancelled, return_exceptions=True)
         if not self._refs:              # nobody needs prices: close the idle WebSocket too
             await self._drop_broker()
 
@@ -128,23 +131,33 @@ class SharedMarketFeed:
             if broker is None:
                 self.state = "unconfigured"
                 return None
-            await broker.connect()
+            try:
+                await asyncio.wait_for(broker.connect(), timeout=30)
+            except BaseException:
+                try:
+                    await asyncio.wait_for(broker.close(), timeout=5)
+                except Exception:
+                    pass
+                raise
             self._broker = broker
             self.state = "connected"
             return broker
 
-    async def _drop_broker(self) -> None:
+    async def _drop_broker(self, *, expected=None) -> None:
         async with self._lock:
+            if expected is not None and self._broker is not expected:
+                return
             broker, self._broker = self._broker, None
         if broker is not None:
             try:
-                await broker.close()
+                await asyncio.wait_for(broker.close(), timeout=5)
             except Exception:
                 pass
 
     async def _run(self, symbol: str) -> None:
         delay = 1.0
         while True:
+            broker = None
             try:
                 broker = await self._get_broker()
                 if broker is None:
@@ -152,6 +165,8 @@ class SharedMarketFeed:
                     continue
                 self.stream_starts[symbol] += 1
                 async for price in broker.ticks(symbol):
+                    if broker is not self._broker:
+                        break
                     stamp = None
                     if isinstance(price, dict):
                         from data.candles import _normalize_broker_timestamp
@@ -167,12 +182,14 @@ class SharedMarketFeed:
             except SessionExpired:
                 self.state = "rejected"
                 log.error("feed account session was rejected; replace %s", "AUTOTRADE_FEED_SSID")
-                await self._drop_broker()
+                if broker is not None:
+                    await self._drop_broker(expected=broker)
                 await asyncio.sleep(60)
             except Exception as exc:
                 self.state = "reconnecting"
                 self._ticks.pop(symbol, None)   # a stale price must never look current
                 log.warning("feed stream %s failed (%s); retrying", symbol, type(exc).__name__)
-                await self._drop_broker()
+                if broker is not None:
+                    await self._drop_broker(expected=broker)
                 await asyncio.sleep(delay + random.random())
                 delay = min(delay * 2, self._backoff_max)

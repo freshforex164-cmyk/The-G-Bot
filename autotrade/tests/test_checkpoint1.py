@@ -1,7 +1,6 @@
-"""Checkpoint 1: Render memory limits, login challenge reporting, no direct SSID login, expired-session
+"""Checkpoint 1: login challenge reporting, no direct SSID login, expired-session
 teardown with an /at_login prompt. Offline only; no live broker."""
 import asyncio
-import re
 import unittest
 from pathlib import Path
 
@@ -90,18 +89,6 @@ class HandshakeFailureReportingTests(unittest.IsolatedAsyncioTestCase):
 
     def test_every_challenge_has_a_hint(self):
         self.assertEqual(set(CHALLENGE_HINTS), {"turnstile", "captcha", "two_factor"})
-
-
-class RenderMemoryTests(unittest.TestCase):
-    def test_no_heap_flag_above_512_mb(self):
-        for name in ("render.yaml", "autotrade/Dockerfile", "autotrade/auth/handshake.py"):
-            for size in re.findall(r"max-old-space-size=(\d+)", (ROOT / name).read_text()):
-                self.assertLessEqual(int(size), 256, name)
-
-    def test_render_limits_malloc_arenas(self):
-        text = (ROOT / "render.yaml").read_text()
-        self.assertRegex(text, r"key: MALLOC_ARENA_MAX\s+value: \"2\"")
-        self.assertIn("MALLOC_ARENA_MAX=2", (ROOT / "autotrade/Dockerfile").read_text())
 
 
 class NoDirectSsidTests(unittest.TestCase):

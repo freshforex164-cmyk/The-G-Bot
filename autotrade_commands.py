@@ -1,7 +1,7 @@
 """Telegram commands that control the separate autotrade service (multi-user auto-trading).
 
 Signals stay read-only. These commands only work in a private chat with the bot and only when
-AUTOTRADE_API_URL and AUTOTRADE_JWT_SECRET are set; otherwise they answer "not set up".
+AUTOTRADE_JWT_SECRET is set (AUTOTRADE_API_URL defaults to the local engine); otherwise they answer "not set up".
 New users always start in Demo; Real (Live) needs /at_live confirm. /at_login reuses a saved session
 instead of a new browser sign-in. The only way to connect is the secure email/password handshake;
 pasted SSIDs are never accepted.

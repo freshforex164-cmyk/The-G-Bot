@@ -1,5 +1,5 @@
 """Auto-trading places the GBot signals a user receives, records results and balance,
-and the hosted sign-in works behind an HTTPS-terminating proxy (Render)."""
+and the hosted sign-in works behind an HTTPS-terminating proxy (local VPS proxy)."""
 import asyncio
 import unittest
 from datetime import timedelta
@@ -108,12 +108,13 @@ class SignalApiTests(unittest.TestCase):
 
 
 class ProxyHttpsLoginTests(unittest.TestCase):
-    """Render terminates TLS at its proxy: the app sees http plus X-Forwarded-Proto: https."""
+    """A configured trusted proxy terminates TLS: the app sees http plus X-Forwarded-Proto: https."""
 
     def setUp(self):
         self.env = Env()
         self.backend = CredentialBackend()
         self.env.rt.handshakes._factory = lambda: self.backend
+        self.env.rt.cfg = __import__("dataclasses").replace(self.env.cfg, trust_proxy=True)
         self.app = create_app(self.env.rt, background=False)
         self.login = {"Authorization": "Bearer " + token(self.env.cfg.jwt_secret, scope="login")}
 
@@ -127,7 +128,7 @@ class ProxyHttpsLoginTests(unittest.TestCase):
         self.fail("login not ready")
 
     def test_sign_in_behind_https_proxy_is_accepted(self):
-        with TestClient(self.app, base_url="http://gbot.onrender.com", client=("10.20.30.40", 5000)) as c:
+        with TestClient(self.app, base_url="http://gbot.example.invalid", client=("10.20.30.40", 5000)) as c:
             sid = self._ready(c)
             r = c.post(f"/auth/handshake/{sid}/credentials", json={"email": "demo@example.invalid", "password": PASSWORD},
                        headers={**self.login, "X-Forwarded-Proto": "https"})
@@ -135,7 +136,7 @@ class ProxyHttpsLoginTests(unittest.TestCase):
             self.assertTrue(self.backend.accepted)
 
     def test_plain_http_from_the_internet_is_refused_without_echoing_the_password(self):
-        with TestClient(self.app, base_url="http://gbot.onrender.com", client=("10.20.30.40", 5000)) as c:
+        with TestClient(self.app, base_url="http://gbot.example.invalid", client=("10.20.30.40", 5000)) as c:
             sid = self._ready(c)
             r = c.post(f"/auth/handshake/{sid}/credentials", json={"email": "demo@example.invalid", "password": PASSWORD},
                        headers=self.login)

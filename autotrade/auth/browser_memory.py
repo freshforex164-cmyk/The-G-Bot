@@ -1,4 +1,4 @@
-"""Memory safety for the login browser on a small (Render 512 MB) container.
+"""Memory safety for the login browser on a memory-constrained host/container.
 
 * ``container_memory`` reads the cgroup limit/usage so a login is refused (cleanly, with a message) when
   starting Chromium would get the container OOM-killed - which would also stop every running trade worker.

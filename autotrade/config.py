@@ -4,6 +4,10 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from runtime_env import load_environment
+
+load_environment()
+
 
 def _bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -29,15 +33,15 @@ class Config:
     max_workers: int = 200
     feed_ssid_env: str = "AUTOTRADE_FEED_SSID"  # name of the env var holding the feed account SSID
     handshake_timeout: float = 300.0
-    max_handshakes: int = 1           # one Chromium at a time fits Render's 512 MB instance
+    max_handshakes: int = 1           # bounded Chromium concurrency; increase only after measuring VPS memory
     handshake_idle_timeout: float = 150.0  # login page closed / stopped polling: free its Chromium
     headless: bool = True
-    low_memory: bool = True           # Chromium without GPU/shared memory, small JS heap (512 MB hosts)
-    chromium_single_process: bool = True  # low-memory Chromium in one OS process (turn off if a site crashes)
+    low_memory: bool = False           # Chromium without GPU/shared memory, small JS heap (512 MB hosts)
+    chromium_single_process: bool = False  # low-memory Chromium in one OS process (turn off if a site crashes)
     screenshot_interval: float = 1.5  # low-memory: seconds between live pictures of the broker page
     handshake_min_free_mb: float = 150.0   # do not start Chromium with less free container memory (0 = off)
     handshake_memory_floor_mb: float = 40.0  # close Chromium if free memory falls below this (0 = off)
-    block_login_assets: bool = True   # no images/fonts/media/stylesheets from the broker during login
+    block_login_assets: bool = False   # no images/fonts/media/stylesheets from the broker during login
     block_third_party: bool = True    # no trackers/ads during login (Google/CAPTCHA always allowed)
     cabinet_switch_delay: float = 3.5 # pause between the Real and Demo cabinet pages (fast switching gets blocked)
     # Per-user brute-force limits: "<attempts>/<seconds>".
@@ -46,14 +50,14 @@ class Config:
     telegram_bot_token: str = ""      # trade open/settle alerts go straight to the user's Telegram chat
     recheck_seconds: float = 6 * 3600
     cors_origins: tuple[str, ...] = field(default_factory=tuple)
-    trust_proxy: bool = True          # TLS terminated by the host's proxy (Render)
+    trust_proxy: bool = False         # Uvicorn handles headers from explicitly trusted proxy IPs
 
     @classmethod
     def from_env(cls) -> "Config":
         origins = tuple(o.strip() for o in os.environ.get("AUTOTRADE_CORS_ORIGINS", "").split(",") if o.strip())
         return cls(
-            database_url=os.environ.get("DATABASE_URL", ""),
-            jwt_secret=os.environ.get("AUTOTRADE_JWT_SECRET", ""),
+            database_url=os.getenv("DATABASE_URL", "").strip(),
+            jwt_secret=os.getenv("AUTOTRADE_JWT_SECRET", "").strip(),
             jwt_audience=os.environ.get("AUTOTRADE_JWT_AUDIENCE") or None,
             allow_live=_bool("AUTOTRADE_ALLOW_LIVE", True),
             trading_halted=_bool("AUTOTRADE_HALTED", False),
@@ -64,12 +68,12 @@ class Config:
             max_handshakes=int(_num("AUTOTRADE_MAX_HANDSHAKES", 1)),
             handshake_idle_timeout=_num("AUTOTRADE_HANDSHAKE_IDLE_TIMEOUT", 150),
             headless=_bool("AUTOTRADE_HEADLESS", True),
-            low_memory=_bool("AUTOTRADE_LOW_MEMORY", True),
-            chromium_single_process=_bool("AUTOTRADE_CHROMIUM_SINGLE_PROCESS", True),
+            low_memory=_bool("AUTOTRADE_LOW_MEMORY", False),
+            chromium_single_process=_bool("AUTOTRADE_CHROMIUM_SINGLE_PROCESS", False),
             screenshot_interval=_num("AUTOTRADE_SCREENSHOT_INTERVAL", 1.5),
             handshake_min_free_mb=_num("AUTOTRADE_HANDSHAKE_MIN_FREE_MB", 150),
             handshake_memory_floor_mb=_num("AUTOTRADE_HANDSHAKE_MEMORY_FLOOR_MB", 40),
-            block_login_assets=_bool("AUTOTRADE_BLOCK_LOGIN_ASSETS", True),
+            block_login_assets=_bool("AUTOTRADE_BLOCK_LOGIN_ASSETS", False),
             block_third_party=_bool("AUTOTRADE_BLOCK_THIRD_PARTY", True),
             cabinet_switch_delay=_num("AUTOTRADE_CABINET_SWITCH_DELAY", 3.5),
             handshake_rate=os.environ.get("AUTOTRADE_HANDSHAKE_RATE", "6/600"),
@@ -77,8 +81,8 @@ class Config:
             telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
             recheck_seconds=_num("AUTOTRADE_RECHECK_SECONDS", 6 * 3600),
             cors_origins=origins,
-            trust_proxy=_bool("AUTOTRADE_TRUST_PROXY", True),
+            trust_proxy=_bool("AUTOTRADE_TRUST_PROXY", False),
         )
 
     def feed_ssid(self) -> str | None:
-        return os.environ.get(self.feed_ssid_env) or None
+        return (os.getenv(self.feed_ssid_env, "").strip() or os.getenv("PO_SSID", "").strip()) or None

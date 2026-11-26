@@ -73,7 +73,7 @@ class SessionHealth:
 
     async def _check_pooled(self, user_id: str, kind: str, keep: bool) -> HealthResult:
         try:
-            async with self._pool.connection(user_id, kind):
+            async with asyncio.timeout(self._timeout), self._pool.connection(user_id, kind):
                 pass
         except SessionExpired as exc:          # the pool closed it, marked it expired and prompted /at_login
             await self._vault.mark_expired(user_id, kind, str(exc))

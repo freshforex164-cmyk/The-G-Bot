@@ -42,7 +42,7 @@ ALLOWED_HOSTS = ("pocketoption.com", "po.market", "po.cash", "google.com", "gsta
 BROKER_HOSTS = ("pocketoption.com", "po.market", "po.cash")
 # Google sign-in and CAPTCHA must render fully, or the user cannot solve a challenge.
 VERIFICATION_HOSTS = ("google.com", "gstatic.com", "recaptcha.net", "googleusercontent.com")
-# Low-memory mode (Render 512 MB): no GPU, no /dev/shm, small JS heap, no background services.
+# Optional low-memory mode: no GPU, no /dev/shm, small JS heap, no background services.
 LOW_MEMORY_ARGS = (
     "--no-sandbox", "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",                 # containers give /dev/shm only 64 MB: use /tmp instead
@@ -185,7 +185,7 @@ ERROR_MESSAGES = {
                        "Nothing was saved. Try again in a minute.",
     "low_memory": "The sign-in server is short of memory right now, so the secure browser was stopped before "
                   "it could crash the service (running trades are protected). Nothing was saved. Try again in a "
-                  "minute; if this keeps happening the autotrade service needs a bigger Render instance.",
+                  "minute; if this keeps happening the autotrade service needs more available VPS memory.",
     "broker_rate_limited": "Pocket Option is limiting sign-ins from the server right now (too many requests). "
                            "Nothing was saved. Wait a few minutes, then send /at_login again.",
     "login_timeout": "The sign-in took too long and was closed. Send /at_login for a new link.",
@@ -773,6 +773,7 @@ class HandshakeManager:
         self._cooldown_until: dict[str, float] = {}  # user -> loop time a new sign-in is allowed
         self._global_until = 0.0                     # whole server backs off after any broker 429
         self._last_launch: float | None = None
+        self._launch_lock = asyncio.Lock()
 
     def cooldown_left(self, user_id: str) -> float:
         now = asyncio.get_running_loop().time()
@@ -935,12 +936,13 @@ class HandshakeManager:
         """Real Chromium launches are spaced out server-wide so the broker never sees a burst of sign-ins."""
         if not isinstance(backend, PlaywrightBackend):
             return
-        loop = asyncio.get_running_loop()
-        if self._last_launch is not None:
-            gap = LAUNCH_SPACING - (loop.time() - self._last_launch)
-            if gap > 0:
-                await asyncio.sleep(gap)
-        self._last_launch = loop.time()
+        async with self._launch_lock:
+            loop = asyncio.get_running_loop()
+            if self._last_launch is not None:
+                gap = LAUNCH_SPACING - (loop.time() - self._last_launch)
+                if gap > 0:
+                    await asyncio.sleep(gap)
+            self._last_launch = loop.time()
 
     async def _run_inner(self, s: HandshakeSession) -> None:
         backend = s.backend

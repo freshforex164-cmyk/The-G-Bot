@@ -1,7 +1,7 @@
 """Small in-memory sliding-window limiter for login endpoints (per user id).
 
 One service instance holds the state; a restart clears it, which is acceptable for brute-force
-protection on a single Render instance."""
+protection on a single VPS service instance."""
 from __future__ import annotations
 
 import math
