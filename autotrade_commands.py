@@ -70,6 +70,24 @@ SET_USAGE = (
     "  max_steps 2     martingale: raises before going back to the base stake (1-6)\n"
     "  base_stake 1    martingale: first stake of the ladder"
 )
+SET_MENU_TEXT = (
+    "⚙️ Settings: tap a button to change it.\n"
+    "Custom amount? Type e.g. /at_set stake 3 or /at_set stop_balance 75"
+)
+
+
+def settings_menu_markup() -> dict[str, Any]:
+    """Beginner-friendly /at_set: preset buttons; each tap sends 'at:set:<name>:<value>'."""
+    def row(label: str, name: str, values: list[tuple[str, str]]) -> list[list[dict[str, str]]]:
+        return [[{"text": label, "callback_data": "at:set:noop"}],
+                [{"text": t, "callback_data": f"at:set:{name}:{v}"} for t, v in values]]
+    rows = (row("💵 Stake per trade", "stake", [("$1", "1"), ("$2", "2"), ("$5", "5"), ("$10", "10")])
+            + row("🛑 Stop Balance (pause at)", "stop_balance", [("Off", "0"), ("$50", "50"), ("$100", "100"), ("$200", "200")])
+            + row("📉 Daily stop-loss", "stop_loss", [("Off", "0"), ("$10", "10"), ("$25", "25"), ("$50", "50")])
+            + row("🔁 Stake mode", "stake_mode", [("Fixed", "fixed"), ("Martingale x2/x4", "martingale")]))
+    return {"inline_keyboard": rows}
+
+
 NOT_SET_UP = "Auto-trading isn't set up on this bot yet."
 PRIVATE_ONLY = "For your account's safety, auto-trading commands only work in a private chat with the bot."
 LIVE_WARNING = (
@@ -475,7 +493,7 @@ class AutotradeCommands:
         parts = args.split()
         if len(parts) != 2:
             current = await self.client.settings(uid)  # type: ignore[union-attr]
-            await self.reply(chat_id, settings_summary(current) + "\n\n" + SET_USAGE)
+            await self.reply(chat_id, settings_summary(current) + "\n\n" + SET_MENU_TEXT, settings_menu_markup())
             return
         name, raw = parts[0].lower(), parts[1]
         if name not in SETTINGS:

@@ -62,10 +62,10 @@ class RiskTests(unittest.TestCase):
         v = self.r.check(self.s, D, state(daily_pnl=20))
         self.assertEqual((v.reason, v.halt), ("daily_take_profit", True))
 
-    def test_open_trades_count_as_exposure(self):
-        # -5 now, one open (2) + this one (2) would risk -9 -> allowed; two open would risk -11 -> blocked
-        self.assertTrue(self.r.check(self.s, D, state(daily_pnl=-5, open_count=1)).ok)
-        self.assertTrue(self.r.check(self.s, D, state(daily_pnl=-5, open_count=1)).ok)  # exposure no longer blocks
+    def test_open_trades_do_not_pre_block_valid_signals(self):
+        # Possible loss of open trades no longer blocks; only a realised loss at the limit halts.
+        self.assertNotEqual(self.reason(daily_pnl=-5, open_count=1), "stop_loss_exposure")
+        self.assertTrue(self.r.check(self.s, D, state(daily_pnl=-9.99)).ok)
 
     def test_max_concurrent(self):
         self.assertEqual(self.reason(open_count=2), "max_concurrent")

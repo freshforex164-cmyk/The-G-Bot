@@ -897,6 +897,9 @@ class TelegramCommandHandler:
                              "at:demo": ("at_demo", ""), "at:live": ("at_live", ""),
                              "at:liveconfirm": ("at_live", "confirm"),
                              "at:login": ("at_login", "")}.get(data, ("", ""))
+            if data.startswith("at:set:") and data.count(":") == 3:    # /at_set menu button
+                _, _, field, value = data.split(":")
+                command, args = "at_set", f"{field} {value}"
             if command and private:
                 await self._autotrade_safe(command, chat_id, int(sender_id), args, False)
             return

@@ -42,7 +42,8 @@ class RiskManager:
             return Verdict(False, "daily_stop_loss", halt=True)
         if s.daily_take_profit is not None and st.daily_pnl >= s.daily_take_profit:
             return Verdict(False, "daily_take_profit", halt=True)
-        # No 'open exposure' pre-check: it blocked valid signals ("stop-loss limit") while trades were open.
+        # No pre-emptive "exposure" block: a valid signal is only stopped once the realised
+        # daily loss actually reaches the user's stop-loss (above) or by Stop Balance.
         if st.open_count >= s.max_concurrent:
             return Verdict(False, "max_concurrent")
         if st.last_trade_at is not None and st.now - st.last_trade_at < s.cooldown_seconds:

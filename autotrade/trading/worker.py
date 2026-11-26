@@ -591,7 +591,8 @@ class UserWorker:
                                 step=meta["stake_step"] if s.stake_mode == "martingale" else None), key=ref)
         await self._repo.update_trade(self.user_id, ref, status="open", broker_trade_id=trade_id)
         self._spawn_tracker(broker, ref, trade_id, stake, payout, expiry + 45,
-                            info={"mode": s.mode, "asset": name, "direction": d.direction, "setup": setup})
+                            info={"mode": s.mode, "asset": name, "direction": d.direction, "setup": setup,
+                                  "asset_id": d.asset, "reason": d.reason, "meta": dict(d.meta)})
 
     # -- results ------------------------------------------------------------------------------
     def _spawn_tracker(self, broker: BrokerClient, ref: str, trade_id: str, stake: float,
@@ -602,6 +603,7 @@ class UserWorker:
             self._track(broker, ref, trade_id, stake, payout, timeout, info or {}))
 
     async def _track(self, broker, ref, trade_id, stake, payout, timeout, info) -> None:
+        recover: Decision | None = None
         try:
             out = await broker.outcome(trade_id, timeout)
             profit = compute_profit(out, stake, payout)
@@ -622,6 +624,7 @@ class UserWorker:
                                              step=self.stakes.step, martingale=s.stake_mode == "martingale"),
                                 reply_to=ref)
                 await self._on_settled(info.get("mode") or self.settings.mode)
+                recover = self._recovery_decision(out.result, info)
         except asyncio.CancelledError:
             raise  # left 'open'; the next session adopts it
         except Exception as exc:
@@ -631,6 +634,23 @@ class UserWorker:
             self._trackers.pop(ref, None)
             self._open_stakes.pop(ref, None)
             self._open_until.pop(ref, None)
+        if recover is not None and not self._stop.is_set():
+            try:
+                await self._try_trade(broker, recover, self.settings, (), pushed=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("martingale recovery trade failed for user %s (%s)", self.user_id, type(exc).__name__)
+
+    def _recovery_decision(self, result: str | None, info: dict) -> Decision | None:
+        """Martingale: after a loss that moved the ladder up (step 1 = x2, step 2 = x4), re-enter at once on
+        the same asset and direction. A win, or a loss on the last step, resets to base and waits for a signal."""
+        s = self.settings
+        if result != "loss" or s.stake_mode != "martingale" or self.stakes.step == 0 or not info.get("asset_id"):
+            return None
+        meta = {k: v for k, v in (info.get("meta") or {}).items() if k not in ("signal_id", "source")}
+        meta["martingale_recovery"] = True
+        return Decision(info["asset_id"], info["direction"], TRADE_EXPIRY_SECONDS, info.get("reason") or "", meta)
 
     # -- daily summary ------------------------------------------------------------------------
     async def _on_settled(self, mode: str) -> None:

@@ -89,13 +89,26 @@ class ExposureTests(unittest.TestCase):
         self.assertIsNone(old.daily_stop_loss)
         self.assertIsNone(old.daily_take_profit)
 
+    def test_ladder_stake_is_not_pre_blocked_by_stop_loss(self):
+        s = MG.with_changes(daily_stop_loss=10.0)
+        d = Decision("EURUSD_otc", "CALL", 60, "test")
+        st = RiskState(now=100.0, last_trade_at=None, open_count=0, daily_pnl=-3.0, tick_ages=[0.0], stake=8.0)
+        self.assertTrue(RiskManager().check(s, d, st).ok)
+
+    def test_realised_loss_at_limit_still_halts(self):
+        s = MG.with_changes(daily_stop_loss=10.0)
+        d = Decision("EURUSD_otc", "CALL", 60, "test")
+        st = RiskState(now=100.0, last_trade_at=None, open_count=0, daily_pnl=-10.0, tick_ages=[0.0])
+        v = RiskManager().check(s, d, st)
+        self.assertEqual((v.reason, v.halt), ("daily_stop_loss", True))
+
 
 class WorkerLadderTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.env = Env()
         self.m = self.env.rt.manager
         await self.env.add_user("a")
-        await self.env.repo.save_settings("a", MG.with_changes(cooldown_seconds=5, max_concurrent=1,
+        await self.env.repo.save_settings("a", MG.with_changes(cooldown_seconds=5, max_concurrent=1, martingale_max_steps=2,
                                                                  daily_stop_loss=20.0))
         await self.m.start("a")
         self.assertTrue(await wait_until(lambda: self.m._workers["a"].status.value == "running"))
@@ -111,12 +124,41 @@ class WorkerLadderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await wait_until(lambda: not self.m._workers["a"]._trackers))
         self.env.clock.advance(6)          # past the cooldown
 
-    async def test_placed_stakes_follow_the_ladder(self):
-        for n, result in enumerate(["loss", "loss", "win", "loss"], start=1):
-            await self.place(n, result)
-        self.assertEqual([p[2] for p in self.env.world("a").placed], [1.0, 2.0, 4.0, 1.0])
-        self.assertEqual([t.stake for t in self.env.repo.trades], [1.0, 2.0, 4.0, 1.0])
-        self.assertEqual(self.env.repo.trades[1].meta["stake_step"], 1)
+    async def settle_all(self, n):
+        self.assertTrue(await wait_until(lambda: len(self.env.world("a").placed) == n))
+        self.assertTrue(await wait_until(lambda: not self.m._workers["a"]._trackers))
+
+    async def test_two_step_recovery_same_direction_then_reset(self):
+        world = self.env.world("a")
+        world.results.extend(["loss", "loss", "loss"])
+        await self.m.submit_signal("a", gbot_signal(self.env, signal_id="s1"))
+        await self.settle_all(3)                          # base, x2, x4 placed without new signals
+        self.assertEqual([p[2] for p in world.placed], [1.0, 2.0, 4.0])
+        self.assertEqual(len({(p[0], p[1]) for p in world.placed}), 1)   # same asset and direction
+        self.assertEqual(self.m._workers["a"].stakes.step, 0)          # reset after step 2
+        self.env.clock.advance(6)
+        world.results.append("win")
+        await self.m.submit_signal("a", gbot_signal(self.env, signal_id="s2"))
+        await self.settle_all(4)
+        self.assertEqual(world.placed[-1][2], 1.0)
+
+    async def test_win_during_recovery_resets_to_base(self):
+        world = self.env.world("a")
+        world.results.extend(["loss", "win"])
+        await self.m.submit_signal("a", gbot_signal(self.env, signal_id="s1"))
+        await self.settle_all(2)
+        self.assertEqual([p[2] for p in world.placed], [1.0, 2.0])
+        self.assertEqual(self.m._workers["a"].stakes.step, 0)
+        self.assertEqual(self.env.repo.trades[1].meta.get("martingale_recovery"), True)
+
+    async def test_recovery_respects_daily_stop_loss(self):
+        await self.m.update_settings("a", {"daily_stop_loss": 2.5})
+        world = self.env.world("a")
+        world.results.extend(["loss", "loss"])
+        await self.m.submit_signal("a", gbot_signal(self.env, signal_id="s1"))
+        await self.settle_all(2)                          # -1, -3: x4 step blocked by the realised limit
+        self.assertTrue(await wait_until(lambda: self.m._workers["a"].last_reject == "daily_stop_loss"))
+        self.assertEqual(len(world.placed), 2)
 
 
 if __name__ == "__main__":
