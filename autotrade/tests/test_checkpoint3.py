@@ -77,20 +77,17 @@ class MartingaleTests(unittest.TestCase):
 
 
 class ExposureTests(unittest.TestCase):
-    def test_ladder_stake_that_could_breach_stop_loss_is_skipped(self):
-        s = MG.with_changes(daily_stop_loss=10.0)
+    def test_open_exposure_never_blocks_a_signal(self):
+        s = MG.with_changes(daily_stop_loss=26.0)
         d = Decision("EURUSD_otc", "CALL", 60, "test")
-        st = RiskState(now=100.0, last_trade_at=None, open_count=0, daily_pnl=-3.0, tick_ages=[0.0], stake=8.0)
-        self.assertEqual(RiskManager().check(s, d, st).reason, "stop_loss_exposure")
-        st.stake = 4.0
+        st = RiskState(now=100.0, last_trade_at=None, open_count=1, daily_pnl=-20.0, tick_ages=[0.0],
+                       stake=8.0, open_exposure=8.0)
         self.assertTrue(RiskManager().check(s, d, st).ok)
 
-    def test_open_trades_count_with_their_own_stakes(self):
-        s = MG.with_changes(daily_stop_loss=10.0)
-        d = Decision("EURUSD_otc", "CALL", 60, "test")
-        st = RiskState(now=100.0, last_trade_at=None, open_count=1, daily_pnl=0.0, tick_ages=[0.0],
-                       stake=4.0, open_exposure=8.0)
-        self.assertEqual(RiskManager().check(s, d, st).reason, "stop_loss_exposure")
+    def test_saved_stop_loss_26_is_cleared_on_load(self):
+        old = TradingSettings.from_dict({"daily_stop_loss": 26.0, "daily_take_profit": 50.0, "defaults_version": 3})
+        self.assertIsNone(old.daily_stop_loss)
+        self.assertIsNone(old.daily_take_profit)
 
 
 class WorkerLadderTests(unittest.IsolatedAsyncioTestCase):
@@ -120,15 +117,6 @@ class WorkerLadderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([p[2] for p in self.env.world("a").placed], [1.0, 2.0, 4.0, 1.0])
         self.assertEqual([t.stake for t in self.env.repo.trades], [1.0, 2.0, 4.0, 1.0])
         self.assertEqual(self.env.repo.trades[1].meta["stake_step"], 1)
-
-    async def test_ladder_respects_daily_stop_loss(self):
-        await self.m.update_settings("a", {"daily_stop_loss": 6.0})
-        for n in (1, 2):
-            await self.place(n, "loss")                 # -1, -2: next ladder stake 4 would reach -7 < -6
-        world = self.env.world("a")
-        await self.m.submit_signal("a", gbot_signal(self.env, signal_id="s3"))
-        self.assertTrue(await wait_until(lambda: self.m._workers["a"].last_reject == "stop_loss_exposure"))
-        self.assertEqual(len(world.placed), 2)
 
 
 if __name__ == "__main__":

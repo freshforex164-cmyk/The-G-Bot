@@ -7,11 +7,13 @@ from typing import Any
 from ..config import Config
 from ..errors import SettingsError
 
-SETTINGS_DEFAULTS_VERSION = 3
+SETTINGS_DEFAULTS_VERSION = 4
 # v1 -> v2: follow-mode max_concurrent 1 -> 2 and cooldown 60 s -> 5 s; the "gap" setting was removed.
 _V1_DEFAULTS = {"max_concurrent": (1, 2), "cooldown_seconds": (60, 5)}
 # v2 -> v3: the hard-coded daily stop-loss/take-profit (10/20) were removed; saved defaults become "off".
 _V2_DEFAULTS = {"daily_stop_loss": (10.0, None), "daily_take_profit": (20.0, None), "martingale_max_steps": (3, 2)}
+# v3 -> v4: saved daily stop-loss/take-profit values (any amount) are cleared; Stop Balance replaces them.
+_V4_CLEARED = ("daily_stop_loss", "daily_take_profit")
 # Settings that accept 0 in an update to mean "off" (stored as None).
 OPTIONAL_LIMITS = ("daily_stop_loss", "daily_take_profit", "stop_balance")
 
@@ -150,6 +152,9 @@ class TradingSettings:
             for name, (old, new) in _V2_DEFAULTS.items():
                 if name in values and values[name] == old:
                     values[name] = new
+        if int(values.get("defaults_version") or 1) < 4:
+            for name in _V4_CLEARED:
+                values[name] = None
         if values.get("strategy") == "gap":                        # removed alias of price_action
             values["strategy"] = "price_action"
         values["defaults_version"] = SETTINGS_DEFAULTS_VERSION

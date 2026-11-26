@@ -15,7 +15,7 @@ class StopBalanceTests(unittest.TestCase):
         self.assertEqual((s.daily_stop_loss, s.daily_take_profit), (None, None))
 
     def test_user_set_limit_is_kept(self):
-        s = TradingSettings.from_dict({"daily_stop_loss": 15.0, "defaults_version": 2})
+        s = TradingSettings.from_dict({"daily_stop_loss": 15.0, "defaults_version": 4})
         self.assertEqual(s.daily_stop_loss, 15.0)
 
     def test_unset_stop_balance_never_blocks(self):
