@@ -107,6 +107,10 @@ class FakeService:
     async def revoke(self, uid):
         self._record("revoke", uid)
 
+    async def submit_manual_session(self, uid, kind, ssid):
+        self._record("submit_manual_session", uid, kind)   # the value itself is not recorded
+        return {"stored": kind, "connected": True}
+
     async def balance(self, uid, fresh=True):
         self._record("balance", uid, fresh)
         return self.balance_data
@@ -226,13 +230,14 @@ class AutotradeCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.service.calls), before)
         self.assertIn("stake_mode martingale", self.chat.last())
 
-    async def test_pasted_ssid_is_deleted_and_not_submitted(self):
+    async def test_pasted_ssid_is_deleted_and_saved_to_its_vault_slot(self):
         ssid = '42["auth",{"session":"abc","isDemo":0,"uid":1,"platform":2}]'
-        update = message(f"/at_ssid {ssid}")
+        update = message(ssid)
         update["message"]["message_id"] = 77
         await self.handler.handle_update(update)
-        self.assertEqual(self.chat.deleted, [(USER, 77)])
-        self.assertIn("/at_login", self.chat.last())
+        self.assertIn((USER, 77), self.chat.deleted)
+        self.assertIn(("submit_manual_session", USER, "real"), self.service.calls)
+        self.assertIn("Real session saved", self.chat.last())
         self.assertNotIn("abc", self.chat.last())
 
     async def test_kill_switch_only_for_admin_in_admin_chat(self):

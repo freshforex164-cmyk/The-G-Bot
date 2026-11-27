@@ -101,17 +101,17 @@ class RefinementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.client.visible.get(USER, {})), before)
         self.assertFalse(any(c[0] == "submit_ssid" for c in self.service.calls))
 
-    async def test_pasted_ssid_frame_is_deleted_and_never_submitted(self):
-        for text in (REAL_SSID, f"/at_ssid {DEMO_SSID}"):
+    async def test_pasted_ssid_frame_is_deleted_then_saved_encrypted(self):
+        for text, kind in ((REAL_SSID, "real"), (DEMO_SSID, "demo")):
             update = message(text)
             update["message"]["message_id"] = 88
             await self.handler.handle_update(update)
             self.assertIn(88, self.client.deletes)
             self.client.deletes.clear()
             reply = list(self.client.visible[USER].values())[-1]["text"]
-            self.assertIn("/at_login", reply)
+            self.assertIn("session saved", reply)
             self.assertNotIn("abc", reply)
-        self.assertFalse(any(c[0] == "submit_ssid" for c in self.service.calls))
+            self.assertIn(("submit_manual_session", USER, kind), self.service.calls)
 
 
 if __name__ == "__main__":

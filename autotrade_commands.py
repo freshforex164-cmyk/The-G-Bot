@@ -4,12 +4,14 @@ Signals stay read-only. These commands only work in a private chat with the bot 
 AUTOTRADE_JWT_SECRET is set (AUTOTRADE_API_URL defaults to the local engine); otherwise they answer "not set up".
 New users always start in Demo; Real (Live) needs /at_live confirm. /at_login reuses a saved session
 instead of a new browser sign-in. The only way to connect is the secure email/password handshake;
-pasted SSIDs are never accepted.
+/at_session also accepts a pasted Pocket Option SSID: GBot deletes the message and stores it encrypted.
 """
 from __future__ import annotations
 
 import logging
 import math
+import re
+import time
 from typing import Any, Awaitable, Callable
 
 from autotrade_client import AutotradeClient, AutotradeError
@@ -19,6 +21,7 @@ logger = logging.getLogger(__name__)
 AUTOTRADE_COMMANDS = [
     {"command": "autotrade", "description": "Auto-trading overview (Demo by default)"},
     {"command": "at_login", "description": "Connect your Pocket Option account"},
+    {"command": "at_session", "description": "Paste your Pocket Option session (SSID)"},
     {"command": "at_start", "description": "Start your auto-trading bot"},
     {"command": "at_stop", "description": "Stop your auto-trading bot"},
     {"command": "at_stats", "description": "Today's trades and results"},
@@ -86,6 +89,36 @@ def settings_menu_markup() -> dict[str, Any]:
             + row("📉 Daily stop-loss", "stop_loss", [("Off", "0"), ("$10", "10"), ("$25", "25"), ("$50", "50")])
             + row("🔁 Stake mode", "stake_mode", [("Fixed", "fixed"), ("Martingale x2/x4", "martingale")]))
     return {"inline_keyboard": rows}
+
+
+SESSION_PICK_TEXT = (
+    "🔑 Connect with your Pocket Option session (SSID).\n"
+    "1. Choose the account type below.\n"
+    "2. Paste the full SSID starting with 42[\"auth\",...] here.\n"
+    "Your message is deleted at once and the session is stored encrypted."
+)
+SESSION_WAIT_SECONDS = 600
+SSID_PATTERN = re.compile(r'42\["auth",\s*\{.*\}\]', re.S)
+
+
+def extract_ssid(text: str) -> str | None:
+    """Pull the 42["auth",{...}] frame out of a pasted message (quotes/backticks around it are fine)."""
+    match = SSID_PATTERN.search(text or "")
+    return match.group(0).strip() if match else None
+
+
+def ssid_kind(raw: str) -> str | None:
+    """"demo" / "real" from the frame's isDemo flag, without exposing the value."""
+    import json
+    try:
+        payload = json.loads(raw[2:])
+        body = payload[1]
+        if not isinstance(body.get("session"), str) or not body["session"]:
+            return None
+        flag = body.get("isDemo")
+    except (ValueError, TypeError, IndexError, AttributeError):
+        return None
+    return {0: "real", "0": "real", 1: "demo", "1": "demo"}.get(flag)
 
 
 NOT_SET_UP = "Auto-trading isn't set up on this bot yet."
@@ -275,6 +308,50 @@ class AutotradeCommands:
         self.client = client
         self._send = send
         self.roster = roster          # AutotradeRoster: who gets trades instead of signal cards
+        self.pending_session: dict[int, tuple[str, float]] = {}   # uid -> (chosen kind, expires)
+
+    @staticmethod
+    def session_markup() -> dict[str, Any]:
+        return {"inline_keyboard": [[{"text": "🧪 Demo", "callback_data": "at:session:demo"},
+                                     {"text": "💰 Real", "callback_data": "at:session:real"}]]}
+
+    async def store_pasted_session(self, chat_id: int, sender_id: int | None, text: str) -> None:
+        """Called after the pasted message was deleted. Saves it to the vault; never echoes or logs it."""
+        if self.client is None:
+            await self.reply(chat_id, NOT_SET_UP)
+            return
+        if sender_id is None or int(chat_id) != int(sender_id):
+            await self.reply(chat_id, "🔒 Your message was deleted. Send your session only in a private chat with the bot.")
+            return
+        uid = int(sender_id)
+        raw = extract_ssid(text)
+        kind = ssid_kind(raw) if raw else None
+        if raw is None or kind is None:
+            await self.reply(chat_id, "🔒 Your message was deleted. That isn't a complete session: copy the "
+                             "whole value starting with 42[\"auth\",{...}] and send /at_session to try again.")
+            return
+        chosen, expires = self.pending_session.pop(uid, (None, 0.0))
+        if chosen and time.monotonic() < expires and chosen != kind:
+            await self.reply(chat_id, f"🔒 Your message was deleted. You chose {chosen.title()}, but this session is "
+                             f"a {kind.title()} account. Nothing was saved. Send /at_session to try again.")
+            return
+        await self.reply(chat_id, f"🔒 Message deleted. Saving your {kind.title()} session…")
+        try:
+            result = await self.client.submit_manual_session(uid, kind, raw)
+        except AutotradeError as exc:
+            logger.warning("Manual session save failed (%s %s).", exc.status, exc.code)
+            if exc.code == "invalid_ssid":
+                await self.reply(chat_id, f"That session wasn't accepted: {exc.message} Nothing was saved.")
+            else:
+                await self.reply(chat_id, error_text(exc))
+            return
+        finally:
+            raw = ""
+        note = ("Pocket Option accepted it." if result.get("connected") else
+                "Saved, but Pocket Option couldn't confirm it yet; it is checked again before trading.")
+        await self.reply(chat_id, f"✅ {kind.title()} session saved. {note}\n"
+                         + ("Switch with /at_live to trade Real. " if kind == "real" else "")
+                         + "Start with /at_start or 🤖 Start Auto-Trade.")
 
     def _roster_add(self, uid: int) -> None:
         if self.roster is not None:
@@ -449,6 +526,14 @@ class AutotradeCommands:
                              "and is only for you, so don't forward it. After logging in, pick an asset with "
                              "/start and tap 🤖 Start Auto-Trade (or send /at_start).",
                              self.login_markup(uid))
+        elif command == "at_session":
+            choice = args.lower()
+            if choice in ("demo", "real"):
+                self.pending_session[uid] = (choice, time.monotonic() + SESSION_WAIT_SECONDS)
+                await self.reply(chat_id, f"Now paste your {choice.title()} SSID (starts with 42[\"auth\",). "
+                                 "It is deleted from the chat immediately.")
+            else:
+                await self.reply(chat_id, SESSION_PICK_TEXT, self.session_markup())
         elif command == "at_start":
             await c.start(uid)
             stats = await c.stats(uid)

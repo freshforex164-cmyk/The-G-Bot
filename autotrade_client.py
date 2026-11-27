@@ -173,6 +173,10 @@ class AutotradeClient:
                     pass
         return ids
 
+    async def submit_manual_session(self, uid: int | str, kind: str, ssid: str) -> dict[str, Any]:
+        """Store a pasted SSID in the user's encrypted vault slot. The value is never logged."""
+        return await self._call("POST", "/auth/manual-session", uid, {"kind": kind, "ssid": ssid}, timeout=45)
+
     async def revoke(self, uid: int | str) -> None:
         await self._call("DELETE", "/auth/sessions", uid)
 

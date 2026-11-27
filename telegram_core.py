@@ -62,10 +62,6 @@ ADMIN_ONLY_COMMANDS = {
     "testsignal",
 }
 COMMAND_REPLY_COOLDOWN_SECONDS = 20.0
-SSID_REFUSED_TEXT = (
-    "🔒 Session codes are not accepted any more, so your message was deleted and nothing was saved.\n"
-    "Connect with the secure Pocket Option login instead: send /at_login."
-)
 
 
 def _stop_balance_text(value) -> str:
@@ -465,17 +461,20 @@ class TelegramCommandHandler:
                 pass
         text = message.get("text")
         if chat_id is not None and isinstance(text, str) and '42["auth"' in text:
-            # Direct SSID login was removed. A pasted session value is still a secret: delete it from the
-            # chat, never store it, and point the user at the secure login.
+            # A pasted Pocket Option session (SSID) is a secret: delete it from the chat first, then save it
+            # encrypted in this user's vault slot (private chats only). The value is never logged.
             if isinstance(message.get("message_id"), int):
                 try:
                     await self.client.delete_message(chat_id, message["message_id"])
                 except Exception:
                     logger.warning("Could not delete a pasted session message.")
-            try:
-                await self.client.send_message(chat_id, SSID_REFUSED_TEXT, parse_mode=None)
-            except Exception:
-                logger.warning("Could not answer a pasted session message.")
+            work = self.autotrade.store_pasted_session(chat_id, sender_id, text)
+            if self.background_selection:
+                task = asyncio.create_task(work, name=f"autotrade-session-{chat_id}")
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+            else:
+                await work
             return
         if chat_id is None or not isinstance(text, str) or not text.startswith("/"):
             return
@@ -902,7 +901,9 @@ class TelegramCommandHandler:
             command, args = {"at:balance": ("at_balance", ""), "at:stats": ("at_stats", ""),
                              "at:demo": ("at_demo", ""), "at:live": ("at_live", ""),
                              "at:liveconfirm": ("at_live", "confirm"),
-                             "at:login": ("at_login", "")}.get(data, ("", ""))
+                             "at:login": ("at_login", ""),
+                             "at:session:demo": ("at_session", "demo"),
+                             "at:session:real": ("at_session", "real")}.get(data, ("", ""))
             if data.startswith("at:set:") and data.count(":") == 3:    # /at_set menu button
                 _, _, field, value = data.split(":")
                 command, args = "at_set", f"{field} {value}"

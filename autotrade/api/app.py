@@ -22,6 +22,7 @@ from ..auth.browser_memory import container_memory, install_quiet_playwright_han
 from ..auth.handshake import LoginCooldown
 from ..errors import ReauthRequired, SettingsError
 from .ratelimit import RateLimiter, parse_rate, wait_text
+from ..auth.ssid import is_well_formed
 from ..runtime import Runtime
 from ..trading.manager import CapacityError, LiveDisabled, ServiceUnavailable, TradingHalted
 from ..trading.models import Decision
@@ -125,6 +126,13 @@ class HandshakeStart(BaseModel):
     height: int | None = Field(None, ge=0, le=10000)
     full_view: bool = False     # the user will sign in on the broker page itself (styles and pictures load)
     force: bool = False         # sign in again even though a saved session still works
+
+
+class ManualSession(BaseModel):
+    """A Pocket Option SSID the user pasted in Telegram (deleted from the chat by GBot)."""
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["demo", "real"]
+    ssid: SecretStr = Field(min_length=20, max_length=4096)
 
 
 class StopBody(BaseModel):
@@ -438,6 +446,28 @@ def create_app(rt: Runtime, auth: Callable[..., Principal] | None = None, *,
         _get(session_id, p)
         await rt.handshakes.cancel(session_id, p.user_id)
         return Response(status_code=204)
+
+    @app.post("/auth/manual-session")
+    async def manual_session(body: ManualSession, p: Principal = Depends(full)):
+        """Save a pasted SSID into the encrypted vault slot it belongs to (Demo and Real never mix)."""
+        limited(handshake_limit, p.user_id)
+        raw = body.ssid.get_secret_value().strip()
+        body.ssid = SecretStr("")
+        if not is_well_formed(raw, body.kind):
+            raise HTTPException(422, {"error": "invalid_ssid",
+                                      "message": f"That is not a valid {body.kind} Pocket Option session."})
+        await rt.vault.store(p.user_id, body.kind, raw, {"method": "manual", "derived": False})
+        raw = ""
+        await rt.repo.save_settings(p.user_id, await rt.repo.get_settings(p.user_id))
+        await rt.repo.audit(p.user_id, "tokens_captured", {"kinds": [body.kind], "method": "manual"})
+        connected = None
+        try:
+            await rt.manager.connect_new_sessions(p.user_id, [body.kind])
+            connected = True
+        except Exception as exc:
+            log.warning("manual session connection check failed: %s", type(exc).__name__)
+            connected = False
+        return {"stored": body.kind, "connected": connected}
 
     @app.delete("/auth/sessions", status_code=204)
     async def disconnect(p: Principal = Depends(full)):
