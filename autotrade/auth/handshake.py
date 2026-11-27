@@ -28,18 +28,15 @@ from ..clock import Clock
 from ..config import Config
 from . import browser_memory as bm
 from .ssid import DEMO_KIND, KINDS, REAL_KIND, account_kind, build_ssid, parse_ssid
-from .session_state import broker_domain, sanitize_browser_session
+from .broker_web import cabinet_urls, describe_proxy, login_url
+from .session_state import BROKER_HOSTS, broker_domain, sanitize_browser_session
 
 log = logging.getLogger("autotrade.handshake")
 
-LOGIN_URL = "https://pocketoption.com/en/login/"
-CABINET_URL = {  # which page makes the web app connect as that account type (adjust if the site changes)
-    DEMO_KIND: "https://pocketoption.com/en/cabinet/demo-quick-high-low/",
-    REAL_KIND: "https://pocketoption.com/en/cabinet/quick-high-low/",
-}
-ALLOWED_HOSTS = ("pocketoption.com", "po.market", "po.cash", "google.com", "gstatic.com", "recaptcha.net",
-                 "googleusercontent.com", "youtube.com")
-BROKER_HOSTS = ("pocketoption.com", "po.market", "po.cash")
+LOGIN_URL = login_url()   # default site; AUTOTRADE_BROKER_WEB_URL can point at an official mirror
+# which page makes the web app connect as that account type (adjust if the site changes)
+CABINET_URL = {DEMO_KIND: cabinet_urls()["demo"], REAL_KIND: cabinet_urls()["real"]}
+ALLOWED_HOSTS = BROKER_HOSTS + ("google.com", "gstatic.com", "recaptcha.net", "googleusercontent.com", "youtube.com")
 # Google sign-in and CAPTCHA must render fully, or the user cannot solve a challenge.
 VERIFICATION_HOSTS = ("google.com", "gstatic.com", "recaptcha.net", "googleusercontent.com")
 # Optional low-memory mode: no GPU, no /dev/shm, small JS heap, no background services.
@@ -296,6 +293,21 @@ def launch_args(low_memory: bool, single_process: bool = True) -> list[str]:
     return args
 
 
+async def launch_chromium(chromium, launch: dict[str, Any], *, new_headless: bool = True):
+    """Start Chromium. Headless runs use the full browser's new headless mode where installed: the legacy
+    headless shell announces itself as "HeadlessChrome" in its client hints, which bot shields refuse.
+    Falls back to the legacy shell when the full browser is not installed."""
+    if launch.get("headless", True) and new_headless:
+        try:
+            return await chromium.launch(channel="chromium", **launch)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("new headless Chromium unavailable (%s); using the legacy headless shell",
+                        type(exc).__name__)
+    return await chromium.launch(**launch)
+
+
 def should_block(url: str, resource_type: str, *, block_assets: bool, block_third_party: bool) -> bool:
     """Login only needs the broker's HTML and scripts. Pictures, fonts, media and stylesheets (and
     third-party trackers) are dropped to keep Chromium small; Google/CAPTCHA pages stay complete."""
@@ -314,8 +326,12 @@ class PlaywrightBackend:
     def __init__(self, headless: bool = True, hosts: tuple[str, ...] = ALLOWED_HOSTS, login_url: str = LOGIN_URL,
                  *, low_memory: bool = True, block_assets: bool = True, block_third_party: bool = True,
                  switch_delay: float = CABINET_SWITCH_DELAY, single_process: bool = True,
-                 frame_interval: float | None = None):
+                 frame_interval: float | None = None, proxy: dict[str, str] | None = None,
+                 cabinet_urls: dict[str, str] | None = None, new_headless: bool = True):
+        self._new_headless = new_headless
         self._headless, self._hosts, self._login_url = headless, hosts, login_url
+        self._proxy = dict(proxy) if proxy else None    # sign-in browser only; never logged with credentials
+        self._cabinet_urls = dict(cabinet_urls or CABINET_URL)
         self._switch_delay = max(0.0, float(switch_delay))
         self._low_memory, self._block_assets, self._block_third_party = low_memory, block_assets, block_third_party
         self._single_process = single_process
@@ -391,8 +407,11 @@ class PlaywrightBackend:
         self.closed = False
         try:
             self._pw = await async_playwright().start()
-            self._browser = await self._pw.chromium.launch(
-                headless=self._headless, args=launch_args(self._low_memory, self._single_process), timeout=60000)
+            launch: dict[str, Any] = {"headless": self._headless, "timeout": 60000,
+                                      "args": launch_args(self._low_memory, self._single_process)}
+            if self._proxy:
+                launch["proxy"] = dict(self._proxy)
+            self._browser = await launch_chromium(self._pw.chromium, launch, new_headless=self._new_headless)
         finally:   # remember exactly which processes this login started, so close() can verify they are gone
             self._pids = bm.descendant_pids() - before
         self._browser.on("disconnected", self._on_disconnected)
@@ -607,7 +626,7 @@ class PlaywrightBackend:
             # A natural pause first: switching cabinets within a second triggers the broker's rate limit.
             await asyncio.sleep(self._switch_delay)
             self._check_alive()
-            await self._page.goto(CABINET_URL[other], wait_until="domcontentloaded", timeout=30000)
+            await self._page.goto(self._cabinet_urls[other], wait_until="domcontentloaded", timeout=30000)
             end = loop.time() + 20
             while other not in self._frames and loop.time() < end and not self._crashed:
                 await asyncio.sleep(0.25)
@@ -975,7 +994,12 @@ class HandshakeManager:
                 crashed = isinstance(exc, BrowserCrashed) or "crash" in text or "closed" in text
                 s.state, s.error = "failed", ("broker_unreachable" if unreachable else
                                               "browser_crashed" if crashed else "browser_unavailable")
-                log.warning("handshake browser could not open the broker page: %s", name)
+                log.warning("handshake browser could not open the broker page: %s (site %s, route %s)", name,
+                            urlparse(getattr(backend, "_login_url", "") or "").hostname or "?",
+                            describe_proxy(getattr(backend, "_proxy", None)))
+                if unreachable:
+                    log.warning("the broker website did not answer this server; if direct access keeps timing out, "
+                                "set AUTOTRADE_BROWSER_PROXY or AUTOTRADE_BROKER_WEB_URL (see docs/oracle-vps.md)")
                 return
             s.state = "waiting_for_login"
             tokens, meta = await backend.capture_tokens(self._cfg.handshake_timeout, lambda st: setattr(s, "state", st))

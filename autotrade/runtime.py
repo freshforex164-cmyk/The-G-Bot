@@ -5,6 +5,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .auth.broker_web import (DEFAULT_BROKER_WEB_URL, broker_web_base, cabinet_urls, describe_proxy, login_url,
+                              playwright_proxy)
 from .auth.handshake import CaptureBackend, HandshakeManager, PlaywrightBackend
 from .auth.health import SessionHealth
 from .auth.ssid import KINDS
@@ -31,6 +33,23 @@ class Runtime:
     manager: TradingManager
     handshakes: HandshakeManager
     notifier: Any = None
+
+
+def sign_in_network(cfg: Config) -> tuple[str, dict[str, str] | None]:
+    """Validated sign-in website and browser proxy. A bad value is logged and ignored instead of crashing
+    the engine, so running trade workers and the Telegram bot keep working."""
+    try:
+        base = broker_web_base(getattr(cfg, "broker_web_url", ""))
+    except ValueError as exc:
+        log.error("ignoring AUTOTRADE_BROKER_WEB_URL: %s", exc)
+        base = DEFAULT_BROKER_WEB_URL
+    try:
+        proxy = playwright_proxy(getattr(cfg, "browser_proxy", ""))
+    except ValueError as exc:
+        log.error("ignoring AUTOTRADE_BROWSER_PROXY: %s", exc)
+        proxy = None
+    log.info("sign-in browser: site %s, route %s", base, describe_proxy(proxy))
+    return base, proxy
 
 
 def build_runtime(cfg: Config, *, repo: Repository | None = None, keyring: KeyRing | None = None,
@@ -89,11 +108,15 @@ def build_runtime(cfg: Config, *, repo: Repository | None = None, keyring: KeyRi
             log.warning("post-login connection check failed: %s", type(exc).__name__)
         return sorted(stored)
 
+    web_base, web_proxy = sign_in_network(cfg)
+
     def default_backend() -> PlaywrightBackend:
         return PlaywrightBackend(cfg.headless, low_memory=cfg.low_memory, block_assets=cfg.block_login_assets,
                                  block_third_party=cfg.block_third_party, switch_delay=cfg.cabinet_switch_delay,
                                  single_process=cfg.chromium_single_process,
-                                 frame_interval=cfg.screenshot_interval if cfg.low_memory else None)
+                                 frame_interval=cfg.screenshot_interval if cfg.low_memory else None,
+                                 login_url=login_url(web_base), cabinet_urls=cabinet_urls(web_base), proxy=web_proxy,
+                                 new_headless=cfg.chromium_new_headless)
 
     handshakes = HandshakeManager(cfg, backend_factory or default_backend, sink, clock, on_failure=notifier.send)
     return Runtime(cfg, repo, vault, health, feed, manager, handshakes, notifier)

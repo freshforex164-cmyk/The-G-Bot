@@ -43,6 +43,9 @@ class Config:
     handshake_memory_floor_mb: float = 40.0  # close Chromium if free memory falls below this (0 = off)
     block_login_assets: bool = False   # no images/fonts/media/stylesheets from the broker during login
     block_third_party: bool = True    # no trackers/ads during login (Google/CAPTCHA always allowed)
+    broker_web_url: str = "https://pocketoption.com"  # sign-in website (an official mirror if the main site refuses the VPS)
+    chromium_new_headless: bool = True  # full-browser headless mode (legacy shell is flagged as a bot)
+    browser_proxy: str = ""            # sign-in browser only: http://user:pass@host:port or socks5://host:port
     cabinet_switch_delay: float = 3.5 # pause between the Real and Demo cabinet pages (fast switching gets blocked)
     # Per-user brute-force limits: "<attempts>/<seconds>".
     handshake_rate: str = "6/600"
@@ -75,6 +78,9 @@ class Config:
             handshake_memory_floor_mb=_num("AUTOTRADE_HANDSHAKE_MEMORY_FLOOR_MB", 40),
             block_login_assets=_bool("AUTOTRADE_BLOCK_LOGIN_ASSETS", False),
             block_third_party=_bool("AUTOTRADE_BLOCK_THIRD_PARTY", True),
+            broker_web_url=os.environ.get("AUTOTRADE_BROKER_WEB_URL", "").strip() or "https://pocketoption.com",
+            browser_proxy=os.environ.get("AUTOTRADE_BROWSER_PROXY", "").strip(),
+            chromium_new_headless=_bool("AUTOTRADE_CHROMIUM_NEW_HEADLESS", True),
             cabinet_switch_delay=_num("AUTOTRADE_CABINET_SWITCH_DELAY", 3.5),
             handshake_rate=os.environ.get("AUTOTRADE_HANDSHAKE_RATE", "6/600"),
             credentials_rate=os.environ.get("AUTOTRADE_CREDENTIALS_RATE", "5/900"),

@@ -99,6 +99,33 @@ curl --fail http://127.0.0.1:5000/health
 
 Adapt the health port if PORT is overridden. The bot health path is `/health`; the separate engine exposes `/healthz` on port 8100. `WELCOME_IMAGE_URL` is optional and now has no hosted-development default; leave it blank for the text menu or set your own public HTTPS image. Do not share logs containing secrets. A repository pull alone does not replace an already installed systemd unit or its overrides.
 
+## Sign-in browser cannot reach Pocket Option
+
+Symptom: the login page stays on "Opening Pocket Option securely… Still starting", then the engine log shows
+`could not open the broker page: TimeoutError`, while price signals keep working. The trading/price WebSocket and
+the broker website are different hosts; cloud server addresses can be refused by the website's anti-bot edge
+even when trading still works. Check from the VPS:
+
+```bash
+cd ~/The-G-Bot && .venv/bin/python -m autotrade.check_sign_in --all
+```
+
+If every line says `FAIL`, route only the sign-in browser through another connection, for example Cloudflare WARP
+in local proxy mode (free, keeps running on the VPS):
+
+```bash
+curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+sudo apt-get update && sudo apt-get install -y cloudflare-warp
+warp-cli --accept-tos registration new && warp-cli --accept-tos mode proxy && warp-cli --accept-tos connect
+```
+
+Proxy mode does not change the server's own routing (SSH and Telegram stay direct). Then set
+`AUTOTRADE_BROWSER_PROXY=socks5://127.0.0.1:40000` in `.env`, restart `gbot-autotrade`, and run the check again.
+Any HTTP proxy works too (`http://user:pass@host:port`); Chromium cannot log in to SOCKS5 proxies.
+`AUTOTRADE_BROKER_WEB_URL` may point the sign-in page at an official mirror (`https://po.cash`, `https://po.trade`).
+Whether a given proxy or mirror is accepted by the broker is not verified by these offline tests.
+
 ## VPS acceptance checklist (not yet performed)
 
 1. Confirm exactly one bot poller and one engine process. Startup automatically removes any stale webhook without dropping pending updates before long polling. HTTP 409 indicates a conflicting poller: stop the old instance, rather than running competing processes. Invalid-token HTTP 401/403 is reported explicitly.

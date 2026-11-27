@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-BROKER_HOSTS = ("pocketoption.com", "po.market", "po.cash")
+BROKER_HOSTS = ("pocketoption.com", "po.trade", "po.market", "po.cash")  # official broker web domains
 
 
 def broker_domain(domain: str) -> bool:
