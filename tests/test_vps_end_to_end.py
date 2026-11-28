@@ -1,5 +1,7 @@
 """Real local polling/command/health flow with only external providers replaced."""
 import asyncio
+from email.parser import BytesParser
+from email.policy import default
 import io
 import json
 import os
@@ -14,7 +16,8 @@ import main
 from admin_http import AdminHttpServer
 from data.signals import SignalOutcomeTracker
 from subscriber_store import SubscriberStore
-from telegram_bot import TelegramBotClient, TelegramCommandHandler
+from telegram_bot import TelegramBotClient, TelegramCommandHandler, WELCOME_IMAGE_PATH
+from notifications import TelegramSendError
 
 
 class Response(io.BytesIO):
@@ -33,7 +36,15 @@ class VpsEndToEndTests(unittest.IsolatedAsyncioTestCase):
         loop = asyncio.get_running_loop()
         def opener(request, timeout):
             method = request.full_url.rsplit('/', 1)[-1]
-            payload = json.loads(request.data)
+            if method == 'sendPhoto':
+                message = BytesParser(policy=default).parsebytes(
+                    f"Content-Type: {request.get_header('Content-type')}\r\n\r\n".encode() + request.data)
+                payload = {part.get_param('name', header='content-disposition'): part.get_payload(decode=True)
+                           for part in message.iter_parts()}
+                self.assertEqual(payload['photo'], WELCOME_IMAGE_PATH.read_bytes())
+                payload['chat_id'] = int(payload['chat_id'])
+            else:
+                payload = json.loads(request.data)
             calls.append((method, payload))
             result = True
             if method == 'getUpdates':
@@ -43,11 +54,11 @@ class VpsEndToEndTests(unittest.IsolatedAsyncioTestCase):
                     'from': {'id': 101}, 'text': '/start'}},
                     {'update_id': 11, 'message': {'chat': {'id': 101, 'type': 'private'},
                     'from': {'id': 101}, 'text': '/stop'}}] if len(polls) == 1 else [])
-            elif method == 'sendMessage':
+            elif method in {'sendMessage', 'sendPhoto'}:
                 result = {'message_id': 55}
                 if payload['chat_id'] == 101:
                     loop.call_soon_threadsafe(replied.set)
-            elif method == 'editMessageText':
+            elif method in {'editMessageText', 'editMessageCaption'}:
                 loop.call_soon_threadsafe(saved.set)
             return Response(json.dumps({'ok': True, 'result': result}).encode())
         def server_factory(**kwargs):
@@ -94,7 +105,7 @@ class VpsEndToEndTests(unittest.IsolatedAsyncioTestCase):
                     self.assertGreaterEqual(len(polls), 2)
                     self.assertEqual(polls[1]['offset'], 12)
                     self.assertIn(('deleteWebhook', {'drop_pending_updates': False}), calls)
-                    self.assertFalse(any(method == 'sendPhoto' for method, _ in calls))
+                    self.assertTrue(any(method == 'sendPhoto' for method, _ in calls))
                     self.assertIn(101, store.subscribers)
                     self.assertEqual(json.loads(store.file_path.read_text())[0]['chat_id'], 101)
                     self.assertFalse(store.subscribers[101].subscribed)
@@ -114,6 +125,36 @@ class VpsEndToEndTests(unittest.IsolatedAsyncioTestCase):
             await handler.handle_update({'message': {'chat': {'id': 101}, 'from': {'id': 101}, 'text': '/start'}})
             self.assertEqual(client.send_photo.await_args.args[1], 'https://bot.example.invalid/welcome.jpg')
             client.send_message.assert_not_awaited()
+
+    async def test_default_banner_works_outside_repository_and_main_restores_photo(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {}, clear=True):
+            store = SubscriberStore(database_url='', file_path=Path(folder)/'subscribers.json')
+            client = SimpleNamespace(send_photo=AsyncMock(return_value={'message_id': 42}),
+                send_message=AsyncMock(), delete_message=AsyncMock())
+            handler = TelegramCommandHandler(client, store, admin_id=900)
+            previous = Path.cwd()
+            try:
+                os.chdir(folder)
+                await handler.handle_update({'message': {'chat': {'id': 101}, 'from': {'id': 101}, 'text': '/start'}})
+                self.assertTrue(client.send_photo.await_args.args[1].is_file())
+                self.assertEqual(handler.menu_message_ids[101], 42)
+                handler._photo_menus.clear()
+                await handler._navigate(101, 'main', 101)
+                self.assertEqual(client.send_photo.await_count, 2)
+                self.assertIn(101, handler._photo_menus)
+            finally:
+                os.chdir(previous)
+
+    async def test_photo_failure_falls_back_to_text_menu(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {}, clear=True):
+            store = SubscriberStore(database_url='', file_path=Path(folder)/'subscribers.json')
+            client = SimpleNamespace(send_photo=AsyncMock(side_effect=TelegramSendError('unavailable')),
+                send_message=AsyncMock(return_value={'message_id': 43}))
+            handler = TelegramCommandHandler(client, store, admin_id=900)
+            await handler._restart_menu(101)
+            client.send_message.assert_awaited_once()
+            self.assertEqual(handler.menu_message_ids[101], 43)
+            self.assertNotIn(101, handler._photo_menus)
 
 
 if __name__ == '__main__':

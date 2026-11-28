@@ -10,3 +10,5 @@
 - Remove stale Telegram webhooks without dropping updates before local polling; treat invalid credentials and duplicate pollers as explicit failures instead of silently looping.
 
 - Classify only completed candles using ATR-normalized balance, structure breaks, and drift; consolidation cannot emit, and the final signal gate enforces regime-specific setups without changing candle timing.
+
+- Bundle the welcome JPEG relative to the Telegram module and upload it with multipart sendPhoto; retain HTTPS overrides and text fallback so VPS deployment needs no external asset host.

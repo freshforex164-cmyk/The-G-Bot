@@ -5,6 +5,11 @@ import asyncio
 import html
 import logging
 import os
+import json
+from pathlib import Path
+import urllib.error
+import urllib.request
+import uuid
 from collections.abc import Mapping
 from typing import Any
 
@@ -25,6 +30,7 @@ ADMIN_ONLY_COMMANDS = core.ADMIN_ONLY_COMMANDS | {"at_halt", "at_resume"}
 ADMIN_COMMANDS = PUBLIC_COMMANDS + core.ADMIN_COMMANDS[len(core.PUBLIC_COMMANDS):] + AUTOTRADE_ADMIN_COMMANDS
 WELCOME_TEXT = "<b>G-Bot · Goodness AI Trader</b>\nClosed 1-minute price-action signals. Choose your next action."
 logger = logging.getLogger("gbot.navigation")
+WELCOME_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "welcome.jpg"
 
 
 def configured_admin_ids(primary: int | None = None) -> frozenset[int]:
@@ -44,8 +50,45 @@ def keyboard(*rows: list[tuple[str, str]]) -> dict[str, Any]:
 
 class TelegramBotClient(core.TelegramBotClient):
     async def send_photo(self, chat_id, photo, caption, *, reply_markup=None):
-        return await self.call("sendPhoto", {"chat_id": chat_id, "photo": photo, "caption": caption,
-                                           "parse_mode": "HTML", "reply_markup": reply_markup or {}})
+        payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML",
+                   "reply_markup": reply_markup or {}}
+        if isinstance(photo, Path):
+            return await asyncio.to_thread(self._upload_photo_sync, photo, payload)
+        return await self.call("sendPhoto", {**payload, "photo": photo})
+
+    def _upload_photo_sync(self, photo, payload):
+        """Upload the bundled JPEG; no external asset host or working directory needed."""
+        boundary = "gbot-" + uuid.uuid4().hex
+        try:
+            parts = []
+            for name, value in payload.items():
+                value = json.dumps(value) if isinstance(value, dict) else str(value)
+                parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"'
+                              f'\r\n\r\n{value}\r\n').encode())
+            parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; '
+                          'filename="welcome.jpg"\r\nContent-Type: image/jpeg\r\n\r\n').encode())
+            parts.extend([photo.read_bytes(), f'\r\n--{boundary}--\r\n'.encode()])
+            request = urllib.request.Request(
+                f"https://api.telegram.org/bot{self._token}/sendPhoto", data=b"".join(parts),
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                         "Accept": "application/json"}, method="POST")
+            with self._opener(request, timeout=self.request_timeout) as response:
+                status = response.getcode()
+                body = response.read()
+        except urllib.error.HTTPError as exc:
+            core.TelegramNotifier._raise_api_error(exc.code, exc.read())
+            raise TelegramSendError("Telegram photo upload failed.") from None
+        except Exception as exc:
+            raise TelegramSendError(f"Telegram photo upload failed ({type(exc).__name__}).") from None
+        try:
+            result = json.loads(body.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise TelegramSendError("Telegram returned an unreadable photo response.") from None
+        if not isinstance(result, dict):
+            raise TelegramSendError("Telegram returned an unexpected photo response.")
+        if not 200 <= status < 300 or not result.get("ok"):
+            core.TelegramNotifier._raise_api_error(status, body)
+        return result.get("result")
 
     async def edit_message_caption(self, chat_id, message_id, caption, *, reply_markup=None):
         return await self.call("editMessageCaption", {"chat_id": chat_id, "message_id": message_id,
@@ -114,9 +157,10 @@ class TelegramCommandHandler(core.TelegramCommandHandler):
                 pass
         self._menu_context[chat_id] = "main"
         image_url = os.getenv("WELCOME_IMAGE_URL", "").strip()
-        if image_url.startswith("https://") and callable(getattr(self.client, "send_photo", None)):
+        photo = image_url if image_url.startswith("https://") else WELCOME_IMAGE_PATH
+        if callable(getattr(self.client, "send_photo", None)):
             try:
-                result = await self.client.send_photo(chat_id, image_url, WELCOME_TEXT,
+                result = await self.client.send_photo(chat_id, photo, WELCOME_TEXT,
                                                       reply_markup=self._main_keyboard())
                 message_id = result.get("message_id") if isinstance(result, Mapping) else None
                 if isinstance(message_id, int):
@@ -188,7 +232,10 @@ class TelegramCommandHandler(core.TelegramCommandHandler):
         if target == "assets":
             await self._show_categories(chat_id)
         elif target == "main":
-            await self._render_menu(chat_id, WELCOME_TEXT, self._main_keyboard())
+            if chat_id in self._photo_menus:
+                await self._render_menu(chat_id, WELCOME_TEXT, self._main_keyboard())
+            else:
+                await self._restart_menu(chat_id)
         elif target == "account":
             await self._render_menu(chat_id, await self._status_text(chat_id),
                 keyboard([("Connect account", "menu:at_login"), ("Account link", "signals:register")],
