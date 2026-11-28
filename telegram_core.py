@@ -832,20 +832,14 @@ class TelegramCommandHandler:
         rows: list[list[dict[str, str]]] = []
         if self._autotrade_allowed(chat_id):
             rows.append([
-                {"text": "📡 Receive Signals" + ("" if auto else " ✅"), "callback_data": "mode:signals"},
-                {"text": "🤖 Auto-Trade ✅" if auto else "🤖 Start Auto-Trade", "callback_data": "mode:autotrade"},
+                {"text": "📡 Signals" + ("" if auto else " ✅"), "callback_data": "mode:signals"},
+                {"text": "🤖 Auto Trade ✅" if auto else "🤖 Auto Trade", "callback_data": "mode:autotrade"},
             ])
-            rows.append([
-                {"text": "💰 Balance", "callback_data": "at:balance"},
-                {"text": "📊 Stats", "callback_data": "at:stats"},
-            ])
-            rows.append([
-                {"text": "🧪 Demo", "callback_data": "at:demo"},
-                {"text": "💵 Real", "callback_data": "at:live"},
-                {"text": "🔑 Login", "callback_data": "at:login"},
-            ])
+            if auto:
+                rows.append([{"text": "💰 Balance", "callback_data": "at:balance"},
+                             {"text": "📊 Stats", "callback_data": "at:stats"}])
         rows.append([
-            {"text": "Change asset", "callback_data": "assetback"},
+            {"text": "Back", "callback_data": "assetback"},
             {"text": "Stop", "callback_data": "signals:stop"},
         ])
         return {"inline_keyboard": rows}
@@ -866,11 +860,11 @@ class TelegramCommandHandler:
             )
         else:
             text = (
-                f"Selected {name}.\n📡 Receive Signals is on: you get signal cards "
+                f"Selected {name}.\n📡 Signals is on: you get signal cards "
                 "(Setup, direction, expiration, payout). No trades are placed."
             )
             if self._autotrade_allowed(chat_id):
-                text += "\n🤖 Start Auto-Trade places these signals on your Pocket Option account instead."
+                text += "\n🤖 Auto Trade places these signals on your Pocket Option account instead."
         await self._render_menu(chat_id, f"{notice}{text}", self._mode_keyboard(chat_id))
 
     def _stop_autotrade_in_background(self, chat_id: int) -> None:
@@ -897,7 +891,7 @@ class TelegramCommandHandler:
 
     async def _handle_mode_button(self, chat_id: int, sender_id: int | None, data: str) -> None:
         private = sender_id is not None and int(sender_id) == int(chat_id)
-        if data.startswith("at:") and not data.startswith(("at:stake:", "at:go")):
+        if data.startswith("at:") and not data.startswith(("at:stake:", "at:smode:", "at:go")):
             command, args = {"at:balance": ("at_balance", ""), "at:stats": ("at_stats", ""),
                              "at:demo": ("at_demo", ""), "at:live": ("at_live", ""),
                              "at:liveconfirm": ("at_live", "confirm"),
@@ -944,6 +938,18 @@ class TelegramCommandHandler:
             await self._render_autotrade_setup(chat_id, name, f"✅ Trade amount set to ${value:.2f}.\n"
                                                + (f"{html.escape(note, quote=False)}\n" if note else "") + "\n")
             return
+        if data.startswith("at:smode:"):
+            mode = data.removeprefix("at:smode:")
+            if mode not in ("fixed", "martingale"):
+                return
+            try:
+                await self.autotrade.client.update_settings(int(chat_id), {"stake_mode": mode})
+            except AutotradeError as exc:
+                await self._render_autotrade_setup(chat_id, name, f"⚠️ {html.escape(error_text(exc), quote=False)}\n\n")
+                return
+            label = "Martingale (2x, 4x, then reset)" if mode == "martingale" else "Fixed"
+            await self._render_autotrade_setup(chat_id, name, f"✅ Trade mode set to {label}.\n\n")
+            return
         if data == "at:go":
             await self._start_autotrade(chat_id, name)
 
@@ -964,7 +970,7 @@ class TelegramCommandHandler:
             await self._render_menu(
                 chat_id,
                 f"{notice}⚠️ <b>Account not connected</b>\nConnect your Pocket Option {which} account first: "
-                f"tap a button below, then tap 🤖 Start Auto-Trade again.\n\nAsset: {name} · Account: {account}",
+                f"tap a button below, then tap 🤖 Auto Trade again.\n\nAsset: {name} · Account: {account}",
                 {"inline_keyboard": rows})
             return
         settings = state["settings"]
@@ -972,15 +978,22 @@ class TelegramCommandHandler:
             stake = float(settings.get("stake", 1.0))
         except (TypeError, ValueError):
             stake = 1.0
+        smode = str(settings.get("stake_mode", "fixed"))
         balance = state["balance"]
         balance_line = f"Balance: ${balance:,.2f}" if balance is not None else "Balance: checked before you start"
         text = (f"{notice}🤖 <b>Auto-Trade setup</b> · {name}\n"
                 f"Account: <b>{account}</b> (connected ✅)\n{balance_line}\n"
                 f"Trade amount: <b>${stake:.2f}</b>\n"
+                f"Trade mode: <b>{'Martingale (2x, 4x, then reset)' if smode == 'martingale' else 'Fixed'}</b>\n"
                 f"Stop Balance: {_stop_balance_text(settings.get('stop_balance'))}\n\n"
-                "Pick a trade amount, then start:")
-        rows = [[{"text": f"🚀 Start Auto-Trade · ${stake:.2f}", "callback_data": "at:go"}], switch_row]
-        rows += self.autotrade.stake_rows(stake)
+                "1. Pick a trade amount  2. Pick a trade mode  3. Start")
+        stake_buttons = [r for r in self.autotrade.stake_rows(stake) if not any(
+            b["callback_data"] in ("mode:signals", "menu:main") for b in r)]
+        rows = [switch_row, *stake_buttons,
+                [{"text": "Fixed" + (" ✅" if smode != "martingale" else ""), "callback_data": "at:smode:fixed"},
+                 {"text": "Martingale" + (" ✅" if smode == "martingale" else ""), "callback_data": "at:smode:martingale"}],
+                [{"text": f"🚀 Start Auto Trade · ${stake:.2f}", "callback_data": "at:go"}],
+                [{"text": "Back", "callback_data": "assetback"}]]
         await self._render_menu(chat_id, text, {"inline_keyboard": rows})
 
     async def _start_autotrade(self, chat_id: int, name: str) -> None:

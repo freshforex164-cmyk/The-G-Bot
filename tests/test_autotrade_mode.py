@@ -64,14 +64,14 @@ class ModeMenuTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_after_choosing_an_asset_both_modes_are_offered_signals_first(self):
         menu = await self.pick_asset()
-        self.assertIn("📡 Receive Signals ✅", buttons(menu["markup"]))
-        self.assertIn("🤖 Start Auto-Trade", buttons(menu["markup"]))
+        self.assertIn("📡 Signals ✅", buttons(menu["markup"]))
+        self.assertIn("🤖 Auto Trade", buttons(menu["markup"]))
         self.assertIn("No trades are placed", menu["text"])
         self.assertEqual(self.store.subscribers[USER].selected_asset, "AUDCAD_otc")
 
     async def test_group_chats_only_get_signals(self):
         menu = await self.pick_asset(GROUP)
-        self.assertNotIn("🤖 Start Auto-Trade", buttons(menu["markup"]))
+        self.assertNotIn("🤖 Auto Trade", buttons(menu["markup"]))
 
     async def start_auto(self) -> None:
         await self.handler.handle_update(tap("mode:autotrade"))
@@ -83,8 +83,8 @@ class ModeMenuTests(unittest.IsolatedAsyncioTestCase):
         menu = self.client.menus(USER)[-1]
         self.assertIn(("start", USER), self.service.calls)
         self.assertTrue(self.handler.roster.is_active(USER))
-        self.assertIn("🤖 Auto-Trade ✅", buttons(menu["markup"]))
-        self.assertIn("📡 Receive Signals", buttons(menu["markup"]))
+        self.assertIn("🤖 Auto Trade ✅", buttons(menu["markup"]))
+        self.assertIn("📡 Signals", buttons(menu["markup"]))
         self.assertIn("Auto-Trade is on for AUD/CAD OTC (DEMO)", menu["text"])
         self.assertIn("Signal cards are paused", menu["text"])
 
@@ -112,7 +112,7 @@ class ModeMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.handler.roster.is_active(USER))
         self.assertIn(("stop", USER), self.service.calls)
         menu = self.client.menus(USER)[-1]
-        self.assertIn("📡 Receive Signals ✅", buttons(menu["markup"]))
+        self.assertIn("📡 Signals ✅", buttons(menu["markup"]))
         self.assertIn("Auto-Trade is stopping", menu["text"])
 
     async def test_mode_buttons_need_the_users_own_tap(self):

@@ -30,6 +30,15 @@ ADMIN_ONLY_COMMANDS = core.ADMIN_ONLY_COMMANDS | {"at_halt", "at_resume"}
 ADMIN_COMMANDS = PUBLIC_COMMANDS + core.ADMIN_COMMANDS[len(core.PUBLIC_COMMANDS):] + AUTOTRADE_ADMIN_COMMANDS
 WELCOME_TEXT = "<b>G-Bot · Goodness AI Trader</b>\nClosed 1-minute price-action signals. Choose your next action."
 logger = logging.getLogger("gbot.navigation")
+HELP_TEXT = ("<b>Support / Help</b>\n"
+             "1. Tap <b>Choose Assets</b>, pick a group, then an asset.\n"
+             "2. Tap <b>Signals</b> to get trade alerts, or <b>Auto Trade</b> to let G-Bot trade for you.\n"
+             "3. For Auto Trade: pick Demo or Real, log in (or paste your SSID), choose an amount and a mode, "
+             "then tap <b>Start Auto Trade</b>.\n\n"
+             "<b>Fixed</b>: same amount every trade. <b>Martingale</b>: after a loss the next trade is 2x, "
+             "then 4x, then back to your amount (needs $20+ balance).\n"
+             "Signals use closed 1-minute candles and 1-minute expiry. Payouts may vary.\n"
+             "Trading carries risk. Practise on Demo first.")
 WELCOME_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "welcome.jpg"
 
 
@@ -113,8 +122,8 @@ class TelegramCommandHandler(core.TelegramCommandHandler):
     @staticmethod
     def _main_keyboard():
         # Asset-first: auto-trading starts from an asset's menu, so there is no top-level Auto Trading button.
-        return keyboard([("Choose Asset", "menu:assets")],
-                        [("Account Info", "menu:account"), ("Support/Help", "menu:help")])
+        return keyboard([("Choose Assets", "menu:assets")],
+                        [("Support / Help", "menu:help"), ("Register", "signals:register")])
 
     def _keyboard(self, chat_id):
         return self._main_keyboard()
@@ -241,7 +250,7 @@ class TelegramCommandHandler(core.TelegramCommandHandler):
                 keyboard([("Connect account", "menu:at_login"), ("Account link", "signals:register")],
                          [("Back", "menu:main")]))
         elif target == "help":
-            await self._render_menu(chat_id, "<b>Support/Help</b>\nSignals use closed 1-minute candles and 1-minute expiry. Payouts may vary.",
+            await self._render_menu(chat_id, HELP_TEXT,
                 keyboard([("Signal status", "signals:status"), ("Stop signals", "signals:stop")], [("Back", "menu:main")]))
         elif target == "live":
             if sender_id != chat_id:

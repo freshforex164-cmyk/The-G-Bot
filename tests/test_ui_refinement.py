@@ -44,13 +44,13 @@ class RefinementTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_main_menu_has_no_top_level_auto_trading_button(self):
         await self.handler.handle_update(message("/start"))
-        self.assertEqual(buttons(self.last()["markup"]), ["Choose Asset", "Account Info", "Support/Help"])
+        self.assertEqual(buttons(self.last()["markup"]), ["Choose Assets", "Support / Help", "Register"])
 
     async def test_connected_account_gets_the_trade_amount_picker_not_a_login_prompt(self):
         menu = await self.open_setup()
         labels = buttons(menu["markup"])
         for label in ["$1.00 ✅", "$1.50", "$2.00", "$2.50", "$5.00 RISK", "$10.00 RISK",
-                      "$25.00", "$50.00", "$100.00", "🛑 Stop", "🏠 Main Menu"]:
+                      "$25.00", "$50.00", "$100.00", "Fixed ✅", "Martingale", "Back"]:
             self.assertIn(label, labels)
         self.assertNotIn("Log in to Pocket Option", labels)
         self.assertIn("connected ✅", menu["text"])
