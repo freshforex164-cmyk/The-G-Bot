@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import isfinite
@@ -36,10 +34,8 @@ class Regime:
     range_valid: bool = False
 
 
-# Temporarily paused: consolidation (range) setups neither send signals nor auto-trade.
-# The range state machine still runs (emit=False) so regime handling is unchanged.
-# Set STRATEGY_ENABLE_CONSOLIDATION=true to bring them back.
-CONSOLIDATION_SIGNALS_ENABLED = os.getenv("STRATEGY_ENABLE_CONSOLIDATION", "").strip().lower() in {"1", "true", "yes", "on"}
+# Consolidation is analysis-only, regardless of legacy environment flags.
+CONSOLIDATION_SIGNALS_ENABLED = False
 TREND_SETUPS = frozenset({"UP_CONTINUATION_BUY", "UP_PULLBACK_SELL", "DOWN_CONTINUATION_SELL", "DOWN_PULLBACK_BUY"})
 
 SETUP_LABELS = {
@@ -110,48 +106,74 @@ def classify_regime(
     *,
     previous_name: str | None = None,
 ) -> Regime:
-    """Classify completed candles using rolling confirmed swings and an ATR range."""
+    """Classify closed candles using volatility, recent balance, structure and drift."""
     window = tuple(candles[-settings.regime_lookback :])
     highs = confirmed_swings(window, "high", settings.swing_lag)
     lows = confirmed_swings(window, "low", settings.swing_lag)
 
     if len(candles) < settings.min_regime_candles:
-        return Regime(previous_name if previous_name in REGIMES else "CONSOLIDATION", highs, lows)
+        return Regime("CONSOLIDATION", highs, lows)
 
-    if len(highs) >= 2 and len(lows) >= 2:
-        if highs[0].price > highs[1].price and lows[0].price > lows[1].price:
+    atr = average_true_range(window, settings.atr_period)
+    if atr is None or not isfinite(atr) or atr <= 0:
+        return Regime("CONSOLIDATION", highs, lows)
+    closes = [float(item.close) for item in window]
+    if not all(isfinite(value) for item in window
+               for value in (float(item.open), float(item.high), float(item.low), float(item.close))):
+        return Regime("CONSOLIDATION", highs, lows)
+
+    # Recent balance/overlap takes precedence over older swing structure.
+    recent = window[-6:]
+    recent_closes = closes[-6:]
+    travel = sum(abs(b - a) for a, b in zip(recent_closes, recent_closes[1:]))
+    displacement = recent_closes[-1] - recent_closes[0]
+    efficiency = abs(displacement) / travel if travel else 0.0
+    recent_height = max(float(c.high) for c in recent) - min(float(c.low) for c in recent)
+    # Low endpoint progress alone also occurs in a normal trend pullback.
+    # Require a contained range before letting it override trend structure.
+    balanced = recent_height <= 1.2 * atr or (
+        abs(displacement) <= 0.35 * atr
+        and efficiency < 0.25
+        and recent_height <= 1.5 * atr
+    )
+
+    # A close through previous structure, not a wick, confirms a breakout.
+    prior = window[-7:-1]
+    up_break = closes[-1] > max(float(c.high) for c in prior) + 0.1 * atr
+    down_break = closes[-1] < min(float(c.low) for c in prior) - 0.1 * atr
+    if not balanced or up_break or down_break:
+        if up_break and displacement > 0.5 * atr:
             return Regime("UPTREND", highs, lows)
-        if highs[0].price < highs[1].price and lows[0].price < lows[1].price:
+        if down_break and displacement < -0.5 * atr:
             return Regime("DOWNTREND", highs, lows)
 
-    if len(window) >= settings.regime_lookback:
-        high_index = max(range(len(window)), key=lambda i: float(window[i].high))
-        low_index = min(range(len(window)), key=lambda i: float(window[i].low))
-        range_high = float(window[high_index].high)
-        range_low = float(window[low_index].low)
-        height = range_high - range_low
-        atr = average_true_range(candles, settings.atr_period)
-        if (
-            atr is not None
-            and atr > 0
-            and height >= settings.min_range_atr_mult * atr
-        ):
-            zone_width = settings.consolidation_zone_width_pct * height
-            return Regime(
-                "CONSOLIDATION",
-                highs,
-                lows,
-                range_high=range_high,
-                range_low=range_low,
-                high_zone_low=range_high - zone_width,
-                low_zone_high=range_low + zone_width,
-                range_key=(window[high_index].time, window[low_index].time),
-                range_valid=True,
-            )
+        # Fit all closes: tolerates noisy pivots without trusting one HH/HL pair.
+        midpoint = (len(closes) - 1) / 2
+        mean = sum(closes) / len(closes)
+        slope = sum((i - midpoint) * (value - mean) for i, value in enumerate(closes)) / sum(
+            (i - midpoint) ** 2 for i in range(len(closes)))
+        progress = slope * (len(closes) - 1) / atr
+        high_move = (highs[0].price - highs[1].price) / atr if len(highs) >= 2 else 0.0
+        low_move = (lows[0].price - lows[1].price) / atr if len(lows) >= 2 else 0.0
+        up_structure = high_move > 0.1 and low_move > 0.1
+        down_structure = high_move < -0.1 and low_move < -0.1
+        if progress > 0.6 and (up_structure or (progress > 1.0 and displacement > -0.5 * atr)):
+            return Regime("UPTREND", highs, lows)
+        if progress < -0.6 and (down_structure or (progress < -1.0 and displacement < 0.5 * atr)):
+            return Regime("DOWNTREND", highs, lows)
 
-    stable_name = previous_name if previous_name in REGIMES else "CONSOLIDATION"
-    return Regime(stable_name, highs, lows)
-
+    # Never inherit a stale trend when current evidence is indecisive.
+    high_index = max(range(len(window)), key=lambda i: float(window[i].high))
+    low_index = min(range(len(window)), key=lambda i: float(window[i].low))
+    range_high, range_low = float(window[high_index].high), float(window[low_index].low)
+    height = range_high - range_low
+    zone_width = settings.consolidation_zone_width_pct * height
+    return Regime(
+        "CONSOLIDATION", highs, lows, range_high=range_high, range_low=range_low,
+        high_zone_low=range_high - zone_width, low_zone_high=range_low + zone_width,
+        range_key=(window[high_index].time, window[low_index].time),
+        range_valid=height >= settings.min_range_atr_mult * atr,
+    )
 
 class PriceActionStrategy:
     """Evaluate closed one-minute candles and enforce per-regime signal alternation."""
@@ -292,7 +314,7 @@ class PriceActionStrategy:
                 candles, pair, asset_name, payout, emit=emit
             )
         return self._consolidation_signal(
-            candle, pair, asset_name, payout, emit=emit and CONSOLIDATION_SIGNALS_ENABLED
+            candle, pair, asset_name, payout, emit=False
         )
 
     def _start_regime(self, regime: Regime, candles: Sequence[Candle]) -> None:
@@ -534,7 +556,11 @@ class PriceActionStrategy:
         if level_key in self._fired_levels:
             return None
         self._fired_levels.add(level_key)
-        if not emit:
+        allowed = {
+            "UPTREND": {"UP_CONTINUATION_BUY", "UP_PULLBACK_SELL"},
+            "DOWNTREND": {"DOWN_CONTINUATION_SELL", "DOWN_PULLBACK_BUY"},
+        }
+        if not emit or setup not in allowed.get(self.regime_name, set()):
             return None
         closed_at = datetime.fromtimestamp(
             candle.time + self.settings.timeframe_seconds, timezone.utc

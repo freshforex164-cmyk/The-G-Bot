@@ -81,11 +81,11 @@ class RegimeClassificationTests(unittest.TestCase):
         self.assertEqual(regime.low_zone_high, 9)
         self.assertIsNotNone(average_true_range(history, 14))
 
-    def test_undersized_range_does_not_replace_a_stable_regime(self) -> None:
+    def test_tight_range_replaces_stale_trend(self) -> None:
         history = [candle(index, 10, 9.5) for index in range(30)]
         settings = replace(STRATEGY_SETTINGS, min_range_atr_mult=20)
         regime = classify_regime(history, settings, previous_name="UPTREND")
-        self.assertEqual(regime.name, "UPTREND")
+        self.assertEqual(regime.name, "CONSOLIDATION")
         self.assertFalse(regime.range_valid)
 
 
