@@ -1,4 +1,12 @@
 # GBot — stability checkpoint 1 (2026-11-26)
+## 2026-11-28 Stage 1 — bounded recovery execution
+- Fixed stakes remain constant; Martingale uses base, x2, x4 only, then resets after either final outcome.
+- Demo and Real selection/start require a verified live balance of at least $20; failed reads never qualify.
+- One active recovery chain per user; unrelated signals cannot steal its asset/direction or escalated stake.
+- Existing broker feeds, vault, trend detection, candle timing, render.yaml and health endpoints unchanged.
+- Prior unfinished account-integrity checks completed: fresh balances, account-scoped reports, transient read isolation and acknowledgement tracking without order replay.
+- Offline verification: 507 passed, 4 PostgreSQL tests skipped, 32 subtests passed; live VPS/Telegram/broker orders NOT RUN.
+
 ## Commits on main (pushed via GitHub API, remote tree verified after each)
 | Checkpoint | Commit | Scope |
 |---|---|---|

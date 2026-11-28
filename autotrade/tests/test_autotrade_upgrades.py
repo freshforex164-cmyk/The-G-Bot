@@ -196,11 +196,11 @@ class AutoTraderListAndAlertsTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SavedBalanceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_last_balance_returned_when_no_session(self):
+    async def test_saved_balance_is_not_reported_without_a_live_session(self):
         env = Env()
         await env.repo.save_balance(BalanceRow("tg:9", "demo", 42.5, env.clock.utcnow()))
         data = await env.rt.manager.balance("tg:9", fresh=True)
-        self.assertEqual((data["balance"], data["fresh"], data["error"]), (42.5, False, "no_session"))
+        self.assertEqual((data["balance"], data["fresh"], data["error"]), (None, False, "no_session"))
 
 
 class ScopedTokenAndRateLimitApiTests(unittest.TestCase):

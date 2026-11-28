@@ -13,7 +13,7 @@ from ..storage.repo import Repository
 from ..vault.service import TokenVault
 from .broker import BrokerClient
 from .balance_pool import BalancePool
-from .models import DEMO, LIVE, OPTIONAL_LIMITS, Decision, TradingSettings
+from .models import DEMO, LIVE, MARTINGALE, MARTINGALE_MIN_BALANCE, OPTIONAL_LIMITS, Decision, TradingSettings
 from .risk import RiskManager
 from .strategy import STRATEGIES
 from .worker import UserWorker, WorkerStatus
@@ -119,6 +119,7 @@ class TradingManager:
                     if res.status in ("missing", "expired"):
                         raise ReauthRequired(kind, res.status)
                     raise ServiceUnavailable(f"broker unreachable: {res.reason}")
+                await self._qualify_martingale(user_id, s)
                 worker = UserWorker(user_id, repo=self.repo, vault=self.vault, feed=self.feed,
                                     broker_factory=self._factory, risk=self._risk, clock=self._clock,
                                     is_halted=lambda: self.halted, reconnect_base=self._reconnect_base,
@@ -184,12 +185,25 @@ class TradingManager:
             if "route_assets" in changes:
                 changes["route_assets"] = tuple(str(a) for a in changes["route_assets"])
             new = cur.with_changes(**changes).validate(self.cfg)
+            if new.stake_mode == MARTINGALE and (cur.stake_mode != MARTINGALE or new.mode != cur.mode):
+                await self._qualify_martingale(user_id, new)
             await self.repo.save_settings(user_id, new)
             worker = self._workers.get(user_id)
             if worker and self.is_running(user_id):
                 worker.apply_settings(new)
             await self.repo.audit(user_id, "settings_changed", {"fields": sorted(changes), "mode": new.mode})
             return new
+
+    async def _qualify_martingale(self, user_id: str, settings: TradingSettings) -> None:
+        if settings.stake_mode != MARTINGALE:
+            return
+        kind = "demo" if settings.mode == DEMO else "real"
+        value, error = await self._read_balance_once(user_id, kind)
+        if value is None or error:
+            raise SettingsError("Cannot verify your account balance. Reconnect and try again, or choose Fixed mode.")
+        if value < MARTINGALE_MIN_BALANCE:
+            action = "Top up your Demo account or choose Fixed mode." if kind == "demo" else "Add funds or choose Fixed mode."
+            raise SettingsError(f"Martingale requires at least $20 in your {kind.title()} account; balance is ${value:.2f}. {action}")
 
     async def reset_to_demo(self, user_id: str, reason: str) -> None:
         """Called after a fresh login: Live must be re-confirmed explicitly."""
@@ -240,28 +254,12 @@ class TradingManager:
         return sorted(u for u, w in self._workers.items() if self.is_running(u) and w.follows_signals)
 
     async def balance(self, user_id: str, fresh: bool = True) -> dict[str, Any]:
-        """Balance of the account for the selected mode. Fresh from the running bot, or from a short
-        broker connection when the bot is stopped; otherwise the last saved value."""
+        """Always query the selected user's live account; never fall back to saved balances."""
         s = await self.repo.get_settings(user_id)
         kind = "demo" if s.mode == DEMO else "real"
-        value, error = None, None
-        if fresh:
-            worker = self._workers.get(user_id)
-            if worker is not None and self.is_running(user_id):
-                value = await worker.refresh_balance_now()
-                if value is not None and worker.balance_kind != kind:
-                    value = None            # bot is on the other account: never report its balance
-                if value is None:
-                    error = "balance_unavailable"
-            else:
-                value, error = await self._read_balance_once(user_id, kind)
-        saved = (await self.repo.get_balances(user_id)).get(kind)
-        if value is not None:
-            return {"account": kind, "balance": value, "fresh": True,
-                    "at": self._clock.utcnow().isoformat()}
-        return {"account": kind, "balance": saved.balance if saved else None, "fresh": False,
-                "at": saved.updated_at.isoformat() if saved and saved.updated_at else None,
-                "error": error}
+        value, error = await self._read_balance_once(user_id, kind)
+        return {"account": kind, "balance": value, "fresh": value is not None,
+                "at": self._clock.utcnow().isoformat() if value is not None else None, "error": error}
 
     async def connect_new_sessions(self, user_id: str, kinds: list[str]) -> dict[str, Any]:
         """Right after a login: open a WebSocket with each newly captured session, confirm the broker
@@ -324,13 +322,8 @@ class TradingManager:
             {"status": state.status if state else "stopped", "last_error": state.last_error if state else None,
              "open_trades": 0, "last_skip_reason": None}
         mode_kind = "demo" if s.mode == DEMO else "real"
-        if bot.get("balance") is not None and bot.get("balance_account") not in (None, mode_kind):
-            bot = {**bot, "balance": None}      # running bot's balance belongs to the other account
-        if bot.get("balance") is None:          # stopped or restarted: last saved balance for this mode
-            saved = (await self.repo.get_balances(user_id)).get("demo" if s.mode == DEMO else "real")
-            if saved is not None:
-                bot = {**bot, "balance": saved.balance, "balance_account": saved.kind,
-                       "balance_at": saved.updated_at.isoformat() if saved.updated_at else None}
+        live = await self.balance(user_id)
+        bot = {**bot, "balance": live["balance"], "balance_account": mode_kind, "balance_at": live["at"]}
         return {
             "bot": {**bot, "running": running, "halted_by_operator": self.halted},
             "mode": s.mode,
@@ -338,16 +331,16 @@ class TradingManager:
             "sessions": await self.vault.status(user_id),
             "routing": {"min_payout": s.min_payout, "route_assets": list(s.route_assets),
                         "last_route": bot.get("last_route")},
-            "today": {**(await self.repo.trade_stats(user_id, day)),
+            "today": {**(await self.repo.trade_stats(user_id, day, s.mode)),
                       "realized_pnl": await self.repo.realized_pnl_since(user_id, day, s.mode),
                       "stop_loss": s.daily_stop_loss, "take_profit": s.daily_take_profit,
                       "stop_balance": s.stop_balance},
-            "all_time": await self.repo.trade_stats(user_id, None),
+            "all_time": await self.repo.trade_stats(user_id, None, s.mode),
             "recent_trades": [
                 {"opened_at": t.opened_at.isoformat() if t.opened_at else None, "mode": t.mode, "asset": t.asset,
                  "direction": t.direction, "stake": t.stake, "status": t.status, "outcome": t.outcome,
                  "profit": t.profit, "payout": t.payout, "reason": t.reason}
-                for t in await self.repo.recent_trades(user_id, 20)],
+                for t in await self.repo.recent_trades(user_id, 20, s.mode)],
         }
 
     # -- lifecycle ----------------------------------------------------------------------------

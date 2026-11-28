@@ -9,7 +9,7 @@ from ..trading.models import Decision, TradingSettings
 from ..trading.risk import RiskManager, RiskState
 from ..trading.worker import StakeTracker
 
-MG = TradingSettings(stake_mode="martingale", base_stake=1.0, martingale_multiplier=2.0, martingale_max_steps=3)
+MG = TradingSettings(stake_mode="martingale", base_stake=1.0, martingale_multiplier=2.0, martingale_max_steps=2)
 
 
 def run(settings, outcomes):
@@ -37,7 +37,7 @@ class FixedStakeTests(unittest.TestCase):
 
 class MartingaleTests(unittest.TestCase):
     def test_losses_climb_the_ladder_then_reset_after_max_steps(self):
-        self.assertEqual(run(MG, ["loss", "loss", "loss", "loss"]), [1.0, 2.0, 4.0, 8.0, 1.0])
+        self.assertEqual(run(MG, ["loss", "loss", "loss", "loss"]), [1.0, 2.0, 4.0, 1.0, 2.0])
 
     def test_win_resets_to_base(self):
         self.assertEqual(run(MG, ["loss", "loss", "win"]), [1.0, 2.0, 4.0, 1.0])
@@ -49,8 +49,8 @@ class MartingaleTests(unittest.TestCase):
         self.assertEqual(run(MG, ["loss", "draw", "loss"]), [1.0, 2.0, 2.0, 4.0])
 
     def test_base_stake_falls_back_to_stake_and_multiplier_applies(self):
-        s = TradingSettings(stake=2.0, stake_mode="martingale", martingale_multiplier=1.5, martingale_max_steps=2)
-        self.assertEqual(run(s, ["loss", "loss", "loss"]), [2.0, 3.0, 4.5, 2.0])
+        s = TradingSettings(stake=2.0, stake_mode="martingale", martingale_multiplier=2.0, martingale_max_steps=2)
+        self.assertEqual(run(s, ["loss", "loss", "loss"]), [2.0, 4.0, 8.0, 2.0])
 
     def test_streak_counters(self):
         t = StakeTracker()

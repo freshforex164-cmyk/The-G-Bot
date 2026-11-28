@@ -15,6 +15,7 @@ from ..errors import (BrokerError, Disconnected, ModeMismatch, RateLimited, Sess
 from ..market.feed import SharedMarketFeed
 from ..notify import (NullNotifier, Notifier, daily_summary_text, failed_text, low_balance_text, opened_text,
                       settled_text, skipped_text)
+from ..storage.transient import is_transient
 from ..storage.repo import BalanceRow, BotState, Repository, summarize
 from ..vault.service import TokenVault
 from .broker import BrokerClient, TradeOutcome, account_is_demo, map_exception
@@ -68,7 +69,7 @@ class StakeTracker:
         elif outcome == "loss":
             self.win_streak, self.loss_streak = 0, self.loss_streak + 1
             if s.stake_mode == "martingale":
-                self.step = 0 if self.step >= s.martingale_max_steps else self.step + 1
+                self.step = 0 if self.step >= 2 else self.step + 1
         elif outcome == "draw":
             pass
         else:
@@ -117,6 +118,8 @@ class UserWorker:
         self._notifier = notifier or NullNotifier()
         self._on_session_expired = on_session_expired
         self._adopt = adopt          # first session reuses the pooled connection from the start-up check
+        self._execution_lock = asyncio.Lock()
+        self._martingale_active = False
         self._broker: BrokerClient | None = None
         self.settings = TradingSettings()
         self.status = WorkerStatus.STARTING
@@ -213,7 +216,15 @@ class UserWorker:
         reconnects = unexpected = 0
         try:
             while not self._stop.is_set():
-                self.settings = await self._repo.get_settings(self.user_id)
+                try:
+                    self.settings = await self._repo.get_settings(self.user_id)
+                except Exception as exc:
+                    if not is_transient(exc):
+                        raise
+                    self.last_error = type(exc).__name__
+                    log.warning("settings read interrupted for user %s (%s)", self.user_id, self.last_error)
+                    await self._sleep(self._reconnect_base)
+                    continue
                 s = self.settings
                 kind = "demo" if s.mode == DEMO else "real"
                 factory = self._strategies[s.strategy]
@@ -343,30 +354,41 @@ class UserWorker:
                 except asyncio.TimeoutError:
                     pass
                 ev.clear()
-                if not await broker.is_alive():
-                    raise Disconnected("connection is not receiving data")
-                if follow:
-                    batch: list[Decision] = []
-                    while self._pending and not self._stop.is_set():
-                        d = self._pending.popleft()
-                        if self._expired(d):
-                            self._note("signal_expired")
-                            self._alert_skip(d, "signal_expired")
-                            continue
-                        batch.append(d)
-                    if batch:
-                        await self._route_and_trade(broker, batch, s, pushed=True)
-                    continue
-                ticks = {sym: self._feed.latest(sym) for sym in symbols}
-                many = getattr(strategy, "on_tick_all", None)
-                if callable(many):
-                    found = many(ticks, s)
-                    if found:
-                        await self._route_and_trade(broker, found, s)
-                    continue
-                decision = strategy.on_tick(ticks, s)
-                if decision is not None:
-                    await self._try_trade(broker, decision, s, symbols)
+                s = self.settings
+                if s.mode != s0.mode or s.strategy != s0.strategy or s.follow_signals != follow or \
+                        (not follow and strategy.required_symbols(s) != symbols):
+                    continue  # apply a mode change through the existing drain/reconnect path
+                try:
+                    if not await broker.is_alive():
+                        raise Disconnected("connection is not receiving data")
+                    if follow:
+                        batch: list[Decision] = []
+                        while self._pending and not self._stop.is_set():
+                            d = self._pending.popleft()
+                            if self._expired(d):
+                                self._note("signal_expired")
+                                self._alert_skip(d, "signal_expired")
+                                continue
+                            batch.append(d)
+                        if batch:
+                            await self._route_and_trade(broker, batch, s, pushed=True)
+                        continue
+                    ticks = {sym: self._feed.latest(sym) for sym in symbols}
+                    many = getattr(strategy, "on_tick_all", None)
+                    if callable(many):
+                        found = many(ticks, s)
+                        if found:
+                            await self._route_and_trade(broker, found, s)
+                        continue
+                    decision = strategy.on_tick(ticks, s)
+                    if decision is not None:
+                        await self._try_trade(broker, decision, s, symbols)
+                except Exception as exc:
+                    if isinstance(exc, (BrokerError, Disconnected, RateLimited, SessionExpired)) or not is_transient(exc):
+                        raise
+                    self.last_error = type(exc).__name__
+                    log.warning("tick interrupted for user %s (%s); next tick will retry reads", self.user_id, self.last_error)
+                    await self._sleep(self._reconnect_base)
             if self._drain_on_stop:
                 await self._drain(broker)
         finally:
@@ -378,6 +400,7 @@ class UserWorker:
 
     async def _refresh_balance(self, broker: BrokerClient) -> float | None:
         """Best effort: a balance read never stops trading. Saved so it survives restarts."""
+        self.balance, self.balance_at = None, None
         fn = getattr(broker, "balance", None)
         if not callable(fn):
             return None
@@ -492,6 +515,17 @@ class UserWorker:
 
     async def _try_trade(self, broker: BrokerClient, d: Decision, s: TradingSettings, symbols: tuple[str, ...],
                          *, pushed: bool = False, payout: int | None = None) -> None:
+        async with self._execution_lock:
+            recovery = d.meta.get("martingale_recovery") is True
+            if s.stake_mode == "martingale" and (self._martingale_active or self._trackers) and not recovery:
+                self._note("martingale_in_progress")
+                return
+            if not recovery:
+                self.stakes.step = 0
+            await self._execute_trade(broker, d, s, symbols, pushed=pushed, payout=payout)
+
+    async def _execute_trade(self, broker: BrokerClient, d: Decision, s: TradingSettings, symbols: tuple[str, ...],
+                         *, pushed: bool = False, payout: int | None = None) -> None:
         now = self._clock.monotonic()
         day = utc_day_start(self._clock.utcnow())
         pnl = await self._repo.realized_pnl_since(self.user_id, day, s.mode)
@@ -528,14 +562,11 @@ class UserWorker:
             self._note(pv.reason)
             self._alert_skip(d, pv.reason, payout=payout)
             return
-        # Demo and Real alike: only trade money that is there. A fresh reading; the last known one if the
-        # broker does not answer; no reading at all -> skip (never trade blind).
+        # Demo and Real alike: no fresh balance means no order, never a cached fallback.
         try:
             balance = await asyncio.wait_for(self._refresh_balance(broker), timeout=PRE_ORDER_BALANCE_TIMEOUT)
         except asyncio.TimeoutError:
             balance = None
-        if balance is None:
-            balance = self.balance
         sb = self._risk.check_balance(s, balance)
         if not sb.ok:
             self._note(sb.reason)
@@ -589,10 +620,12 @@ class UserWorker:
         self._alert(opened_text(mode=s.mode, asset=name, direction=d.direction, setup=setup, stake=stake,
                                 payout=payout, expiry_seconds=expiry,
                                 step=meta["stake_step"] if s.stake_mode == "martingale" else None), key=ref)
-        await self._repo.update_trade(self.user_id, ref, status="open", broker_trade_id=trade_id)
+        self._martingale_active = s.stake_mode == "martingale"
         self._spawn_tracker(broker, ref, trade_id, stake, payout, expiry + 45,
                             info={"mode": s.mode, "asset": name, "direction": d.direction, "setup": setup,
-                                  "asset_id": d.asset, "reason": d.reason, "meta": dict(d.meta)})
+                                  "asset_id": d.asset, "reason": d.reason, "meta": dict(d.meta),
+                                  "settings": s, "stake_step": self.stakes.step})
+        await self._repo.update_trade(self.user_id, ref, status="open", broker_trade_id=trade_id)
 
     # -- results ------------------------------------------------------------------------------
     def _spawn_tracker(self, broker: BrokerClient, ref: str, trade_id: str, stake: float,
@@ -607,15 +640,15 @@ class UserWorker:
         try:
             out = await broker.outcome(trade_id, timeout)
             profit = compute_profit(out, stake, payout)
-            self.stakes.record(self.settings, out.result if profit is not None else "unknown")
+            original = info.get("settings", self.settings)
+            self.stakes.step = info.get("stake_step", 0)
+            self.stakes.record(original, out.result if profit is not None else "unknown")
             if profit is None:
                 await self._repo.update_trade(self.user_id, ref, status="unknown", error="result unavailable")
             else:
                 await self._repo.update_trade(self.user_id, ref, status="settled", outcome=out.result,
                                               profit=profit, settled_at=self._clock.utcnow())
                 balance = await self._refresh_balance(broker)
-                if balance is None and self.balance_kind == ("demo" if info.get("mode") == DEMO else "real"):
-                    balance = self.balance
                 if info:
                     s = self.settings
                     self._alert(settled_text(mode=info["mode"], asset=info["asset"], direction=info["direction"],
@@ -624,12 +657,16 @@ class UserWorker:
                                              step=self.stakes.step, martingale=s.stake_mode == "martingale"),
                                 reply_to=ref)
                 await self._on_settled(info.get("mode") or self.settings.mode)
-                recover = self._recovery_decision(out.result, info)
+                if info.get("settings", self.settings) == self.settings:
+                    recover = self._recovery_decision(out.result, info)
         except asyncio.CancelledError:
             raise  # left 'open'; the next session adopts it
         except Exception as exc:
             self.stakes.record(self.settings, "unknown")
-            await self._repo.update_trade(self.user_id, ref, status="unknown", error=type(map_exception(exc)).__name__)
+            try:
+                await self._repo.update_trade(self.user_id, ref, status="unknown", error=type(map_exception(exc)).__name__)
+            except Exception:
+                log.warning("result persistence interrupted for user %s", self.user_id)
         finally:
             self._trackers.pop(ref, None)
             self._open_stakes.pop(ref, None)
@@ -641,6 +678,10 @@ class UserWorker:
                 raise
             except Exception as exc:
                 log.warning("martingale recovery trade failed for user %s (%s)", self.user_id, type(exc).__name__)
+
+        if not self._trackers:
+            self._martingale_active = False
+            self.stakes.step = 0
 
     def _recovery_decision(self, result: str | None, info: dict) -> Decision | None:
         """Martingale: after a loss that moved the ladder up (step 1 = x2, step 2 = x4), re-enter at once on

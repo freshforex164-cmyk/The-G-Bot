@@ -7,7 +7,9 @@ from typing import Any
 from ..config import Config
 from ..errors import SettingsError
 
-SETTINGS_DEFAULTS_VERSION = 4
+SETTINGS_DEFAULTS_VERSION = 5
+MARTINGALE_MIN_BALANCE = 20.0
+MARTINGALE_MAX_STEPS = 2
 # v1 -> v2: follow-mode max_concurrent 1 -> 2 and cooldown 60 s -> 5 s; the "gap" setting was removed.
 _V1_DEFAULTS = {"max_concurrent": (1, 2), "cooldown_seconds": (60, 5)}
 # v2 -> v3: the hard-coded daily stop-loss/take-profit (10/20) were removed; saved defaults become "off".
@@ -108,10 +110,10 @@ class TradingSettings:
             bad("route_assets must be distinct and different from symbol_otc")
         if self.stake_mode not in STAKE_MODES:
             bad("stake_mode must be 'fixed' or 'martingale'")
-        if not (isinstance(self.martingale_multiplier, (int, float)) and 1.1 <= self.martingale_multiplier <= 5.0):
-            bad("martingale_multiplier must be between 1.1 and 5")
-        if not (isinstance(self.martingale_max_steps, int) and 1 <= self.martingale_max_steps <= 6):
-            bad("martingale_max_steps must be between 1 and 6")
+        if not (isinstance(self.martingale_multiplier, (int, float)) and self.martingale_multiplier == 2.0):
+            bad("martingale_multiplier must be 2")
+        if not (isinstance(self.martingale_max_steps, int) and self.martingale_max_steps == MARTINGALE_MAX_STEPS):
+            bad("martingale_max_steps must be 2 (maximum two recovery trades)")
         if self.base_stake is not None:
             if not (1.0 <= self.base_stake <= cap):
                 bad(f"base_stake must be between 1 and {cap:g} in {self.mode} mode")
@@ -130,8 +132,8 @@ class TradingSettings:
         """Stake for a ladder step (0 = base). Fixed mode always returns ``stake``."""
         if self.stake_mode != MARTINGALE:
             return float(self.stake)
-        step = max(0, min(int(step), self.martingale_max_steps))
-        return round(self.effective_base_stake * self.martingale_multiplier ** step, 2)
+        step = max(0, min(int(step), MARTINGALE_MAX_STEPS))
+        return round(self.effective_base_stake * 2.0 ** step, 2)
 
     @property
     def max_ladder_stake(self) -> float:
@@ -157,6 +159,8 @@ class TradingSettings:
                 values[name] = None
         if values.get("strategy") == "gap":                        # removed alias of price_action
             values["strategy"] = "price_action"
+        values["martingale_multiplier"] = 2.0
+        values["martingale_max_steps"] = MARTINGALE_MAX_STEPS
         values["defaults_version"] = SETTINGS_DEFAULTS_VERSION
         return cls(**values)
 

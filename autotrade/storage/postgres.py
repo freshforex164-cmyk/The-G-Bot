@@ -198,11 +198,11 @@ class PostgresRepository:
             "where user_id=%s and mode=%s and status='settled' and settled_at >= %s", (user_id, mode, since))
         return round(float(rows[0][0]), 2)
 
-    async def recent_trades(self, user_id, limit):
+    async def recent_trades(self, user_id, limit, mode=None):
         return [_trade(r) for r in await self._all(
-            f"select {_TRADE_SELECT} from autotrade_trades where user_id=%s order by opened_at desc limit %s", (user_id, limit))]
+            f"select {_TRADE_SELECT} from autotrade_trades where user_id=%s and (%s::text is null or mode=%s) order by opened_at desc limit %s", (user_id, mode, mode, limit))]
 
-    async def trade_stats(self, user_id, since):
+    async def trade_stats(self, user_id, since, mode=None):
         r = (await self._all(
             """select count(*),
                       count(*) filter (where status='settled'),
@@ -212,8 +212,8 @@ class PostgresRepository:
                       count(*) filter (where outcome='loss'),
                       count(*) filter (where outcome='draw'),
                       coalesce(sum(profit) filter (where status='settled'),0)
-               from autotrade_trades where user_id=%s and (%s::timestamptz is null or opened_at >= %s)""",
-            (user_id, since, since)))[0]
+               from autotrade_trades where user_id=%s and (%s::text is null or mode=%s) and (%s::timestamptz is null or opened_at >= %s)""",
+            (user_id, mode, mode, since, since)))[0]
         decided = r[4] + r[5]
         return {"trades": r[0], "settled": r[1], "open": r[2], "failed": r[3], "wins": r[4], "losses": r[5],
                 "draws": r[6], "win_rate": round(r[4] / decided * 100, 1) if decided else None,
