@@ -199,6 +199,7 @@ class AutotradeRoster:
                  clock: Callable[[], float] = time.monotonic) -> None:
         self.client, self.max_age, self._clock = client, max_age, clock
         self._ids: set[int] = set()
+        self._added_at: dict[int, float] = {}
         self._fetched_at: float | None = None
         self._lock = asyncio.Lock()
 
@@ -210,6 +211,14 @@ class AutotradeRoster:
 
     def add(self, chat_id: int) -> None:
         self._ids.add(int(chat_id))
+        self._added_at[int(chat_id)] = self._clock()
+
+    def release(self, chat_id: int, grace: float = 90.0) -> None:
+        """Discard unless the chat started auto-trading within ``grace`` seconds (worker still starting)."""
+        started = self._added_at.get(int(chat_id))
+        if started is not None and self._clock() - started < grace:
+            return
+        self.discard(chat_id)
 
     def discard(self, chat_id: int) -> None:
         self._ids.discard(int(chat_id))

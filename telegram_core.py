@@ -1318,8 +1318,12 @@ class SubscriberFanoutNotifier:
                 self.autotrade_accepted += 1
                 return
             reason = result.get("reason") if isinstance(result, dict) else None
-            if reason in ("not_running", "follow_signals_off") and self.roster is not None:
-                self.roster.discard(chat_id)        # the bot stopped: back to signal cards (Signal Mode)
+            if reason == "follow_signals_off" and self.roster is not None:
+                self.roster.discard(chat_id)
+            elif reason == "not_running" and self.roster is not None:
+                # A just-started worker reports not_running while connecting; keep Auto-Trade mode.
+                release = getattr(self.roster, "release", None)
+                (release or self.roster.discard)(chat_id)        # the bot stopped: back to signal cards (Signal Mode)
             if reason in ("not_running", "follow_signals_off", "unreachable", "trading_halted") and signal is not None:
                 # Nothing was traded: a user who chose this asset still gets the signal card.
                 try:

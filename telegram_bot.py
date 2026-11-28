@@ -220,7 +220,10 @@ class TelegramCommandHandler(core.TelegramCommandHandler):
         if isinstance(callback, Mapping) and str(callback.get("data", "")).startswith("menu:"):
             callback_id = callback.get("id")
             if callback_id is not None:
-                await self.client.answer_callback(str(callback_id))
+                try:
+                    await self.client.answer_callback(str(callback_id))
+                except TelegramSendError as exc:
+                    logger.warning("Callback answer failed (%s).", type(exc).__name__)
             chat_id = self._update_chat_id(update)
             if chat_id is None:
                 return
@@ -229,12 +232,24 @@ class TelegramCommandHandler(core.TelegramCommandHandler):
             message = callback.get("message", {})
             message_id = message.get("message_id") if isinstance(message, Mapping) else None
             # Do not let a stale button turn a signal or another message into a menu.
-            if message_id != self.menu_message_ids.get(chat_id):
+            known = self.menu_message_ids.get(chat_id)
+            if known is None and isinstance(message_id, int):
+                self.menu_message_ids[chat_id] = known = message_id   # adopt the menu after a restart
+            if message_id != known:
                 return
-            async with self._menu_lock(chat_id):
-                await self._navigate(chat_id, str(callback["data"])[5:], sender_id)
+            task = asyncio.create_task(self._navigate_locked(chat_id, str(callback["data"])[5:], sender_id))
+            self._nav_tasks = getattr(self, "_nav_tasks", set())
+            self._nav_tasks.add(task)
+            task.add_done_callback(self._nav_tasks.discard)
             return
         await super()._handle_update(update)
+
+    async def _navigate_locked(self, chat_id, target, sender_id):
+        try:
+            async with self._menu_lock(chat_id):
+                await self._navigate(chat_id, target, sender_id)
+        except Exception:
+            logger.exception("Menu navigation failed.")
 
     async def _navigate(self, chat_id, target, sender_id):
         self._menu_context[chat_id] = target
