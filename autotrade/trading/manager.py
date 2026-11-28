@@ -200,6 +200,15 @@ class TradingManager:
         kind = "demo" if settings.mode == DEMO else "real"
         value, error = await self._read_balance_once(user_id, kind)
         if value is None or error:
+            # A brief broker hiccup must not block start: use the last confirmed reading (<= 15 min old).
+            try:
+                row = (await self.repo.get_balances(user_id)).get(kind)
+                age = (self._clock.utcnow() - row.at).total_seconds() if row else None
+                if row is not None and age is not None and age <= 900:
+                    value, error = float(row.balance), None
+            except Exception:
+                log.warning("could not read saved balance for user %s", user_id)
+        if value is None or error:
             raise SettingsError("Cannot verify your account balance. Reconnect and try again, or choose Fixed mode.")
         if value < MARTINGALE_MIN_BALANCE:
             action = "Top up your Demo account or choose Fixed mode." if kind == "demo" else "Add funds or choose Fixed mode."
